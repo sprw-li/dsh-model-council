@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Model council">
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#2f6fed"/>
+  <path d="M32 13v7" stroke="#dfe9ff" stroke-width="3" stroke-linecap="round"/>
+  <path d="M18 30h28" stroke="#dfe9ff" stroke-width="3" stroke-linecap="round"/>
+  <path d="M18 30l-7 10a7 7 0 0 0 14 0z" fill="#dfe9ff" opacity="0.92"/>
+  <path d="M46 30l-7 10a7 7 0 0 0 14 0z" fill="#dfe9ff" opacity="0.92"/>
+  <circle cx="32" cy="20" r="6" fill="#ffffff"/>
+  <path d="M23 47h18" stroke="#dfe9ff" stroke-width="3" stroke-linecap="round"/>
+</svg>

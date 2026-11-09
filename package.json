@@ -1,0 +1,62 @@
+{
+  "name": "dsh-model-council",
+  "version": "0.1.0",
+  "private": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sprw-li/dsh-model-council.git"
+  },
+  "homepage": "https://github.com/sprw-li/dsh-model-council",
+  "bugs": {
+    "url": "https://github.com/sprw-li/dsh-model-council/issues"
+  },
+  "description": "Multi-model council for DeepSeek Harness: run /council to ask several selected models in parallel, let them review each other anonymously, and have a chairman model synthesize the conclusion.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "llm",
+    "multi-model",
+    "llm-council",
+    "evaluation"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": ">=0.2.2-rc.1 <0.3.0"
+  },
+  "scripts": {
+    "verify": "node dev/verify-client.mjs",
+    "syntax": "node --check index.js && node --check client.js"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-commands",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  }
+}

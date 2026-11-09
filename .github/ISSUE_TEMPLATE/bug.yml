@@ -1,0 +1,41 @@
+name: Bug report
+description: Report a problem with dsh-model-council
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: input
+    id: dsh-version
+    attributes:
+      label: DSH version
+      description: Output of the DSH version you run (e.g. 0.2.2-rc.1)
+    validations:
+      required: true
+  - type: input
+    id: profile
+    attributes:
+      label: Profile name
+      description: The dsh profile the plugin is installed in
+    validations:
+      required: true
+  - type: dropdown
+    id: quick-quote
+    attributes:
+      label: Is @local/quick-quote installed?
+      options:
+        - "Yes"
+        - "No (using /council and the right-click menu only)"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include the question, selected models, and which entry point you used
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual result
+    validations:
+      required: true

@@ -1,0 +1,8 @@
+node_modules/
+*.tgz
+.DS_Store
+
+# GitHub rejects workflow files from OAuth tokens without the "workflow" scope.
+# Remove the next line (and `git add .github/workflows/verify.yml`) after
+# `gh auth refresh -s workflow`.
+.github/workflows/
