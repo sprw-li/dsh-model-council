@@ -75,8 +75,15 @@ DeepSeek Harness 的多模型理事会插件：一个入口把问题交给多个
 
 ## 安装
 
+已发布到 npm：<https://www.npmjs.com/package/dsh-model-council>（dist-tags `latest` / `alpha` = `0.1.0`）。
+
 ```sh
-npx --yes @deepseek-ai/dsh@latest plugin --profile <name> add <包目录或 tarball>
+# 从 npm
+npx --yes @deepseek-ai/dsh@latest plugin --profile <name> add dsh-model-council@alpha
+
+# 或从 GitHub Release 的 tarball
+npx --yes @deepseek-ai/dsh@latest plugin --profile <name> add `
+  https://github.com/sprw-li/dsh-model-council/releases/download/v0.1.0-alpha/dsh-model-council-0.1.0.tgz
 ```
 
 安装或升级后刷新 DSH Web 页面；Host 半场可用插件行 disable → enable 重载。
@@ -90,8 +97,9 @@ npm run syntax    # node --check 两个入口
 
 CI：`.github/workflows/verify.yml`（文件已随目录保留；当前仓库 token 无 `workflow` scope 时 GitHub 会拒绝推送该文件，执行 `gh auth refresh -s workflow` 后 `git add .github/workflows/verify.yml && git push` 即可补上。本地等价的检查是 `npm run verify`）。
 
-## 发布到 GitHub / npm
+## 发布记录与后续
 
-仓库根 = 本目录。发布前：`npm run verify` 全绿 → 打 tag `v0.1.0-alpha` → GitHub Release 勾 **pre-release** 并在说明里列「已知限制」。npm 发布用 `npm publish`（未 scoped，`private: false` 已就绪）。
+- GitHub：<https://github.com/sprw-li/dsh-model-council>，首个 release `v0.1.0-alpha`（pre-release，含可安装 tarball）。
+- npm：<https://www.npmjs.com/package/dsh-model-council>（`latest` / `alpha` = `0.1.0`；`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
 
-`CHANGELOG.md` 记录本版本功能、限制与安装方式；Issue 模板要求填 DSH 版本 / profile / 是否装 quick-quote。
+发新版本：更新 `CHANGELOG.md` 与 `package.json` 版本 → `npm run verify` → commit/tag → `npm publish --tag alpha`（npm 新包首次发布会进入 staged 审核，通常几分钟内变为可安装）→ `npm pack` + `gh release create vX.Y.Z --prerelease --notes-file CHANGELOG.md <tarball>`。
