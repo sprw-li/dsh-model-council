@@ -406,7 +406,21 @@ async function collectSourceFiles(root, hints = []) {
     } catch {
       return
     }
-    entries.sort((a, b) => a.name.localeCompare(b.name))
+    /* Names matching the question come first: an alphabetical walk burned the
+       entry budget on unrelated sibling projects before reaching the one the
+       question asked about (a review of dsh-council received ai-agent-book). */
+    const nameScore = (entry) => {
+      const lower = entry.name.toLowerCase()
+      let score = 0
+      for (const hint of hints) if (lower.includes(hint)) score += 1
+      return score
+    }
+    entries.sort((a, b) => {
+      const byHint = nameScore(b) - nameScore(a)
+      if (byHint !== 0) return byHint
+      if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1
+      return a.name.localeCompare(b.name)
+    })
     for (const entry of entries) {
       if (visited >= CODE_WALK_ENTRIES) return
       visited += 1
@@ -2061,7 +2075,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v49', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v50', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -2070,7 +2084,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v49' })
+          sendJson(res, 200, { ok: true, build: 'v50' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
