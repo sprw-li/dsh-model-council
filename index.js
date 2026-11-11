@@ -617,9 +617,15 @@ async function readCodeSegments(path, budget, hints = []) {
          when the symbol sits outside every keyword cluster (draftBridge.draft,
          stopEventStream, …). */
       if (/^[A-Za-z][A-Za-z0-9_.]*$/.test(hint) && hint.length >= 5) {
+        /* Longer identifier hints shadow shorter ones (schedulePollRetry
+           contains schedulePoll): a line that matches a LONGER hint is that
+           other symbol's occurrence and must not consume this one's windows. */
+        const shadowed = lowerHints.filter((other) => other !== hint && other.length > hint.length && other.includes(hint))
         let windows = 0
-        for (let index = 0; index < totalLines && windows < 2; index += 1) {
-          if (!(lines[index] || '').toLowerCase().includes(hint)) continue
+        for (let index = 0; index < totalLines && windows < 3; index += 1) {
+          const line = (lines[index] || '').toLowerCase()
+          if (!line.includes(hint)) continue
+          if (shadowed.some((other) => line.includes(other))) continue
           const from = Math.max(0, index - 3)
           const to = Math.min(totalLines, index + 8)
           if (regions.some((region) => from >= region.from && to <= region.to)) continue
@@ -2123,7 +2129,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v53', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v54', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -2132,7 +2138,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v53' })
+          sendJson(res, 200, { ok: true, build: 'v54' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
