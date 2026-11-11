@@ -36,8 +36,10 @@ window.__ModuleLoader__.load({
       'panel.optContext': '接当前对话上下文',
       'panel.optFiles': '自动附带问题里的本地路径',
       'panel.optSeats': 'subagent 只读席位（可读文件/skill）',
-      'panel.seatsHint': '开启后每个委员是一个只读子代理：可读文件、搜索、加载 skill，不能写；更慢但能自行查证。关闭则用纯模型调用。开启时路径附件默认关闭（委员自己读文件）。subagent 席位整轮结束才出正文，想看逐字输出请关闭此开关。',
+      'panel.seatsHint': '开启后前 N 个委员是只读子代理（可读文件/搜索/加载 skill），其余走快速流式通道；关闭则全部纯模型。子代理席位整轮结束才出正文。',
+      'panel.seatSplit': 'subagent 席位数：{count}（其余为快速席位）',
       'panel.seatModeSub': '本次使用只读 subagent 席位',
+      'panel.seatModeHybrid': '席位：{sub} 个只读 subagent + {fast} 个快速',
       'panel.seatModeFallback': 'subagent 席位不可用，本次退回纯模型调用',
       'panel.filesHint': '问题中出现的本地路径（如 D:\\dev\\项目）会自动读取目录树和关键文件，最多 {chars} 字；没写路径但提到工作区/项目时用当前会话工作区；跳过 .git/node_modules/密钥文件。注意：这些文件内容会随问题一起发送给所选模型提供商。',
       'panel.workspace': '当前会话工作区：{path}',
@@ -121,8 +123,10 @@ window.__ModuleLoader__.load({
       'panel.optContext': 'Attach current chat context',
       'panel.optFiles': 'Attach local paths named in the question',
       'panel.optSeats': 'Read-only subagent seats (files + skills)',
-      'panel.seatsHint': 'Each seat becomes a read-only subagent: it can read files, search, and load skills, but cannot write. Slower, but it can verify things itself. Off = raw model calls. With seats on, path attachments default off (the seats read files themselves). Subagent seats emit text only when a turn finishes; turn this off for token-by-token output.',
+      'panel.seatsHint': 'With seats on, the first N members are read-only subagents (files/search/skills); the rest take the fast streaming path. Off = all raw model calls. Subagent seats emit text only when a turn finishes.',
+      'panel.seatSplit': 'subagent seats: {count} (the rest are fast seats)',
       'panel.seatModeSub': 'Used read-only subagent seats',
+      'panel.seatModeHybrid': 'Seats: {sub} read-only subagent + {fast} fast',
       'panel.seatModeFallback': 'Subagent seats unavailable; fell back to raw model calls',
       'panel.filesHint': 'Local paths in the question (e.g. D:\\dev\\project) attach their directory tree and key files, up to {chars} characters; a workspace/project question without a path uses the session workspace; .git/node_modules/secret files are skipped. Those file contents are sent to the selected model providers.',
       'panel.workspace': 'Session workspace: {path}',
@@ -287,6 +291,9 @@ window.__ModuleLoader__.load({
         useContext: persisted.useContext !== false,
         attachFiles: persisted.attachFiles !== false,
         useSubagentSeats: persisted.useSubagentSeats === true,
+        seatSplit: Number.isSafeInteger(persisted.seatSplit) && persisted.seatSplit >= 1 && persisted.seatSplit <= 5
+          ? persisted.seatSplit
+          : 2,
         feedbackMode: persisted.feedbackMode === 'silent' || persisted.feedbackMode === 'wake'
           ? persisted.feedbackMode
           : persisted.useFeedback === true ? 'wake' : 'off',
@@ -328,6 +335,7 @@ window.__ModuleLoader__.load({
           useContext: store.state.useContext,
           attachFiles: store.state.attachFiles,
           useSubagentSeats: store.state.useSubagentSeats,
+          seatSplit: store.state.seatSplit,
           feedbackMode: store.state.feedbackMode,
           useChairman: store.state.useChairman,
         }))
@@ -485,6 +493,57 @@ window.__ModuleLoader__.load({
      * ------------------------------------------------------------------ */
 
     let pollTimer = 0
+    let eventSource = null
+
+    /** Preferred live channel: SSE with automatic fallback to 320ms polling. */
+    function stopEventStream() {
+      if (eventSource !== null) {
+        try {
+          eventSource.close()
+        } catch {
+          /* best effort */
+        }
+        eventSource = null
+      }
+    }
+
+    function watchRun(runId) {
+      stopPolling()
+      stopEventStream()
+      if (typeof window === 'undefined' || typeof window.EventSource !== 'function') {
+        schedulePoll(runId)
+        return
+      }
+      try {
+        eventSource = new window.EventSource(`/council/run/${encodeURIComponent(runId)}/stream`)
+      } catch {
+        schedulePoll(runId)
+        return
+      }
+      eventSource.onmessage = (event) => {
+        if (store.state.runId !== runId) return
+        let data
+        try {
+          data = JSON.parse(event.data)
+        } catch {
+          return
+        }
+        if (data === null || typeof data !== 'object') return
+        const running = data.status === 'running'
+        store.publish({ run: data, running })
+        if (!running) {
+          stopEventStream()
+          if (data.status === 'done' && store.state.feedbackMode !== 'off') {
+            void resumeRun(runId, store.state.feedbackMode)
+          }
+        }
+      }
+      eventSource.onerror = () => {
+        /* The stream reconnected or died; fall back to polling until it heals. */
+        stopEventStream()
+        if (store.state.runId === runId && store.state.running === true) schedulePoll(runId)
+      }
+    }
 
     /** Reattach a run that kept running in the host after a refresh or window close. */
     async function adoptRunningRun() {
@@ -499,7 +558,7 @@ window.__ModuleLoader__.load({
         const current = rows.find((row) => row !== null && typeof row === 'object' && row.status === 'running')
         if (current === undefined || typeof current.id !== 'string') return
         store.publish({ runId: current.id, run: current, running: true, error: '' })
-        schedulePoll(current.id)
+        watchRun(current.id)
       } catch {
         /* best effort: the tab still works without reattachment */
       }
@@ -511,6 +570,8 @@ window.__ModuleLoader__.load({
         window.addEventListener('pagehide', () => {
           const runId = store.state.runId
           if (store.state.running !== true || typeof runId !== 'string' || runId === '') return
+          /* A follower tab must not cancel the leader's run on hide. */
+          if (isPollLeader() !== true) return
           try {
             if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
               navigator.sendBeacon(`/council/run/${encodeURIComponent(runId)}/cancel`)
@@ -527,6 +588,55 @@ window.__ModuleLoader__.load({
     const sessionCache = new Map()
     const SESSION_KEYS = ['question', 'runId', 'run', 'running', 'feedbackRunId', 'workspace']
 
+    /*
+     * Multi-tab election: only one tab per session polls and delivers, so two
+     * open tabs cannot double-poll or double-deliver the conclusion. The leader
+     * publishes its role; a tab that stops seeing heartbeats takes over.
+     */
+    const LEADER_TTL_MS = 2500
+    let leaderChannel = null
+    let leaderTab = ''
+    let leaderSeenAt = 0
+    let leaderTimer = 0
+
+    function initLeaderElection(sessionId) {
+      if (typeof window === 'undefined' || typeof window.BroadcastChannel !== 'function') return
+      try {
+        leaderChannel = new window.BroadcastChannel(`dsh-council-${sessionId}`)
+        leaderChannel.onmessage = (event) => {
+          const data = event !== null && typeof event === 'object' ? event.data : null
+          if (data === null || typeof data !== 'object') return
+          if (typeof data.leader === 'string' && data.leader !== leaderTab) {
+            leaderSeenAt = Date.now()
+          }
+        }
+      } catch {
+        leaderChannel = null
+        return
+      }
+      leaderTab = `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+      leaderSeenAt = 0
+      if (leaderTimer !== 0) window.clearInterval(leaderTimer)
+      leaderTimer = window.setInterval(() => {
+        if (leaderChannel === null) return
+        /* Another tab claimed leadership recently: stay a follower. */
+        if (Date.now() - leaderSeenAt < LEADER_TTL_MS) return
+        leaderSeenAt = Date.now()
+        try {
+          leaderChannel.postMessage({ leader: leaderTab, sessionId: store.state.sessionId })
+        } catch {
+          /* best effort */
+        }
+      }, 1000)
+    }
+
+    /** True when this tab owns polling for the current session. */
+    function isPollLeader() {
+      /* Without BroadcastChannel every tab degrades to independent polling. */
+      if (leaderChannel === null) return true
+      return Date.now() - leaderSeenAt < LEADER_TTL_MS
+    }
+
     function saveSessionState() {
       const sessionId = store.state.sessionId
       if (typeof sessionId !== 'string' || sessionId === '') return
@@ -542,7 +652,7 @@ window.__ModuleLoader__.load({
         return
       }
       store.publish({ ...cached, error: '' })
-      if (cached.running === true && typeof cached.runId === 'string' && cached.runId !== '') schedulePoll(cached.runId)
+      if (cached.running === true && typeof cached.runId === 'string' && cached.runId !== '') watchRun(cached.runId)
     }
 
     function switchSession(sessionId) {
@@ -552,6 +662,7 @@ window.__ModuleLoader__.load({
       saveSessionState()
       store.publish({ sessionId })
       restoreSessionState(sessionId)
+      initLeaderElection(sessionId)
       void loadWorkspace()
       void adoptRunningRun()
     }
@@ -572,13 +683,20 @@ window.__ModuleLoader__.load({
 
     async function pollRun(runId) {
       if (store.state.runId !== runId) return
+      if (isPollLeader() !== true) return
       try {
         const data = await fetchJson(`/council/run/${encodeURIComponent(runId)}`)
         if (store.state.runId !== runId) return
         const running = data.status === 'running'
         store.publish({ run: data, running })
-        if (running) schedulePoll(runId)
-        else if (data.status === 'done' && store.state.feedbackMode !== 'off') {
+        if (running) {
+          /* The SSE stream may have healed while we were polling. */
+          if (eventSource === null && typeof window !== 'undefined' && typeof window.EventSource === 'function') {
+            watchRun(runId)
+          } else {
+            schedulePoll(runId)
+          }
+        } else if (data.status === 'done' && store.state.feedbackMode !== 'off') {
           void resumeRun(runId, store.state.feedbackMode)
         }
       } catch (error) {
@@ -612,8 +730,13 @@ window.__ModuleLoader__.load({
         models,
         chairman,
         context: store.state.useContext === true,
-        attachFiles: store.state.useSubagentSeats !== false ? false : store.state.attachFiles !== false,
+        attachFiles: store.state.attachFiles !== false,
         seatMode: store.state.useSubagentSeats !== false ? 'subagent' : 'llm',
+        /* Hybrid seats: with subagent seats on, only the first N answerers are
+           subagents; the rest take the fast streaming path. */
+        subagentSeats: store.state.useSubagentSeats !== false
+          ? Math.max(1, Math.min(store.state.selected.length - 1, store.state.seatSplit))
+          : 0,
         useChairman,
         sessionId,
       }
@@ -627,7 +750,7 @@ window.__ModuleLoader__.load({
         })
         if (typeof data.runId !== 'string' || data.runId === '') throw new Error('missing runId')
         store.publish({ runId: data.runId })
-        schedulePoll(data.runId)
+        watchRun(data.runId)
       } catch (error) {
         store.publish({ running: false, error: String(error && error.message ? error.message : error) })
       }
@@ -869,7 +992,11 @@ window.__ModuleLoader__.load({
       const [copied, setCopied] = React.useState(false)
 
       React.useEffect(() => {
-        if (typeof draftBridge.sessionId === 'string' && draftBridge.sessionId !== '') switchSession(draftBridge.sessionId)
+        if (typeof draftBridge.sessionId === 'string' && draftBridge.sessionId !== '') {
+          switchSession(draftBridge.sessionId)
+        } else {
+          initLeaderElection(store.state.sessionId)
+        }
         if (state.catalog.length === 0) void loadModels()
         void adoptRunningRun()
         return () => saveSessionState()
@@ -995,8 +1122,26 @@ window.__ModuleLoader__.load({
               })),
               h('div', { className: 'dsc-hint' }, t('panel.privacy', { chars: state.contextMaxChars })),
               h('div', { className: 'dsc-hint' }, t('panel.filesHint', { chars: state.filesMaxChars })),
-              h('div', { className: 'dsc-hint' }, t('panel.seatsHint')),            ),
-            h('div', { className: 'dsc-field' },
+              h('div', { className: 'dsc-hint' }, t('panel.seatsHint')),
+              state.useSubagentSeats === true
+                ? h('div', { className: 'dsc-hint' },
+                    h('label', { className: 'dsc-inline' },
+                      h('span', null, t('panel.seatSplit', { count: state.seatSplit })),
+                      h('input', {
+                        type: 'range', min: 1, max: 5, step: 1,
+                        value: state.seatSplit,
+                        onChange: (event) => {
+                          const value = Number(event.target.value)
+                          if (Number.isSafeInteger(value) && value >= 1 && value <= 5) {
+                            store.publish({ seatSplit: value })
+                            persist()
+                          }
+                        },
+                      }),
+                    ),
+                  )
+                : null,
+            ),            h('div', { className: 'dsc-field' },
               h('span', { className: 'dsc-field-label' }, t('panel.feedbackMode')),
               h('div', { className: 'dsc-toggles' },
                 feedbackOption('off', 'panel.feedbackOff'),
@@ -1086,7 +1231,12 @@ window.__ModuleLoader__.load({
                         }))
                       : null,
                     run.seatMode === 'subagent'
-                      ? h('span', { className: 'dsc-note' }, t('panel.seatModeSub'))
+                      ? h('span', { className: 'dsc-note' }, t('panel.seatModeHybrid', {
+                          sub: typeof run.subagentSeats === 'number' ? run.subagentSeats : 0,
+                          fast: run.answers !== undefined && Array.isArray(run.answers)
+                            ? Math.max(0, run.answers.length - (typeof run.subagentSeats === 'number' ? run.subagentSeats : 0))
+                            : 0,
+                        }))
                       : state.useSubagentSeats !== false
                         ? h('span', { className: 'dsc-warn' }, t('panel.seatModeFallback'))
                         : null,
@@ -1175,6 +1325,19 @@ window.__ModuleLoader__.load({
           if (retired) return
           retired = true
           stopPolling()
+          stopEventStream()
+          if (leaderTimer !== 0) {
+            window.clearInterval(leaderTimer)
+            leaderTimer = 0
+          }
+          if (leaderChannel !== null) {
+            try {
+              leaderChannel.close()
+            } catch {
+              /* best effort */
+            }
+            leaderChannel = null
+          }
           for (const dispose of disposers.reverse()) {
             try {
               dispose()

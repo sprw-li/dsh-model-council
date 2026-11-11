@@ -63,7 +63,7 @@ const SCENARIOS = [
   {
     id: 'run-1', status: 'done', stage: 'done', question: '测试问题', error: '',
     contextChars: 120, contextState: 'ok', useChairman: true,
-    seatMode: 'subagent',
+    seatMode: 'subagent', subagentSeats: 1,
     filesState: 'ok', filesPaths: ['D:\\demo'], filesChars: 1200,
     codeState: 'ok', codeFiles: 4, codeChars: 3000,
     answers: answersFor(),
@@ -383,7 +383,7 @@ if (resumeCalls.length !== 1 || resumeCalls[0].mode !== 'wake') {
 }
 const filesHtml = render(React.createElement(tabBody, { t }))
 if (!filesHtml.includes('已附带 1 个路径')) throw new Error('path-attachment note is missing after the run')
-if (!filesHtml.includes('本次使用只读 subagent 席位')) throw new Error('subagent-seat note is missing after the run')
+if (!filesHtml.includes('席位：1 个只读 subagent + 1 个快速')) throw new Error('hybrid seat note is missing after the run')
 if (!filesHtml.includes('已附带源码 4 个文件')) throw new Error('source-pack note is missing after the run')
 if (!filesHtml.includes('首字 0.9s')) throw new Error('per-seat TTFT metric is missing after the run')
 

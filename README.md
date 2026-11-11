@@ -23,7 +23,7 @@ DeepSeek Harness 的多模型理事会插件：一个入口把问题交给多个
 | **接当前对话上下文** | 开 | 把当前会话最近约 6000 字可见文本附在问题前；失败自动降级为只发问题并提示。 |
 | **自动附带问题里的本地路径** | 开 | 问题中出现的本地绝对路径（如 `D:\dev\项目`，也兼容 `D/dev/项目` 写法）会自动读取：目录树（深度 2）+ 关键文件（README/SKILL/CLAUDE/AGENTS/CHECKPOINT/pyproject/package.json/ARCHITECTURE/STATUS/DEFAULTS/RELEASE/DECISIONS 等，最多 6 个、单文件 8k 字、总 20k 字），跳过 `.git`/`node_modules`/`runs`/密钥类文件。**没写路径但问题提到「工作区/项目/仓库」时，自动改用当前会话工作区**（`SessionHeader.cwd` → workspace registry → Host cwd 兜底）；也支持 `@相对路径`。 |
 | **结果回投**（三元） | 不做 | 运行结束后如何处置结论：<br>**不做** = 只留在右侧栏；<br>**静默注入** = 按 subagent 的 turn 边界语义 `send(msg, 'next-turn', false)`：结论排到**下一轮**，不唤醒主 Agent，也不会在当前 turn 中途插话；<br>**直接唤醒** = `followup()`（即 subagent parent 投递）：排一个普通后续 turn，立即让主 Agent 回复。 |
-| **subagent 只读席位** | 开 | 每个委员是一个真正的只读子代理（`spawn` + `council-readonly` Agent Preset：只读文件、搜索、加载 skill、时间上下文，无写/编辑/执行工具），继承当前会话工作区 cwd，可以自己查证代码；关闭则退回纯模型调用。subagent 席位更慢，且会在子代理侧栏出现子会话。 |
+| **subagent 只读席位（混合）** | 关 | 开启后**前 N 个**委员是只读子代理（`spawn` + `council-readonly` Agent Preset：只读文件、搜索、加载 skill），其余走快速纯模型流式通道；`subagentSeats` 滑杆选 N（1–5，默认 2）。全关 = 全部纯模型。subagent 席位整轮结束才出正文，快速席位逐字流式。 |
 | **主席汇总（关闭=无主）** | 开 | 关掉则只出各模型答案与匿名互评，不做主席结论。 |
 
 参与模型 2–6 个，主席模型可选；选择与选项都记在浏览器 localStorage。
@@ -54,7 +54,8 @@ DeepSeek Harness 的多模型理事会插件：一个入口把问题交给多个
 | GET | `/council/runs?sessionId=` | 最近 5 个运行快照（含仍在跑的），用于页面刷新/重开后接回运行 |
 | GET | `/council/run/<id>` | 快照：阶段、`contextChars/contextState`、`filesState/filesPaths/filesChars`、`workspace`、`structure`、`seatMode`、`resumed`、各席位文本与 `seat` 状态、互评、主席结论 |
 | POST | `/council/run/<id>/resume` | `{ mode: 'silent' \| 'wake' }`：静默注入（`agent.inject`）或直接唤醒（`agent.followup`）；每个结果只接受一次 |
-| POST | `/council/run/<id>/cancel` | 中止全部在途调用 |
+| GET | `/council/run/<id>/stream` | SSE 事件流：每个快照带递增 `seq`（`id:` 字段可断线续传），终态发 `event: end` 后关闭；断流时 client 自动回退 320ms 轮询 |
+| POST | `/council/run/<id>/cancel` | 中止全部在途调用并 dispose 活跃席位 |
 
  运行记录保存在宿主内存（30 分钟过期、最多 `MAX_RUNS = 16` 条），并同步落盘到 `${DSH_HOME:-~/.dsh}/council-runs.json`（最多 20 条、500ms 防抖）；DSH 重启后仍能查到历史运行，重启前仍在跑的那条会标成「Host 重启，运行中断」。
 
@@ -142,6 +143,8 @@ council 不再只靠正则猜路径，而是按 Harness 自己的结构解析：
 - 「结果回投」的**直接唤醒**会让主 Agent 立即回复（有意行为）；**静默注入**与 subagent 的投递边界一致：`send(msg, 'next-turn', false)` 只排队、不唤醒，结论在**下一轮用户消息**的 turn 边界进入上下文，不会打断当前 turn。
 - 上下文只取可见文本，不含工具调用与附件；路径附件只读文本类文件（1 MB 内），不读二进制、不跟随符号链接。
 - **运行中可停止**：运行中显示「停止」按钮；页面刷新/重新打开后会自动从 `GET /council/runs` 接回正在跑的 run（仍可点停止）。直接关闭浏览器窗口/标签页时，client 用 `navigator.sendBeacon` 通知 host 取消当前 run（`pagehide`），不会把后台运行留在无人看管状态。**关闭右侧栏 tab 不终止运行**（设计如此：重开 tab 可接回），要终止请点「停止」或关闭页面。
+- **多标签页**：同会话多标签用 `BroadcastChannel` 选主，只有一个标签轮询/回投/在关页时取消；leader 失联 2.5s 内其他标签接管。无 BroadcastChannel 的环境退化为各自轮询。
+- **每席指标**：快照 `seat.ttftMs/elapsedMs`，卡片显示「首字 Xs · 总 Ys」，用于定位慢席位（subagent 席位 TTFT 高是正常的——它整轮结束才出正文）。
 - **subagent 席位只在作答阶段**：互评与主席走快速纯模型通道，避免 6 席 × 多阶段各开一整轮子代理导致假死；单席有启动 60s / 执行 240s 上限（`SEAT_START_TIMEOUT_MS` / `SEAT_RESULT_TIMEOUT_MS`，与本节一致），超时或失败自动降级纯模型（卡片标「完成（降级）」），整轮另有 30 分钟 watchdog。卡片在运行中显示「启动中/运行中 Ns」。
 - **subagent 模式下路径附件默认关闭**：委员自己用只读工具读工作区，避免重复注入 20k 字；如需同时注入，走 API 显式传 `attachFiles: true`。
 - **subagent 席位较慢**：每席是一轮完整子代理（带工具），比纯模型调用慢数倍；子会话会出现在子代理侧栏。`council-readonly` preset 依赖 DSH 的 `dsh-persona`/`dsh-tool-fs`/`dsh-tool-fs-search`/`dsh-skill-filesystem`/`dsh-tool-skill` 模块名，升级 DSH 后若改名会注册失败并自动退回纯模型模式（UI 会提示）。
