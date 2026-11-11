@@ -13,6 +13,7 @@
 
 ## P1/P2（本轮新增）
 
+- **`council_review` 全局工具**：任何 agent（含 subagent/workflow）可编程调用理事会，拿回 `{conclusion, runId, models}`（三个字段全部 required，结论末尾带参与模型与 runId 括注行）；工作区按调用方会话解析、`exec.signal` 联动取消；自动挑模型保证异构（每 provider 一个、模型名不重复）。实测三轮：subagent 调用 → 3 模型作答/互评/主席汇总返回；元数据缺失缺陷由测试 subagent 报告并修复；同名重复缺陷（DeepSeek-V4.1-Flash ×2）同样由测试 subagent 抓出并修复，复测 3 个不同模型零重复。
 - **SSE 事件流**：`GET /council/run/<id>/stream`，快照带递增 `seq`、终态 `event: end`；client 优先用 EventSource，断流自动回退 320ms 轮询。实测 16 事件、`seq=13` 结束。
 - **多标签选主**：`BroadcastChannel` 每会话一个 leader，只有 leader 轮询/回投/关页取消；失联 2.5s 接管。
 - **混合席位**：`subagentSeats`（1–5，默认 2）个只读 subagent + 其余快速流式；快照 `subagentSeats` 与 UI 滑杆；有快速席位时源码包照常附带。

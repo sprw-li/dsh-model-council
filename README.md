@@ -70,6 +70,26 @@ council 不再只靠正则猜路径，而是按 Harness 自己的结构解析：
 | **group 角色组** | `structure.roles = { answerers, reviewers, arbiter }`；`POST /council/run` 可传 `reviewers` 子集（缺省=全部作答模型），arbiter 即主席。 |
 | **workflow 阶段** | `structure.stages = ['answers','reviews','synthesize']`（无主席时省略末段），每个阶段对一组角色执行，快照 `structure` 即节点图。 |
 
+## 供 Agent 调用：`council_review` 工具
+
+council 不只是 Web UI——host 侧注册了**全局工具 `council_review`**，任何 agent（主 Lead、迭代中的 subagent、workflow 步骤）都能编程调用，拿回理事会结论：
+
+```
+council_review({
+  question: "评审 xxx 的实现，指出两个最值得先修的问题",
+  models: [{provider, model}, ...],   // 可选；缺省自动挑 ≤3 个跨 provider 模型
+  chairman: true,                     // 可选，默认 true
+  attachFiles: true,                  // 可选，默认 true：附调用方工作区（树/关键文件/源码包）
+})
+→ { conclusion, runId, models }
+```
+
+要点：
+- **工作区归属调用方**：用 `exec.agent` 的会话解析 cwd，subagent 在自己工作区里评审自己改的东西；
+- **取消联动**：工具转发 `exec.signal`，调用方中断 → run 立即取消并 dispose；
+- **超时**：工具声明 `RUN_TIMEOUT_MS`（30 分钟）为协作上限；
+- **自反馈循环**：边改边评审的标准姿势——改完一批，spawn 一个 subagent 让它带着改动上下文调 `council_review`，读回结论决定下一步；council 自身的很多修复就是这么被理事会指出的。
+
 ## Skill 接入（agent-library / DSH）
 
 `council-readonly` 席位里装了 `skill-filesystem` + `tool-skill`，所以委员**能只读加载 skill**（列在它的 catalog 里、能看到 `skill` 工具）。

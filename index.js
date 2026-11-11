@@ -26,7 +26,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { lstat, readdir, readFile, stat } from 'node:fs/promises'
 import { extname, isAbsolute, join, relative, sep } from 'node:path'
 
-export const inject = ['webServer', 'llm', 'agents', 'subagents']
+export const inject = ['webServer', 'llm', 'agents', 'subagents', 'tools']
 
 /** Selected models per run. */
 const MAX_MODELS = 6
@@ -152,6 +152,25 @@ function sendJson(res, code, value) {
 /** Human-readable message of any thrown value. */
 function errorText(error) {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** Auto-pick heterogeneous routes from a catalog: one provider and one model name each. */
+export function defaultRoutesFromCatalog(cat) {
+  const routes = []
+  for (const provider of cat.providers) {
+    if (routes.length >= 3) break
+    const model = provider.models.find((candidate) => candidate !== undefined
+      && !routes.some((row) => row.provider === provider.id || row.name === candidate.name))
+    if (model === undefined) continue
+    routes.push({
+      key: `${provider.id}|${model.id}`,
+      provider: provider.id,
+      providerName: provider.name,
+      model: model.id,
+      name: model.name,
+    })
+  }
+  return routes
 }
 
 /** Clip one answer before it enters another prompt. */
@@ -566,7 +585,7 @@ export function apply(ctx, config) {
       for (const run of runs.values()) {
         rows.push({
           id: run.id,
-          sessionId: run.sessionId,
+          sessionId: typeof run.sessionId === 'string' ? run.sessionId : '',
           status: run.status,
           stage: run.stage,
           question: String(run.question || '').slice(0, 120),
@@ -868,8 +887,7 @@ export function apply(ctx, config) {
 
   /** Global per-provider slot so tabs/chats cannot multiply provider concurrency. */
   const providerActive = new Map()
-  async function withProviderSlot(provider, signal, run) {
-    while ((providerActive.get(provider) || 0) >= PROVIDER_CONCURRENCY) {
+  async function withProviderSlot(provider, signal, run) {    while ((providerActive.get(provider) || 0) >= PROVIDER_CONCURRENCY) {
       if (signal !== undefined && signal.aborted) throw new Error('已取消')
       await new Promise((resolve) => setTimeout(resolve, 40))
     }
@@ -993,6 +1011,7 @@ export function apply(ctx, config) {
   function snapshot(run) {
     return {
       id: run.id,
+      sessionId: typeof run.sessionId === 'string' ? run.sessionId : '',
       /* Monotonic per-run revision: lets an SSE stream resume exactly where it left off. */
       seq: typeof run.seq === 'number' ? run.seq : 0,
       status: run.status,
@@ -1394,6 +1413,229 @@ export function apply(ctx, config) {
     }
   }
 
+  /* ------------------------------------------------------------------ *
+   * council_review: a global tool so any agent — the Lead, a subagent   *
+   * spawned mid-iteration, or a workflow step — can run a council       *
+   * review programmatically and read back the synthesized conclusion.   *
+   * ------------------------------------------------------------------ */
+
+  /** Default cross-provider routes when the caller does not name models. */
+  function defaultRoutes(cat) {
+    return defaultRoutesFromCatalog(cat)
+  }
+
+  /** Conclusion text returned to the calling agent. */
+  function toolConclusion(run) {
+    const usable = run.answers.filter((answer) => answer.text !== '')
+    const modelsLine = `（参与模型：${run.answers.map((answer) => answer.name).join('、')}；runId: ${run.id}）`
+    if (run.status === 'error') {
+      const kept = usable.map((answer) => `### ${answer.name}\n${answer.text}`).join('\n\n')
+      return `理事会运行失败：${run.error}${kept === '' ? '' : `\n\n已完成的答案：\n${kept}`}\n\n${modelsLine}`
+    }
+    if (run.chairman.text !== '') return `${run.chairman.text}\n\n${modelsLine}`
+    const parts = ['（无主席汇总：各模型答案如下）', '']
+    for (const answer of run.answers) {
+      parts.push(`### ${answer.name}`, answer.text !== '' ? answer.text : `（失败：${answer.error}）`, '')
+    }
+    parts.push(modelsLine)
+    return parts.join('\n')
+  }
+
+  ctx.effect(() => ctx.tools.register({
+    name: 'council_review',
+    description:
+      'Run a multi-model council review: several models answer the question in parallel, '
+      + 'review each other anonymously, and a chairman model synthesizes the final conclusion. '
+      + 'Use it for cross-checking claims, second opinions, or reviewing code and documents '
+      + 'from multiple perspectives. The calling workspace is attached automatically '
+      + '(directory tree, key files, and a bounded source pack for review questions). '
+      + 'Returns the synthesized conclusion text. Slow by design: expect minutes, not seconds; '
+      + 'prefer it for review-grade questions rather than quick lookups.',
+    parameters: {
+      type: 'object',
+      properties: {
+        question: {
+          type: 'string',
+          description: 'The question or review task, self-contained. Mention paths or "the workspace" to have files attached.',
+        },
+        models: {
+          type: 'array',
+          description: 'Explicit participants as {provider, model}. Omit to auto-pick up to 3 cross-provider defaults.',
+          items: {
+            type: 'object',
+            properties: {
+              provider: { type: 'string', description: 'Provider id from the catalog' },
+              model: { type: 'string', description: 'Model id from the catalog' },
+            },
+            required: ['provider', 'model'],
+            additionalProperties: false,
+          },
+        },
+        chairman: {
+          type: 'boolean',
+          description: 'Whether a chairman model synthesizes the conclusion (default true).',
+        },
+        attachFiles: {
+          type: 'boolean',
+          description: 'Attach the calling workspace (tree, key files, source pack). Default true.',
+        },
+      },
+      required: ['question'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          conclusion: { type: 'string', description: 'Synthesized conclusion (or assembled answers when chairman is off), ending with the participant list and runId.' },
+          runId: { type: 'string', description: 'Council run id for diagnostics.' },
+          models: { type: 'array', items: { type: 'string' }, description: 'Participating routes as provider/model.' },
+        },
+        required: ['conclusion', 'runId', 'models'],
+      },
+      render: (args, value) => [{
+        type: 'text',
+        text: value !== null && typeof value === 'object' && typeof value.conclusion === 'string'
+          ? value.conclusion
+          : String(value),
+      }],
+      presentationMeta: (args, value) => (value !== null && typeof value === 'object'
+        ? {
+          runId: typeof value.runId === 'string' ? value.runId : '',
+          models: Array.isArray(value.models) ? value.models : [],
+        }
+        : {}),
+    },
+    timeoutMs: RUN_TIMEOUT_MS,
+    isConcurrencySafe: () => false,
+    async execute(args, exec) {
+      const input = args === null || typeof args !== 'object' ? {} : args
+      const question = typeof input.question === 'string' ? input.question.trim() : ''
+      if (question === '') throw new Error('question is required')
+      if (question.length > MAX_QUESTION) throw new Error('question is too long')
+      const cat = await catalog()
+      const selected = []
+      if (Array.isArray(input.models) && input.models.length > 0) {
+        for (const item of input.models.slice(0, MAX_MODELS)) {
+          if (item === null || typeof item !== 'object') continue
+          const route = findRoute(cat, String(item.provider || ''), String(item.model || ''))
+          if (route === undefined) throw new Error(`unknown model: ${String(item.provider)}/${String(item.model)}`)
+          if (!selected.some((row) => row.key === route.key)) selected.push(route)
+        }
+      } else {
+        for (const route of defaultRoutes(cat)) selected.push(route)
+      }
+      if (selected.length === 0) throw new Error('no models available for the council')
+      const useChairman = input.chairman !== false
+      const chairman = selected[0]
+      /* The calling agent owns the workspace and the cancellation signal. */
+      const caller = exec !== null && typeof exec === 'object' ? exec.agent : undefined
+      const callerId = caller !== undefined && caller !== null && typeof caller.id === 'string' ? caller.id : ''
+      const workspace = resolveWorkspace(callerId)
+      const contextParts = []
+      let filesState = 'off'
+      let filesPaths = []
+      let filesChars = 0
+      let codeState = 'off'
+      let codeFiles = 0
+      let codeChars = 0
+      if (input.attachFiles !== false) {
+        const files = await collectPathContext(
+          question, filesMaxChars, workspace.cwd, codeMaxChars, true, attachRoots,
+        )
+        filesState = files.state
+        filesPaths = files.paths
+        filesChars = files.chars
+        codeState = files.codeState
+        codeFiles = files.codeFiles
+        codeChars = files.codeChars
+        if (files.text !== '') contextParts.push(files.text)
+      }
+      const routes = {}
+      for (const route of selected) routes[route.key] = route
+      const run = {
+        id: `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`,
+        createdAt: Date.now(),
+        sessionId: callerId,
+        useChairman,
+        seatMode: 'llm',
+        subagentSeats: 0,
+        cwd: workspace.cwd,
+        contextState: 'off',
+        filesState,
+        filesPaths,
+        filesChars,
+        codeState,
+        codeFiles,
+        codeChars,
+        workspace,
+        structure: {
+          roles: {
+            answerers: selected.map((route) => route.key),
+            reviewers: selected.map((route) => route.key),
+            arbiter: useChairman ? chairman.key : '',
+          },
+          stages: useChairman ? ['answers', 'reviews', 'synthesize'] : ['answers', 'reviews'],
+          workspace,
+          seatMode: 'llm',
+        },
+        contextBlock: contextParts.join('\n\n'),
+        status: 'running',
+        stage: 'answers',
+        question,
+        error: '',
+        controller: new AbortController(),
+        answers: selected.map((route) => ({
+          key: route.key, provider: route.provider, model: route.model, name: route.name,
+          text: '', done: false, error: '', seat: { phase: 'idle' },
+        })),
+        reviews: selected.map((route) => ({
+          key: route.key, reviewer: route.name, text: '', done: false, error: '', seat: { phase: 'idle' },
+        })),
+        chairman: {
+          key: chairman.key, provider: chairman.provider, model: chairman.model, name: chairman.name,
+          text: '', done: false, error: '', seat: { phase: 'idle' },
+        },
+        liveSeats: new Set(),
+        fallbacks: 0,
+        toolRun: true,
+      }
+      run.watchdog = setTimeout(() => {
+        if (run.status !== 'running') return
+        finishRun(run, 'error', '运行超时（30 分钟），已中止')
+        try {
+          run.controller.abort()
+        } catch {
+          /* best effort */
+        }
+      }, RUN_TIMEOUT_MS)
+      if (typeof run.watchdog.unref === 'function') run.watchdog.unref()
+      const signal = exec !== null && typeof exec === 'object' ? exec.signal : undefined
+      if (signal !== undefined) {
+        if (signal.aborted) throw new Error('已取消')
+        signal.addEventListener('abort', () => {
+          try {
+            run.controller.abort()
+          } catch {
+            /* best effort */
+          }
+        }, { once: true })
+      }
+      runs.set(run.id, run)
+      persistRuns()
+      try {
+        await execute(run, routes)
+      } finally {
+        if (run.watchdog !== undefined) clearTimeout(run.watchdog)
+      }
+      return {
+        conclusion: toolConclusion(run),
+        runId: run.id,
+        models: selected.map((route) => `${route.provider}/${route.model}`),
+      }
+    },
+  }), 'council: review tool')
+
   ctx.effect(() => ctx.webServer.register({
     kind: 'prefix',
     path: '/council',
@@ -1431,7 +1673,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v22', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v25', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -1440,7 +1682,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v22' })
+          sendJson(res, 200, { ok: true, build: 'v25' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
