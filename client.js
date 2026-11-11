@@ -568,7 +568,10 @@ window.__ModuleLoader__.load({
       try {
         eventSource = new window.EventSource(`/council/run/${encodeURIComponent(runId)}/stream`)
       } catch {
-        schedulePoll(runId)
+        /* Same rule as every other poll-conversion path: only the leader
+           polls. A follower that cannot open a stream waits for takeover
+           instead of spinning its own poller. */
+        if (isPollLeader() === true) schedulePoll(runId)
         return
       }
       armStreamWatchdog(runId)

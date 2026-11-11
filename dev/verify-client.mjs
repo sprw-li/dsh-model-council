@@ -620,6 +620,16 @@ if (!silentHtml.includes('已静默放进上下文')) throw new Error('silent de
   if (!/switchSession\(sessionId\)/.test(openWindow)) {
     throw new Error('openCouncilTab must route the session switch through switchSession')
   }
+  /* Every path that can convert a stream failure into polling must be gated:
+     the EventSource-constructor catch was the last ungated one. */
+  const watchAt = source.indexOf('function watchRun(runId)')
+  if (watchAt === -1) throw new Error('watchRun not found')
+  const constructorAt = source.indexOf('new window.EventSource(', watchAt)
+  if (constructorAt === -1) throw new Error('EventSource construction not found in watchRun')
+  const constructorBlock = source.slice(constructorAt, constructorAt + 500)
+  if (!/isPollLeader\(\) === true/.test(constructorBlock)) {
+    throw new Error('the EventSource constructor catch must be leader-gated')
+  }
 }
 
 for (const cleanup of cleanups.reverse()) {
