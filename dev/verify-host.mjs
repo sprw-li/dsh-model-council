@@ -134,6 +134,18 @@ try {
   assert.equal(providers.size, picks.length, 'auto-pick must not repeat a provider')
   assert.equal(names.size, picks.length, 'auto-pick must not repeat a model name')
 
+  /* Deadline discipline: a caller-provided budget must bound the retry loop.
+     Simulate the clamp arithmetic the host applies per attempt. */
+  const clampAttempt = (deadlineAt, now) => (typeof deadlineAt === 'number' ? Math.min(300000, Math.max(0, deadlineAt - now)) : Infinity)
+  assert.equal(clampAttempt(0, 0), 0, 'an expired deadline must leave zero budget')
+  assert.equal(clampAttempt(1000, 0), 1000, 'the attempt timeout clamps to the remaining budget')
+  assert.equal(clampAttempt(Infinity, 0), 300000, 'no deadline keeps the full per-call timeout')
+  assert.equal(clampAttempt(-1, 0), 0, 'a past deadline is zero, never negative (no zero-timeout helper)')
+  /* Seat budgets clamp the same way: start and result windows never outlive the run. */
+  const clampSeat = (seatMs, deadlineAt, now) => Math.min(seatMs, Math.max(0, deadlineAt - now))
+  assert.equal(clampSeat(60000, 1000, 0), 1000, 'seat start clamps to the remaining run budget')
+  assert.equal(clampSeat(240000, 100, 500), 0, 'an expired run leaves no seat result budget')
+
   /* runLimited never exceeds its window. */
   let active = 0
   let peak = 0

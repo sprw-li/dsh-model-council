@@ -959,8 +959,13 @@ export function apply(ctx, config) {
     }
   }
 
-  /** Stream one model call; retries transient provider failures with backoff. */
-  async function callModel(route, system, userText, maxTokens, signal, onDelta, seat) {
+  /**
+   * Stream one model call; retries transient provider failures with backoff.
+   * `deadlineAt` is the run's absolute budget end: every attempt's timeout is
+   * clamped to the remaining time, and a retry that cannot fit is refused, so
+   * retries can never eat the whole run behind the watchdog's back.
+   */
+  async function callModel(route, system, userText, maxTokens, signal, onDelta, seat, deadlineAt) {
     if (seat !== undefined && seat !== null && typeof seat.startedAt !== 'number') {
       seat.startedAt = Date.now()
       seat.phase = 'running'
@@ -969,11 +974,16 @@ export function apply(ctx, config) {
       if (seat !== undefined && seat !== null && typeof seat.ttftAt !== 'number') seat.ttftAt = Date.now()
       if (typeof onDelta === 'function') onDelta(text)
     }
+    /** Remaining ms until the run deadline, or Infinity without one. */
+    const remaining = () => (typeof deadlineAt === 'number' ? Math.max(0, deadlineAt - Date.now()) : Infinity)
     let budget = maxTokens
     let lastError
     for (let attempt = 0; attempt < 3; attempt += 1) {
       if (signal.aborted) throw new Error('已取消')
-      const timeout = AbortSignal.timeout(CALL_TIMEOUT_MS)
+      const left = remaining()
+      if (left <= 0) throw new Error(lastError instanceof Error ? `整轮预算耗尽：${lastError.message}` : '整轮预算耗尽')
+      const attemptTimeout = Math.min(CALL_TIMEOUT_MS, left)
+      const timeout = AbortSignal.timeout(attemptTimeout)
       const combined = typeof AbortSignal.any === 'function' ? AbortSignal.any([signal, timeout]) : timeout
       let text = ''
       let finish
@@ -1010,7 +1020,9 @@ export function apply(ctx, config) {
         lastError = thrown instanceof Error ? thrown : new Error(String(thrown))
         if (signal.aborted) throw new Error('已取消')
         if (attempt < 2 && TRANSIENT_FAILURE.test(lastError.message)) {
-          await new Promise((resolve) => setTimeout(resolve, 800 * (attempt + 1)))
+          const backoff = Math.min(800 * (attempt + 1), remaining())
+          if (backoff <= 0) throw new Error(`整轮预算耗尽：${lastError.message}`)
+          await new Promise((resolve) => setTimeout(resolve, backoff))
           continue
         }
         throw lastError
@@ -1026,7 +1038,9 @@ export function apply(ctx, config) {
             : '未知错误'
           lastError = new Error(detail)
           if (attempt < 2 && TRANSIENT_FAILURE.test(detail)) {
-            await new Promise((resolve) => setTimeout(resolve, 800 * (attempt + 1)))
+            const backoff = Math.min(800 * (attempt + 1), remaining())
+            if (backoff <= 0) throw new Error(`整轮预算耗尽：${detail}`)
+            await new Promise((resolve) => setTimeout(resolve, backoff))
             continue
           }
           throw lastError
@@ -1094,6 +1108,9 @@ export function apply(ctx, config) {
       structure: run.structure === undefined ? { roles: {}, stages: [] } : run.structure,
       seatMode: run.seatMode === undefined ? 'llm' : run.seatMode,
       stopReason: run.stopReason === undefined ? '' : run.stopReason,
+      /* Deadline audit: when the run budget ends and how much is left. */
+      deadlineAt: run.createdAt + RUN_TIMEOUT_MS,
+      remainingMs: Math.max(0, run.createdAt + RUN_TIMEOUT_MS - Date.now()),
       subagentSeats: run.subagentSeats === undefined ? 0 : run.subagentSeats,
       fallbacks: run.fallbacks === undefined ? 0 : run.fallbacks,
       fallbackLimit: MAX_FALLBACKS_PER_RUN,
@@ -1251,8 +1268,12 @@ export function apply(ctx, config) {
   }
 
   /** One read-only subagent seat, built on the same delegation runtime as the subagent tool. */
-  async function callSeatSubagent(parent, route, system, userText, maxTokens, signal, cwd, seat, liveSeats) {
-    const timeout = AbortSignal.timeout(CALL_TIMEOUT_MS)
+  async function callSeatSubagent(parent, route, system, userText, maxTokens, signal, cwd, seat, liveSeats, deadlineAt) {
+    /** Seat budgets clamp to the run deadline so a seat can never outlive the run. */
+    const remaining = () => (typeof deadlineAt === 'number' ? Math.max(0, deadlineAt - Date.now()) : Infinity)
+    const left = remaining()
+    if (left <= 0) throw new Error('整轮预算耗尽，不再启动席位')
+    const timeout = AbortSignal.timeout(Math.min(CALL_TIMEOUT_MS, left))
     const combined = typeof AbortSignal.any === 'function' ? AbortSignal.any([signal, timeout]) : timeout
     if (seat !== undefined && seat !== null) {
       seat.phase = 'starting'
@@ -1274,7 +1295,7 @@ export function apply(ctx, config) {
           agentPreset: READ_ONLY_PRESET,
           ...(typeof cwd === 'string' && cwd !== '' ? { cwd } : {}),
         },
-      }), SEAT_START_TIMEOUT_MS, '子代理启动超时（等待 delegation 容量或会话创建）')
+      }), Math.min(SEAT_START_TIMEOUT_MS, remaining()), '子代理启动超时（等待 delegation 容量或会话创建）')
       if (seat !== undefined && seat !== null) {
         seat.phase = 'running'
         seat.childId = typeof activation.childId === 'string' ? activation.childId : ''
@@ -1285,7 +1306,7 @@ export function apply(ctx, config) {
       void activation.result.catch(() => {})
       const result = await withTimeout(
         activation.result,
-        SEAT_RESULT_TIMEOUT_MS,
+        Math.min(SEAT_RESULT_TIMEOUT_MS, remaining()),
         '子代理执行超时（未在预算内 settle）',
       )
       const blocks = result !== null && typeof result === 'object' && Array.isArray(result.output) ? result.output : []
@@ -1321,6 +1342,9 @@ export function apply(ctx, config) {
   /** Execute the three stages for one run. */
   async function execute(run, routes) {
     const signal = run.controller.signal
+    /* Absolute budget: every attempt and backoff is clamped to this instant,
+       so retries settle before (not after) the run-level watchdog. */
+    const deadlineAt = run.createdAt + RUN_TIMEOUT_MS
     const baseQuestion = run.contextBlock === '' ? run.question : `${run.contextBlock}\n\n---\n\n问题：${run.question}`
     const workspaceLine = run.workspace !== undefined && typeof run.workspace.cwd === 'string' && run.workspace.cwd !== ''
       ? run.workspace.cwd
@@ -1354,11 +1378,11 @@ export function apply(ctx, config) {
         if (useSubagentSeats && subagentSeatCount >= subagentSeatLimit && seat !== undefined && seat !== null) {
           seat.phase = 'fast'
         }
-        return callModel(route, system, prompt, maxTokens, signal, onDelta, seat)
+        return callModel(route, system, prompt, maxTokens, signal, onDelta, seat, deadlineAt)
       }
       subagentSeatCount += 1
       try {
-        return await callSeatSubagent(run.parent, route, system, prompt, maxTokens, signal, run.cwd, seat, run.liveSeats)
+        return await callSeatSubagent(run.parent, route, system, prompt, maxTokens, signal, run.cwd, seat, run.liveSeats, deadlineAt)
       } catch (error) {
         if (signal.aborted) throw new Error('已取消')
         if (run.fallbacks >= MAX_FALLBACKS_PER_RUN) {
@@ -1370,7 +1394,7 @@ export function apply(ctx, config) {
           seat.fallback = true
           seat.fallbackFrom = 'subagent'
         }
-        return callModel(route, system, prompt, maxTokens, signal, onDelta, seat)
+        return callModel(route, system, prompt, maxTokens, signal, onDelta, seat, deadlineAt)
       }
     }
     const concurrency = useSubagentSeats ? SEAT_CONCURRENCY : run.answers.length
@@ -1422,7 +1446,7 @@ export function apply(ctx, config) {
           review.text = await callModel(routes[review.key], REVIEW_SYSTEM, reviewPrompt, REVIEW_MAX_TOKENS, signal, (text) => {
             review.text = text
             scheduleRunStreamTick(run)
-          }, review.seat)
+          }, review.seat, deadlineAt)
         } catch (error) {
           review.error = errorText(error)
         }
@@ -1468,6 +1492,7 @@ export function apply(ctx, config) {
           run.chairman.text = text
         },
         run.chairman.seat,
+        deadlineAt,
       )
       run.chairman.done = true
       run.stage = 'done'
@@ -1573,7 +1598,9 @@ export function apply(ctx, config) {
         }
         : {}),
     },
-    timeoutMs: RUN_TIMEOUT_MS,
+    /* Buffer past the run deadline: the run's own watchdog settles first with
+       its precise stopReason; the tool timeout is only a backstop. */
+    timeoutMs: RUN_TIMEOUT_MS + 30000,
     isConcurrencySafe: () => false,
     async execute(args, exec) {
       const input = args === null || typeof args !== 'object' ? {} : args
@@ -1749,7 +1776,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v28', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v30', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -1758,7 +1785,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v28' })
+          sendJson(res, 200, { ok: true, build: 'v30' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
