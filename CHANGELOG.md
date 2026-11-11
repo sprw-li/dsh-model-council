@@ -1,3 +1,12 @@
+# 0.2.5
+
+self-loop 第 4 圈（复审「不通过」的整改）。理事会与验证 subagent 联合定位出**两个真缺陷**：
+
+- **「验收」类问题不附源码包（根因修复）**：`REVIEW_INTENT` 只匹配 评审/审查/审计/review/audit，验收题用的是「验收/复审」——不命中 → 源码包静默关闭（实测 `codeState=off, 0/0`，理事会因此看不到任何代码）。现在「验收/复审/检查/acceptance」也触发源码包与工作区兜底，并有回归断言钉住（「验收题必须附源码包」）。
+- **工具外显等待硬封顶**：`council_review` 增加 `deadlineWall`（`Promise.race` 到 `run.createdAt + RUN_TIMEOUT_MS`）——`timeoutMs` 的 +30s 只是执行器清理宽限，**对外可见等待绝不超过 remainingMs**（理事会第 5 高风险项的验收判据）。
+- **拒绝路径不静默回退**：问题点名了 allowlist 之外的路径时，不再悄悄换成工作区附件（会误导「评审了别处」）。
+- runtime harness 头注释与正文对齐（声称的 zero-budget 情况改为不变量断言），取消传播用例补齐。
+
 # 0.2.4
 
 self-loop 第 3 圈：真实代码路径回归（验收门 a 条件闭环）：

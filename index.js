@@ -86,7 +86,7 @@ const SECRET_NAME = /(^|[\\/])(\.env[^\\/]*|id_(rsa|ed25519|ecdsa)[^\\/]*|creden
 /** A question that means the session workspace even without an explicit path. */
 const WORKSPACE_INTENT = /(工作区|项目|仓库|代码库|目录|本仓库|本项目|workspace|repository|repo\b|project|codebase)/i
 /** A question that asks for a review, so the source pack is worth attaching. */
-const REVIEW_INTENT = /(评审|审查|审计|review|audit|全项目|代码质量|安全审查)/i
+const REVIEW_INTENT = /(评审|审查|审计|验收|复审|检查|review|audit|acceptance|全项目|代码质量|安全审查)/i
 /** Bounded source pack so llm-mode seats can cite real files instead of guessing. */
 const CODE_MAX_CHARS = 40000
 const CODE_MAX_FILES = 24
@@ -463,14 +463,17 @@ async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars
   const permitted = (candidate) => attachRoots.length === 0
     || allowedRoots.some((root) => candidate === root || isPathInside(candidate, root))
   const candidates = candidatePaths(question, workspaceCwd).filter(permitted)
+  /* Did the question name a path that the allowlist refused? Then it must NOT
+     silently fall back to the workspace — the caller asked for somewhere else. */
+  const namedButRefused = candidatePaths(question, workspaceCwd).some((candidate) => !permitted(candidate))
   /* The caller's own directory is the primary anchor: a subagent spawned in
      the plugin directory reviews THAT directory, not the workspace root. */
-  if (candidates.length === 0 && typeof callerCwd === 'string' && callerCwd !== ''
+  if (candidates.length === 0 && !namedButRefused && typeof callerCwd === 'string' && callerCwd !== ''
     && (WORKSPACE_INTENT.test(String(question || '')) || REVIEW_INTENT.test(String(question || '')))) {
     candidates.push(callerCwd)
   }
   /* A named project directory wins over the whole workspace: "评审 dsh-council". */
-  if (candidates.length === 0 && typeof workspaceCwd === 'string' && workspaceCwd !== '') {
+  if (candidates.length === 0 && !namedButRefused && typeof workspaceCwd === 'string' && workspaceCwd !== '') {
     let matched
     try {
       const entries = await readdir(workspaceCwd, { withFileTypes: true })
@@ -484,9 +487,11 @@ async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars
     } catch {
       matched = undefined
     }
-    if (matched !== undefined) candidates.push(matched)
-    else if (WORKSPACE_INTENT.test(String(question || ''))) candidates.push(workspaceCwd)
-  }
+    if (matched !== undefined && permitted(matched)) candidates.push(matched)
+    else if ((WORKSPACE_INTENT.test(String(question || '')) || REVIEW_INTENT.test(String(question || '')))
+      && permitted(workspaceCwd)) {
+      candidates.push(workspaceCwd)
+    }  }
   const sections = []
   const valid = []
   const dirs = []
@@ -1726,10 +1731,23 @@ export function apply(ctx, config) {
       }
       runs.set(run.id, run)
       persistRuns()
+      /*
+       * Hard wall for the tool's external wait: the run deadline itself, not
+       * deadline+30s. The +30s in `timeoutMs` is only the executor's
+       * cleanup grace; this race guarantees the tool settles by `deadlineAt`
+       * so the visible wait never exceeds remainingMs.
+       */
+      const deadlineWall = new Promise((resolve) => {
+        const left = run.createdAt + RUN_TIMEOUT_MS - Date.now()
+        run.deadlineTimer = setTimeout(() => resolve(undefined), Math.max(0, left))
+        if (typeof run.deadlineTimer.unref === 'function') run.deadlineTimer.unref()
+      })
       try {
-        await execute(run, routes)
+        await Promise.race([execute(run, routes), deadlineWall])
+        if (run.status === 'running') finishRun(run, 'error', '整轮预算耗尽', 'watchdog')
       } finally {
         if (run.watchdog !== undefined) clearTimeout(run.watchdog)
+        if (run.deadlineTimer !== undefined) clearTimeout(run.deadlineTimer)
       }
       return {
         conclusion: toolConclusion(run),
@@ -1776,7 +1794,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v30', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v32', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -1785,7 +1803,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v30' })
+          sendJson(res, 200, { ok: true, build: 'v32' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
