@@ -839,7 +839,15 @@ export function apply(ctx, config) {
   }
 
   /** Stream one model call; retries transient provider failures with backoff. */
-  async function callModel(route, system, userText, maxTokens, signal, onDelta) {
+  async function callModel(route, system, userText, maxTokens, signal, onDelta, seat) {
+    if (seat !== undefined && seat !== null && typeof seat.startedAt !== 'number') {
+      seat.startedAt = Date.now()
+      seat.phase = 'running'
+    }
+    const report = (text) => {
+      if (seat !== undefined && seat !== null && typeof seat.ttftAt !== 'number') seat.ttftAt = Date.now()
+      if (typeof onDelta === 'function') onDelta(text)
+    }
     let budget = maxTokens
     let lastError
     for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -863,11 +871,11 @@ export function apply(ctx, config) {
             if (chunk === null || typeof chunk !== 'object') continue
             if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
               text += chunk.text
-              if (typeof onDelta === 'function') onDelta(text)
+              report(text)
             } else if (chunk.type === 'block-end' && text === '' && chunk.block !== null && typeof chunk.block === 'object') {
               if (chunk.block.type === 'text' && typeof chunk.block.text === 'string') {
                 text = chunk.block.text
-                if (typeof onDelta === 'function') onDelta(text)
+                report(text)
               }
             } else if (chunk.type === 'finish') {
               finish = chunk.reason
@@ -920,7 +928,9 @@ export function apply(ctx, config) {
 
   /** Compact per-seat diagnostics for the browser. */
   function summarizeSeat(seat) {
-    if (seat === undefined || seat === null) return { phase: 'idle', childId: '', elapsedMs: 0, fallback: false, activity: '', activityMs: 0 }
+    if (seat === undefined || seat === null) {
+      return { phase: 'idle', childId: '', elapsedMs: 0, fallback: false, fallbackFrom: '', activity: '', activityMs: 0, ttftMs: 0 }
+    }
     const startedAt = typeof seat.startedAt === 'number' ? seat.startedAt : 0
     const finishedAt = typeof seat.finishedAt === 'number' ? seat.finishedAt : Date.now()
     return {
@@ -931,6 +941,8 @@ export function apply(ctx, config) {
       fallbackFrom: typeof seat.fallbackFrom === 'string' ? seat.fallbackFrom : '',
       activity: typeof seat.activity === 'string' ? seat.activity : '',
       activityMs: typeof seat.activityAt === 'number' ? Math.max(0, Date.now() - seat.activityAt) : 0,
+      /* Time to first token: the metric that explains a slow seat. */
+      ttftMs: typeof seat.ttftAt === 'number' && startedAt !== 0 ? Math.max(0, seat.ttftAt - startedAt) : 0,
     }
   }
 
@@ -1160,6 +1172,7 @@ export function apply(ctx, config) {
       if (seat !== undefined && seat !== null) {
         seat.phase = 'done'
         seat.finishedAt = Date.now()
+        if (typeof seat.ttftAt !== 'number' && typeof seat.activityAt === 'number') seat.ttftAt = seat.activityAt
       }
       return text
     } finally {
@@ -1202,7 +1215,7 @@ export function apply(ctx, config) {
      * per reviewer.
      */
     const invokeAnswer = async (route, system, prompt, maxTokens, onDelta, seat) => {
-      if (!useSubagentSeats) return callModel(route, system, prompt, maxTokens, signal, onDelta)
+      if (!useSubagentSeats) return callModel(route, system, prompt, maxTokens, signal, onDelta, seat)
       try {
         return await callSeatSubagent(run.parent, route, system, prompt, maxTokens, signal, run.cwd, seat, run.liveSeats)
       } catch (error) {
@@ -1216,7 +1229,7 @@ export function apply(ctx, config) {
           seat.fallback = true
           seat.fallbackFrom = 'subagent'
         }
-        return callModel(route, system, prompt, maxTokens, signal, onDelta)
+        return callModel(route, system, prompt, maxTokens, signal, onDelta, seat)
       }
     }
     const concurrency = useSubagentSeats ? SEAT_CONCURRENCY : run.answers.length
@@ -1264,7 +1277,7 @@ export function apply(ctx, config) {
         try {
           review.text = await callModel(routes[review.key], REVIEW_SYSTEM, reviewPrompt, REVIEW_MAX_TOKENS, signal, (text) => {
             review.text = text
-          })
+          }, review.seat)
         } catch (error) {
           review.error = errorText(error)
         }
@@ -1307,6 +1320,7 @@ export function apply(ctx, config) {
         (text) => {
           run.chairman.text = text
         },
+        run.chairman.seat,
       )
       run.chairman.done = true
       run.stage = 'done'
@@ -1664,8 +1678,18 @@ export function apply(ctx, config) {
   }, 'council: runs')
 }
 
-/* Pure helpers exported for the host harness (`dev/verify-host.mjs`). */
+/* Pure helpers and limits exported for the host harness (`dev/verify-host.mjs`).
+   The limits are exported so a test can assert the README quotes them. */
 export {
+  CHAIRMAN_MAX_TOKENS,
+  ANSWER_MAX_TOKENS,
+  MAX_FALLBACKS_PER_RUN,
+  PROVIDER_CONCURRENCY,
+  REVIEW_MAX_TOKENS,
+  RUN_TIMEOUT_MS,
+  SEAT_CONCURRENCY,
+  SEAT_RESULT_TIMEOUT_MS,
+  SEAT_START_TIMEOUT_MS,
   TRANSIENT_FAILURE,
   candidatePaths,
   collectCodeContext,

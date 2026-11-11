@@ -8,7 +8,8 @@ import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { TRANSIENT_FAILURE, candidatePaths, collectCodeContext, collectPathContext, isPathInside, readTextFile, runLimited, withTimeout } from '../index.js'
+import { readFileSync } from 'node:fs'
+import { TRANSIENT_FAILURE, SEAT_RESULT_TIMEOUT_MS, SEAT_START_TIMEOUT_MS, PROVIDER_CONCURRENCY, MAX_FALLBACKS_PER_RUN, RUN_TIMEOUT_MS, candidatePaths, collectCodeContext, collectPathContext, isPathInside, readTextFile, runLimited, withTimeout } from '../index.js'
 
 const root = await mkdtemp(join(tmpdir(), 'council-host-'))
 try {
@@ -74,6 +75,18 @@ try {
   assert.equal(confined.paths.length, 0, `allowlist must refuse outside paths: ${JSON.stringify(confined.paths)}`)
   const allowed = await collectPathContext('review the workspace', 2000, workspace, 0, false, [workspace])
   assert.equal(allowed.paths.length, 1, 'allowlist keeps the workspace itself')
+
+  /* Documentation must quote the constants it describes; drift is a test failure. */
+  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8')
+  const seats = /启动 (\d+)s \/ 执行 (\d+)s/.exec(readme)
+  assert.ok(seats !== null, 'README must state the seat start/result windows')
+  assert.equal(Number(seats[1]), Math.round(SEAT_START_TIMEOUT_MS / 1000), 'README seat start budget drifted from SEAT_START_TIMEOUT_MS')
+  assert.equal(Number(seats[2]), Math.round(SEAT_RESULT_TIMEOUT_MS / 1000), 'README seat result budget drifted from SEAT_RESULT_TIMEOUT_MS')
+  const watchdog = /(\d+) 分钟 watchdog/.exec(readme)
+  assert.ok(watchdog !== null, 'README must state the watchdog window')
+  assert.equal(Number(watchdog[1]), Math.round(RUN_TIMEOUT_MS / 60000), 'README watchdog drifted from RUN_TIMEOUT_MS')
+  assert.ok(readme.includes(`${PROVIDER_CONCURRENCY} 并发`), 'README must state the provider concurrency')
+  assert.ok(readme.includes(`降级配额 ${MAX_FALLBACKS_PER_RUN}`), 'README must state the fallback quota')
 
   /* runLimited never exceeds its window. */
   let active = 0

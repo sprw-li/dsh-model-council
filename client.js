@@ -73,6 +73,9 @@ window.__ModuleLoader__.load({
       'status.seatRunning': '运行中 {s}s',
       'status.seatClosed': '已关闭',
       'status.fallback': '完成（降级）',
+      'metrics.total': '总 {total}',
+      'metrics.both': '首字 {ttft} · 总 {total}',
+      'metrics.hint': '首字 = 从发起到第一个字符的耗时；总 = 该席位总耗时',
       'seat.activity.step': '思考中',
       'seat.activity.tool': '调用工具',
       'seat.activity.result': '工具返回',
@@ -155,6 +158,9 @@ window.__ModuleLoader__.load({
       'status.seatRunning': 'Running {s}s',
       'status.seatClosed': 'Closed',
       'status.fallback': 'Done (fallback)',
+      'metrics.total': 'total {total}',
+      'metrics.both': 'TTFT {ttft} · total {total}',
+      'metrics.hint': 'TTFT = time from dispatch to the first character; total = this seat\'s full duration',
       'seat.activity.step': 'Thinking',
       'seat.activity.tool': 'Using tools',
       'seat.activity.result': 'Tool returned',
@@ -885,6 +891,16 @@ window.__ModuleLoader__.load({
       const stageName = run !== null && stageNames[run.stage] !== undefined ? stageNames[run.stage] : t('stage.answers')
       const stageRank = { answers: 0, reviews: 1, chairman: 2, done: 3 }
       const stageIndex = run !== null && stageRank[run.stage] !== undefined ? stageRank[run.stage] : 0
+      /** Per-seat timing: what explains a slow seat (TTFT vs total). */
+      function seatMetrics(seat) {
+        if (seat === null || typeof seat !== 'object') return ''
+        const seconds = (ms) => (typeof ms === 'number' && ms > 0 ? `${(ms / 1000).toFixed(1)}s` : '')
+        const total = seconds(seat.elapsedMs)
+        const ttft = seconds(seat.ttftMs)
+        if (total === '') return ''
+        return ttft === '' ? t('metrics.total', { total }) : t('metrics.both', { ttft, total })
+      }
+
       /** Seat phase label for a running card (starting/running/closed). */
       function seatStatusText(seat) {
         if (seat === null || typeof seat !== 'object') return t('status.streaming')
@@ -979,8 +995,7 @@ window.__ModuleLoader__.load({
               })),
               h('div', { className: 'dsc-hint' }, t('panel.privacy', { chars: state.contextMaxChars })),
               h('div', { className: 'dsc-hint' }, t('panel.filesHint', { chars: state.filesMaxChars })),
-              h('div', { className: 'dsc-hint' }, t('panel.seatsHint')),
-            ),
+              h('div', { className: 'dsc-hint' }, t('panel.seatsHint')),            ),
             h('div', { className: 'dsc-field' },
               h('span', { className: 'dsc-field-label' }, t('panel.feedbackMode')),
               h('div', { className: 'dsc-toggles' },
@@ -1090,6 +1105,9 @@ window.__ModuleLoader__.load({
                                 ? t('status.fallback')
                                 : t('status.done'))
                             : seatStatusText(answer.seat)),
+                        answer.done === true && seatMetrics(answer.seat) !== ''
+                          ? h('span', { className: 'dsc-metrics', title: t('metrics.hint') }, seatMetrics(answer.seat))
+                          : null,
                       ),
                       answer.error !== ''
                         ? h('div', { className: 'dsc-error-box' }, answer.error)
