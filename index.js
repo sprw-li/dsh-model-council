@@ -19,7 +19,7 @@
 import { readdir, readFile, stat } from 'node:fs/promises'
 import { extname, isAbsolute, join } from 'node:path'
 
-export const inject = ['webServer', 'llm', 'agents']
+export const inject = ['webServer', 'llm', 'agents', 'subagents']
 
 /** Selected models per run. */
 const MAX_MODELS = 6
@@ -27,14 +27,18 @@ const MAX_MODELS = 6
 const MAX_QUESTION = 20000
 /** Per-answer characters forwarded to the review and chairman prompts. */
 const MAX_ANSWER_CHARS = 6000
-const ANSWER_MAX_TOKENS = 4096
-const REVIEW_MAX_TOKENS = 8192
-const CHAIRMAN_MAX_TOKENS = 8192
+const ANSWER_MAX_TOKENS = 16384
+const REVIEW_MAX_TOKENS = 16384
+const CHAIRMAN_MAX_TOKENS = 16384
+/** Retry budget for reasoning-only responses that burned the first one. */
+const RETRY_MAX_TOKENS = 32768
 /** One model call, not one run. */
-const CALL_TIMEOUT_MS = 180000
+const CALL_TIMEOUT_MS = 300000
 const RUN_TTL_MS = 30 * 60 * 1000
 const MAX_RUNS = 16
 const MODEL_CACHE_MS = 60000
+/** Read-only Agent Preset used by subagent-backed seats. */
+const READ_ONLY_PRESET = 'council-readonly'
 
 /** Paths in the question whose directory tree / key files ride along. */
 const MAX_ATTACH_PATHS = 3
@@ -373,9 +377,70 @@ export function apply(ctx, config) {
     return info
   }
 
+  /** Readiness of the read-only Agent Preset used by subagent-backed seats. */
+  let readOnlyPresetReady = Promise.resolve(false)
+  ctx.effect(() => {
+    let disposed = false
+    let unregister
+    let presets
+    try {
+      presets = ctx.get('agentPresets')
+    } catch {
+      presets = undefined
+    }
+    if (presets === undefined || presets === null || typeof presets.register !== 'function') {
+      readOnlyPresetReady = Promise.resolve(false)
+      return
+    }
+    const definition = {
+      id: READ_ONLY_PRESET,
+      name: 'Council read-only member',
+      description: 'Read-only council seat: file reads, searches and skills, with no mutation tools.',
+      order: 90,
+      plugins: [
+        {
+          id: 'persona',
+          name: '@deepseek-ai/dsh-persona',
+          config: {
+            prefix: 'You are a read-only member of a model council. Inspect the workspace with read-only tools; never modify files, never run mutating commands, and answer the question directly.',
+          },
+        },
+        { id: 'tool-fs', name: '@deepseek-ai/dsh-tool-fs', config: { read: true, readImage: false, write: false, edit: false } },
+        { id: 'tool-fs-search', name: '@deepseek-ai/dsh-tool-fs-search', config: { sampleOverCapGlobResults: false } },
+        { id: 'skill-filesystem', name: '@deepseek-ai/dsh-skill-filesystem' },
+        { id: 'tool-skill', name: '@deepseek-ai/dsh-tool-skill' },
+        { id: 'time-context', name: '@deepseek-ai/dsh-time-context' },
+      ],
+    }
+    readOnlyPresetReady = presets.register(definition)
+      .then((disposePreset) => {
+        if (disposed) {
+          try {
+            void disposePreset().catch(() => {})
+          } catch {
+            /* best effort */
+          }
+          return false
+        }
+        unregister = disposePreset
+        return true
+      })
+      .catch((error) => {
+        console.warn('[council] read-only agent preset unavailable:', error instanceof Error ? error.message : String(error))
+        return false
+      })
+    return () => {
+      disposed = true
+      try {
+        if (typeof unregister === 'function') void unregister().catch(() => {})
+      } catch {
+        /* best effort */
+      }
+    }
+  }, 'council: read-only preset')
+
   /** Enumerate every configured provider and its text models. */
-  async function catalog() {
-    if (catalogCache.value !== undefined && Date.now() - catalogCache.at < MODEL_CACHE_MS) return catalogCache.value
+  async function catalog() {    if (catalogCache.value !== undefined && Date.now() - catalogCache.at < MODEL_CACHE_MS) return catalogCache.value
     let providers = []
     try {
       providers = ctx.llm.listProviders()
@@ -436,49 +501,62 @@ export function apply(ctx, config) {
 
   /** Stream one model call, reporting cumulative text. */
   async function callModel(route, system, userText, maxTokens, signal, onDelta) {
-    const timeout = AbortSignal.timeout(CALL_TIMEOUT_MS)
-    const combined = typeof AbortSignal.any === 'function' ? AbortSignal.any([signal, timeout]) : timeout
-    let text = ''
-    let finish
-    const stream = ctx.llm.stream({
-      provider: route.provider,
-      model: route.model,
-      system,
-      messages: [{ role: 'user', content: [{ type: 'text', text: userText }] }],
-      maxTokens,
-      signal: combined,
-    })
-    for await (const chunk of stream) {
-      if (chunk === null || typeof chunk !== 'object') continue
-      if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
-        text += chunk.text
-        onDelta(text)
-      } else if (chunk.type === 'block-end' && text === '' && chunk.block !== null && typeof chunk.block === 'object') {
-        if (chunk.block.type === 'text' && typeof chunk.block.text === 'string') {
-          text = chunk.block.text
-          onDelta(text)
+    let budget = maxTokens
+    let lastError
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const timeout = AbortSignal.timeout(CALL_TIMEOUT_MS)
+      const combined = typeof AbortSignal.any === 'function' ? AbortSignal.any([signal, timeout]) : timeout
+      let text = ''
+      let finish
+      const stream = ctx.llm.stream({
+        provider: route.provider,
+        model: route.model,
+        system,
+        messages: [{ role: 'user', content: [{ type: 'text', text: userText }] }],
+        maxTokens: budget,
+        signal: combined,
+      })
+      for await (const chunk of stream) {
+        if (chunk === null || typeof chunk !== 'object') continue
+        if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
+          text += chunk.text
+          if (typeof onDelta === 'function') onDelta(text)
+        } else if (chunk.type === 'block-end' && text === '' && chunk.block !== null && typeof chunk.block === 'object') {
+          if (chunk.block.type === 'text' && typeof chunk.block.text === 'string') {
+            text = chunk.block.text
+            if (typeof onDelta === 'function') onDelta(text)
+          }
+        } else if (chunk.type === 'finish') {
+          finish = chunk.reason
         }
-      } else if (chunk.type === 'finish') {
-        finish = chunk.reason
       }
-    }
-    /* Adapter and transport failures settle as a terminal finish chunk rather
-       than a throw; surfacing them keeps one failed seat from looking empty. */
-    if (finish !== null && typeof finish === 'object') {
-      if (finish.kind === 'aborted') throw new Error('调用被中止或超时')
-      if (finish.kind === 'error') {
-        const failure = finish.failure
-        const detail = failure !== null && typeof failure === 'object' ? `${failure.message} (${failure.code})` : '未知错误'
-        throw new Error(detail)
+      /* Adapter and transport failures settle as a terminal finish chunk rather
+         than a throw; surfacing them keeps one failed seat from looking empty. */
+      if (finish !== null && typeof finish === 'object') {
+        if (finish.kind === 'aborted') {
+          lastError = new Error('调用被中止或超时')
+          break
+        }
+        if (finish.kind === 'error') {
+          const failure = finish.failure
+          const detail = failure !== null && typeof failure === 'object' ? `${failure.message} (${failure.code})` : '未知错误'
+          lastError = new Error(detail)
+          break
+        }
       }
-    }
-    const trimmed = text.trim()
-    if (trimmed === '') {
-      throw new Error(finish !== null && typeof finish === 'object' && finish.kind === 'max-tokens'
-        ? '输出预算耗尽且无正文（max-tokens）'
+      const trimmed = text.trim()
+      if (trimmed !== '') return trimmed
+      /* Reasoning-only completion burned the whole budget: retry once larger. */
+      if (finish !== null && typeof finish === 'object' && finish.kind === 'max-tokens' && attempt === 0) {
+        budget = Math.min(Math.max(budget * 2, RETRY_MAX_TOKENS), RETRY_MAX_TOKENS)
+        continue
+      }
+      lastError = new Error(finish !== null && typeof finish === 'object' && finish.kind === 'max-tokens'
+        ? '输出预算耗尽且无正文（max-tokens，已重试）'
         : '模型返回了空内容')
+      break
     }
-    return trimmed
+    throw lastError ?? new Error('模型调用失败')
   }
 
   /** Run snapshot returned to the browser. */
@@ -497,6 +575,7 @@ export function apply(ctx, config) {
       filesChars: run.filesChars === undefined ? 0 : run.filesChars,
       workspace: run.workspace === undefined ? { cwd: '', source: 'none', workspaceId: '', name: '' } : run.workspace,
       structure: run.structure === undefined ? { roles: {}, stages: [] } : run.structure,
+      seatMode: run.seatMode === undefined ? 'llm' : run.seatMode,
       resumed: run.resumed === undefined ? '' : run.resumed,
       useChairman: run.useChairman !== false,
       answers: run.answers.map((answer) => ({
@@ -645,16 +724,60 @@ export function apply(ctx, config) {
     run.resumed = mode
   }
 
+  /** One read-only subagent seat, built on the same delegation runtime as the subagent tool. */
+  async function callSeatSubagent(parent, route, system, userText, maxTokens, signal, cwd) {
+    const timeout = AbortSignal.timeout(CALL_TIMEOUT_MS)
+    const combined = typeof AbortSignal.any === 'function' ? AbortSignal.any([signal, timeout]) : timeout
+    const activation = await ctx.subagents.startActivation({
+      provider: 'spawn',
+      label: `council-${route.name}`.slice(0, 60),
+      delivery: 'caller',
+      signal: combined,
+      request: {
+        parent,
+        prompt: [{ type: 'text', text: `${system}\n\n---\n\n${userText}` }],
+        agentOptions: { provider: route.provider, model: route.model, maxTokens },
+        agentPreset: READ_ONLY_PRESET,
+        ...(typeof cwd === 'string' && cwd !== '' ? { cwd } : {}),
+      },
+    })
+    try {
+      const result = await activation.result
+      const blocks = result !== null && typeof result === 'object' && Array.isArray(result.output) ? result.output : []
+      const parts = []
+      for (const block of blocks) {
+        if (block !== null && typeof block === 'object'
+          && block.type === 'text' && typeof block.text === 'string' && block.text.trim() !== '') {
+          parts.push(block.text.trim())
+        }
+      }
+      const text = parts.join('\n\n')
+      if (text === '') throw new Error('子代理返回了空内容')
+      return text
+    } finally {
+      try {
+        await activation.dispose()
+      } catch {
+        /* best effort */
+      }
+    }
+  }
+
   /** Execute the three stages for one run. */
   async function execute(run, routes) {
     const signal = run.controller.signal
     const questionBlock = run.contextBlock === '' ? run.question : `${run.contextBlock}\n\n---\n\n问题：${run.question}`
+    const useSubagentSeats = run.seatMode === 'subagent' && run.parent !== undefined && run.parent !== null
+    /** One seat call: read-only subagent (tools+skills) or a raw model stream. */
+    const invoke = (route, system, prompt, maxTokens, onDelta) => useSubagentSeats
+      ? callSeatSubagent(run.parent, route, system, prompt, maxTokens, signal, run.cwd)
+      : callModel(route, system, prompt, maxTokens, signal, onDelta)
     try {
       /* Stage 1: independent answers. */
       run.stage = 'answers'
       await Promise.all(run.answers.map(async (answer) => {
         try {
-          answer.text = await callModel(routes[answer.key], ANSWER_SYSTEM, questionBlock, ANSWER_MAX_TOKENS, signal, (text) => {
+          answer.text = await invoke(routes[answer.key], ANSWER_SYSTEM, questionBlock, ANSWER_MAX_TOKENS, (text) => {
             answer.text = text
           })
         } catch (error) {
@@ -690,7 +813,7 @@ export function apply(ctx, config) {
       ].join('\n\n')
       await Promise.all(run.reviews.map(async (review) => {
         try {
-          review.text = await callModel(routes[review.key], REVIEW_SYSTEM, reviewPrompt, REVIEW_MAX_TOKENS, signal, (text) => {
+          review.text = await invoke(routes[review.key], REVIEW_SYSTEM, reviewPrompt, REVIEW_MAX_TOKENS, (text) => {
             review.text = text
           })
         } catch (error) {
@@ -725,12 +848,11 @@ export function apply(ctx, config) {
         `各模型的匿名互评：\n\n${reviewsBlock}`,
         '你是理事会主席。请综合以上材料输出最终结论：共识、分歧与盲点、最终建议，以及结论依赖的前提。',
       ].join('\n\n')
-      run.chairman.text = await callModel(
+      run.chairman.text = await invoke(
         routes[run.chairman.key],
         CHAIRMAN_SYSTEM,
         chairmanPrompt,
         CHAIRMAN_MAX_TOKENS,
-        signal,
         (text) => {
           run.chairman.text = text
         },
@@ -763,7 +885,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v7' })
+          sendJson(res, 200, { ok: true, build: 'v8' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
@@ -802,6 +924,27 @@ export function apply(ctx, config) {
           const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
           const useChairman = body.useChairman !== false
           const workspace = resolveWorkspace(sessionId)
+          let seatMode = 'llm'
+          let seatParent
+          if (body.seatMode === 'subagent') {
+            let presetReady = false
+            try {
+              presetReady = await Promise.race([
+                readOnlyPresetReady,
+                new Promise((resolve) => setTimeout(() => resolve(false), 3000)),
+              ])
+            } catch {
+              presetReady = false
+            }
+            if (presetReady) {
+              try {
+                seatParent = ctx.agents.get(sessionId)
+              } catch {
+                seatParent = undefined
+              }
+              if (seatParent !== undefined && seatParent !== null) seatMode = 'subagent'
+            }
+          }
           let chairman = selected[0]
           if (body.chairman !== null && typeof body.chairman === 'object') {
             const chosen = findRoute(cat, String(body.chairman.provider || ''), String(body.chairman.model || ''))
@@ -844,12 +987,16 @@ export function apply(ctx, config) {
             },
             stages: useChairman ? ['answers', 'reviews', 'synthesize'] : ['answers', 'reviews'],
             workspace,
+            seatMode,
           }
           const run = {
             id: `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`,
             createdAt: Date.now(),
             sessionId,
             useChairman,
+            seatMode,
+            cwd: workspace.cwd,
+            ...(seatParent === undefined ? {} : { parent: seatParent }),
             contextState,
             filesState,
             filesPaths,
