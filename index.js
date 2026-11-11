@@ -34,6 +34,14 @@ const CHAIRMAN_MAX_TOKENS = 16384
 const RETRY_MAX_TOKENS = 32768
 /** One model call, not one run. */
 const CALL_TIMEOUT_MS = 300000
+/** A subagent seat must finish startup within this bound. */
+const SEAT_START_TIMEOUT_MS = 60000
+/** A subagent seat must return a result within this bound after startup. */
+const SEAT_RESULT_TIMEOUT_MS = 240000
+/** Whole-run watchdog: a stuck stage can never hold the UI forever. */
+const RUN_TIMEOUT_MS = 30 * 60 * 1000
+/** Concurrent subagent seats; the delegation runtime has a shared capacity pool (default 8). */
+const SEAT_CONCURRENCY = 6
 const RUN_TTL_MS = 30 * 60 * 1000
 const MAX_RUNS = 16
 const MODEL_CACHE_MS = 60000
@@ -133,6 +141,28 @@ function messageText(content) {
 /** Answer label A, B, C, … */
 function letter(index) {
   return String.fromCharCode(65 + index)
+}
+
+/** Race a promise against a timeout that rejects with a readable message. */
+function withTimeout(promise, ms, message) {
+  let timer
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms)
+  })
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
+}
+
+/** Run async items with a small concurrency window. */
+async function runLimited(items, limit, worker) {
+  let next = 0
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next
+      next += 1
+      await worker(items[index], index)
+    }
+  })
+  await Promise.all(runners)
 }
 
 /** Local paths mentioned by the question: absolute tokens, `@mentions`, or workspace-relative. */
@@ -559,6 +589,19 @@ export function apply(ctx, config) {
     throw lastError ?? new Error('模型调用失败')
   }
 
+  /** Compact per-seat diagnostics for the browser. */
+  function summarizeSeat(seat) {
+    if (seat === undefined || seat === null) return { phase: 'idle', childId: '', elapsedMs: 0, fallback: false }
+    const startedAt = typeof seat.startedAt === 'number' ? seat.startedAt : 0
+    const finishedAt = typeof seat.finishedAt === 'number' ? seat.finishedAt : Date.now()
+    return {
+      phase: typeof seat.phase === 'string' ? seat.phase : 'idle',
+      childId: typeof seat.childId === 'string' ? seat.childId : '',
+      elapsedMs: startedAt === 0 ? 0 : Math.max(0, finishedAt - startedAt),
+      fallback: seat.fallback === true,
+    }
+  }
+
   /** Run snapshot returned to the browser. */
   function snapshot(run) {
     return {
@@ -586,6 +629,7 @@ export function apply(ctx, config) {
         text: answer.text,
         done: answer.done,
         error: answer.error,
+        seat: summarizeSeat(answer.seat),
       })),
       reviews: run.reviews.map((review) => ({
         key: review.key,
@@ -593,6 +637,7 @@ export function apply(ctx, config) {
         text: review.text,
         done: review.done,
         error: review.error,
+        seat: summarizeSeat(review.seat),
       })),
       chairman: {
         key: run.chairman.key,
@@ -602,6 +647,7 @@ export function apply(ctx, config) {
         text: run.chairman.text,
         done: run.chairman.done,
         error: run.chairman.error,
+        seat: summarizeSeat(run.chairman.seat),
       },
     }
   }
@@ -616,6 +662,7 @@ export function apply(ctx, config) {
       } catch {
         /* best effort */
       }
+      if (run.watchdog !== undefined) clearTimeout(run.watchdog)
       runs.delete(id)
     }
     while (runs.size > MAX_RUNS) {
@@ -627,6 +674,7 @@ export function apply(ctx, config) {
         } catch {
           /* best effort */
         }
+        if (run.watchdog !== undefined) clearTimeout(run.watchdog)
       }
       runs.delete(oldest)
     }
@@ -725,24 +773,37 @@ export function apply(ctx, config) {
   }
 
   /** One read-only subagent seat, built on the same delegation runtime as the subagent tool. */
-  async function callSeatSubagent(parent, route, system, userText, maxTokens, signal, cwd) {
+  async function callSeatSubagent(parent, route, system, userText, maxTokens, signal, cwd, seat) {
     const timeout = AbortSignal.timeout(CALL_TIMEOUT_MS)
     const combined = typeof AbortSignal.any === 'function' ? AbortSignal.any([signal, timeout]) : timeout
-    const activation = await ctx.subagents.startActivation({
-      provider: 'spawn',
-      label: `council-${route.name}`.slice(0, 60),
-      delivery: 'caller',
-      signal: combined,
-      request: {
-        parent,
-        prompt: [{ type: 'text', text: `${system}\n\n---\n\n${userText}` }],
-        agentOptions: { provider: route.provider, model: route.model, maxTokens },
-        agentPreset: READ_ONLY_PRESET,
-        ...(typeof cwd === 'string' && cwd !== '' ? { cwd } : {}),
-      },
-    })
+    if (seat !== undefined && seat !== null) {
+      seat.phase = 'starting'
+      seat.startedAt = Date.now()
+    }
+    let activation
     try {
-      const result = await activation.result
+      activation = await withTimeout(ctx.subagents.startActivation({
+        provider: 'spawn',
+        label: `council-${route.name}`.slice(0, 60),
+        delivery: 'caller',
+        signal: combined,
+        request: {
+          parent,
+          prompt: [{ type: 'text', text: `${system}\n\n---\n\n${userText}` }],
+          agentOptions: { provider: route.provider, model: route.model, maxTokens },
+          agentPreset: READ_ONLY_PRESET,
+          ...(typeof cwd === 'string' && cwd !== '' ? { cwd } : {}),
+        },
+      }), SEAT_START_TIMEOUT_MS, '子代理启动超时（等待 delegation 容量或会话创建）')
+      if (seat !== undefined && seat !== null) {
+        seat.phase = 'running'
+        seat.childId = typeof activation.childId === 'string' ? activation.childId : ''
+      }
+      const result = await withTimeout(
+        activation.result,
+        SEAT_RESULT_TIMEOUT_MS,
+        '子代理执行超时（未在预算内 settle）',
+      )
       const blocks = result !== null && typeof result === 'object' && Array.isArray(result.output) ? result.output : []
       const parts = []
       for (const block of blocks) {
@@ -753,12 +814,19 @@ export function apply(ctx, config) {
       }
       const text = parts.join('\n\n')
       if (text === '') throw new Error('子代理返回了空内容')
+      if (seat !== undefined && seat !== null) {
+        seat.phase = 'done'
+        seat.finishedAt = Date.now()
+      }
       return text
     } finally {
-      try {
-        await activation.dispose()
-      } catch {
-        /* best effort */
+      if (seat !== undefined && seat !== null && seat.phase !== 'done') seat.phase = 'closed'
+      if (activation !== undefined) {
+        try {
+          await activation.dispose()
+        } catch {
+          /* best effort */
+        }
       }
     }
   }
@@ -768,23 +836,38 @@ export function apply(ctx, config) {
     const signal = run.controller.signal
     const questionBlock = run.contextBlock === '' ? run.question : `${run.contextBlock}\n\n---\n\n问题：${run.question}`
     const useSubagentSeats = run.seatMode === 'subagent' && run.parent !== undefined && run.parent !== null
-    /** One seat call: read-only subagent (tools+skills) or a raw model stream. */
-    const invoke = (route, system, prompt, maxTokens, onDelta) => useSubagentSeats
-      ? callSeatSubagent(run.parent, route, system, prompt, maxTokens, signal, run.cwd)
-      : callModel(route, system, prompt, maxTokens, signal, onDelta)
+    /**
+     * Stage-1 seat: read-only subagent when enabled, falling back to a raw model
+     * call when the seat times out or fails. Reviews and the chairman always use
+     * the fast raw path so a six-model run cannot spend a whole subagent turn
+     * per reviewer.
+     */
+    const invokeAnswer = async (route, system, prompt, maxTokens, onDelta, seat) => {
+      if (!useSubagentSeats) return callModel(route, system, prompt, maxTokens, signal, onDelta)
+      try {
+        return await callSeatSubagent(run.parent, route, system, prompt, maxTokens, signal, run.cwd, seat)
+      } catch {
+        if (seat !== undefined && seat !== null) {
+          seat.phase = 'fallback'
+          seat.fallback = true
+        }
+        return callModel(route, system, prompt, maxTokens, signal, onDelta)
+      }
+    }
+    const concurrency = useSubagentSeats ? SEAT_CONCURRENCY : run.answers.length
     try {
       /* Stage 1: independent answers. */
       run.stage = 'answers'
-      await Promise.all(run.answers.map(async (answer) => {
+      await runLimited(run.answers, concurrency, async (answer) => {
         try {
-          answer.text = await invoke(routes[answer.key], ANSWER_SYSTEM, questionBlock, ANSWER_MAX_TOKENS, (text) => {
+          answer.text = await invokeAnswer(routes[answer.key], ANSWER_SYSTEM, questionBlock, ANSWER_MAX_TOKENS, (text) => {
             answer.text = text
-          })
+          }, answer.seat)
         } catch (error) {
           answer.error = errorText(error)
         }
         answer.done = true
-      }))
+      })
       const usable = run.answers.filter((answer) => answer.error === '' && answer.text !== '')
       if (usable.length === 0) {
         run.status = 'error'
@@ -811,16 +894,16 @@ export function apply(ctx, config) {
           '保持简洁。',
         ].join('\n'),
       ].join('\n\n')
-      await Promise.all(run.reviews.map(async (review) => {
+      await runLimited(run.reviews, run.reviews.length, async (review) => {
         try {
-          review.text = await invoke(routes[review.key], REVIEW_SYSTEM, reviewPrompt, REVIEW_MAX_TOKENS, (text) => {
+          review.text = await callModel(routes[review.key], REVIEW_SYSTEM, reviewPrompt, REVIEW_MAX_TOKENS, signal, (text) => {
             review.text = text
           })
         } catch (error) {
           review.error = errorText(error)
         }
         review.done = true
-      }))
+      })
 
       if (run.useChairman === false) {
         run.stage = 'done'
@@ -848,11 +931,12 @@ export function apply(ctx, config) {
         `各模型的匿名互评：\n\n${reviewsBlock}`,
         '你是理事会主席。请综合以上材料输出最终结论：共识、分歧与盲点、最终建议，以及结论依赖的前提。',
       ].join('\n\n')
-      run.chairman.text = await invoke(
+      run.chairman.text = await callModel(
         routes[run.chairman.key],
         CHAIRMAN_SYSTEM,
         chairmanPrompt,
         CHAIRMAN_MAX_TOKENS,
+        signal,
         (text) => {
           run.chairman.text = text
         },
@@ -879,13 +963,29 @@ export function apply(ctx, config) {
           sendJson(res, 200, { providers: cat.providers, contextMaxChars, filesMaxChars })
           return
         }
+        if (req.method === 'GET' && path === '/diag') {
+          const runsOut = []
+          for (const run of runs.values()) runsOut.push(snapshot(run))
+          const agentsOut = []
+          try {
+            const list = typeof ctx.agents.list === 'function' ? ctx.agents.list() : []
+            for (const agent of list) {
+              if (agent === null || typeof agent !== 'object') continue
+              agentsOut.push({ id: agent.id, status: agent.status })
+            }
+          } catch {
+            /* diagnostics must never throw */
+          }
+          sendJson(res, 200, { build: 'v10', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          return
+        }
         if (req.method === 'GET' && path === '/workspace') {
           const sessionId = url.searchParams.get('sessionId') || ''
           sendJson(res, 200, resolveWorkspace(sessionId))
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v8' })
+          sendJson(res, 200, { ok: true, build: 'v10' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
@@ -986,6 +1086,9 @@ export function apply(ctx, config) {
               arbiter: useChairman ? chairman.key : '',
             },
             stages: useChairman ? ['answers', 'reviews', 'synthesize'] : ['answers', 'reviews'],
+            seatStages: seatMode === 'subagent'
+              ? { answers: 'subagent', reviews: 'llm', synthesize: 'llm' }
+              : { answers: 'llm', reviews: 'llm', synthesize: 'llm' },
             workspace,
             seatMode,
           }
@@ -1017,6 +1120,7 @@ export function apply(ctx, config) {
               text: '',
               done: false,
               error: '',
+              seat: { phase: 'idle' },
             })),
             reviews: reviewers.map((route) => ({
               key: route.key,
@@ -1024,6 +1128,7 @@ export function apply(ctx, config) {
               text: '',
               done: false,
               error: '',
+              seat: { phase: 'idle' },
             })),
             chairman: {
               key: chairman.key,
@@ -1033,10 +1138,23 @@ export function apply(ctx, config) {
               text: '',
               done: false,
               error: '',
+              seat: { phase: 'idle' },
             },
           }
           const routes = {}
           for (const route of selected) routes[route.key] = route
+          run.watchdog = setTimeout(() => {
+            if (run.status === 'running') {
+              run.status = 'error'
+              run.error = '运行超时（30 分钟），已中止'
+              try {
+                run.controller.abort()
+              } catch {
+                /* best effort */
+              }
+            }
+          }, RUN_TIMEOUT_MS)
+          if (typeof run.watchdog.unref === 'function') run.watchdog.unref()
           runs.set(run.id, run)
           void execute(run, routes)
           sendJson(res, 200, { runId: run.id })
