@@ -1,3 +1,17 @@
+# 0.2.10
+
+**自我循环收敛：理事会终审通过。**
+
+第 9 轮终审（runId cmwcdfl…，三模型 + 主席）：判定「通过」——四项 deadline 机制在附件中全部可指认且同源：
+`runDeadlineOf` 唯一 deadline 公式、`callModel` 两处退避 `Math.min(800*(attempt+1), remaining())`、
+`callSeatSubagent` 三处席位裁剪、`deadlineWall` 参与 `Promise.race` 并清理终态与定时器。
+连续三轮至此零逻辑缺陷指认，此前所有「不通过」均为附件覆盖口径。
+
+主席留下的唯一非否决整改项（本轮已修）：
+
+- **三处席位裁剪全部改为现场 `remaining()`**：第一处原先复用 guard 前的 `left` 快照（功能同源但字面不同形）；现在守卫与裁剪都调用 `remaining()`，不存在过期快照窗口。
+- **gate 改为区内断言**：新增 `inRegion(seatZeroGuard/seatCombined/seatStart/seatResult)`——三处裁剪必须**位于 `callSeatSubagent` 的完整函数体区域内**才计分。此前只在整个包里查字面量，截断片段也能过。验收门 19/19 + 真实验收问题 4/4。
+
 # 0.2.9
 
 self-loop 第 8 圈（def 区被尾部切掉的最后一修）：
