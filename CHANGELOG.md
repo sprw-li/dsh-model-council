@@ -1,3 +1,33 @@
+# 0.2.13
+
+自我循环第 12 圈：客户端半复审「有条件通过」的整改 + 验收门自证漏洞修复。
+
+## 按复审清单整改
+
+- **409 收窄为结构化错误码**（P0→证伪后仍做）：host 三种 409 分别带
+  `code: 'session-busy' | 'not-finished' | 'already-resumed'`；`fetchJson` 把 `status`/`code`/`runId`
+  挂到抛出的错误上；`resumeRun` **只认 `already-resumed`** 为成功，其余 409 照常显示。
+  用状态码或文案做判别都会吞掉真实失败。
+- **follower 轮询死循环**（真 P1）：非 leader 分支原先只重排、从不 fetch，640ms 无限循环，
+  run 结束也不停。现在 follower 不轮询，只保留自己的 SSE；由选举接管时新 leader 重新挂轮询
+  （`claim()` 里判断 `running && pollTimer === 0 && eventSource === null`）。
+- **`pollFailures`/`streamStalls` 跨 run 泄漏**（真 P2）：`startRun` 与 `switchSession` 都清零，
+  否则上一个 run 攒到 8 次后，新 run 第一次抖动就判死。
+- **SSE 错误风暴**（P2）：`onerror` 现在也计入 stall；两次失败后本 run 固定走轮询。
+- **非 leader 回投提示**（P1）：`feedbackNote: 'another-tab'` + `panel.feedbackOtherTab` 文案，
+  不再静默；`feedbackRunId` 在**所有标签**都记，leader 迁移后不会重投。
+- **`track()` 退役后立即 dispose**（P1）：teardown 之后注册的清理器不再永久泄漏。
+- **轮询失败不再抹掉别的错误**（P2）：仅在达到阈值时写入，不再写空串。
+
+## 验收门（`dev/tune-sampler.mjs`）
+
+- **修自证漏洞**：`text.slice(indexOf('client.js'))` 会切到别的文件（甚至 gate 自己，而 gate 源码也在
+  pack 内），断言字面量于是能匹配自身。改为按 `--- <路径> ---` 精确取块、按下一个路径头收尾。
+- **拆分两个真问题用例**：deadline 问题验 index.js（4/4），client 问题验 client.js（9/9），
+  覆盖 SSE、看门狗、选举租约、`closeLeaderChannel`、`schedulePollRetry`、Hook 拆分、resume 门禁。
+- 采样器：簇跨度上限 80 行、区域按份额自适应裁剪（不再"宽区截断到只剩开头"）、
+  入选簇 5 → 9、SCREAMING_SNAKE 常量补窗口。
+
 # 0.2.12
 
 自我循环第 11 圈：**客户端半首次被评审**，并修掉采样器的假定义缺陷。

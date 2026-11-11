@@ -469,7 +469,9 @@ async function readCodeSegments(path, budget, hints = []) {
     const clusters = []
     let run = [hits[0]]
     for (let index = 1; index < hits.length; index += 1) {
-      if (hits[index] - hits[index - 1] <= 40) run.push(hits[index])
+      /* Cap the span too: a 40-line gap tolerance over a dense file chained
+         hundreds of hits into one giant region that then got truncated. */
+      if (hits[index] - hits[index - 1] <= 40 && hits[index] - run[0] <= 80) run.push(hits[index])
       else {
         clusters.push(run)
         run = [hits[index]]
@@ -481,7 +483,7 @@ async function readCodeSegments(path, budget, hints = []) {
      * count: the top cluster gets the bulk (a whole function beats five
      * mid-cut fragments — equal shares truncated every region last round). */
     const anchorBudget = Math.floor(budget * 0.75)
-    let chosen = clusters.slice(0, 5)
+    let chosen = clusters.slice(0, 9)
     const weights = chosen.map((cluster) => cluster.length * cluster.length)
     const weightSum = weights.reduce((sum, value) => sum + value, 0)
     for (let index = 0; index < chosen.length; index += 1) {
@@ -503,6 +505,16 @@ async function readCodeSegments(path, budget, hints = []) {
           to = line + 1
           break
         }
+      }
+      /* Never emit more lines than the share can actually carry: a 500-line
+         region truncated to its first ~60 lines wasted the rest and could cut
+         the very code the question named (the leader lease was lost this way).
+         Keep the densest slice around the hits instead. */
+      const maxLines = Math.max(12, Math.floor(share / 55))
+      if (to - from > maxLines) {
+        const center = Math.floor((cluster[0] + cluster[cluster.length - 1]) / 2)
+        from = Math.max(0, center - Math.floor(maxLines / 2))
+        to = Math.min(totalLines, from + maxLines)
       }
       regions.push({ from, to, share })
     }
@@ -535,6 +547,21 @@ async function readCodeSegments(path, budget, hints = []) {
           const pattern = new RegExp(`(const|let|var)\\s+${escapeRegExp(hint)}\\s*=\\s*(async\\s+)?(function\\b|\\()`, 'i')
           if (pattern.test(text) && isFunctionDecl(text)) {
             found = index
+            break
+          }
+        }
+      }
+      /* SCREAMING_SNAKE constants named by the question (STREAM_STALL_MS,
+         SEAT_START_TIMEOUT_MS) are not function definitions, so only a small
+         window around them — but they must be present. */
+      if (/^[a-z0-9]+(_[a-z0-9]+)+$/.test(hint)) {
+        for (let index = 0; index < totalLines; index += 1) {
+          if ((lines[index] || '').toLowerCase().includes(hint)) {
+            const from = Math.max(0, index - 3)
+            const to = Math.min(totalLines, index + 12)
+            if (!regions.some((region) => from >= region.from && to <= region.to)) {
+              regions.push({ from, to, share: 1600 })
+            }
             break
           }
         }
@@ -1998,7 +2025,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v42', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v43', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -2007,7 +2034,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v42' })
+          sendJson(res, 200, { ok: true, build: 'v43' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
@@ -2047,7 +2074,7 @@ export function apply(ctx, config) {
           if (sessionId !== '') {
             for (const existing of runs.values()) {
               if (existing.historic !== true && existing.sessionId === sessionId && existing.status === 'running') {
-                sendJson(res, 409, { error: '该会话已有运行中的评审', runId: existing.id })
+                sendJson(res, 409, { error: '该会话已有运行中的评审', code: 'session-busy', runId: existing.id })
                 return
               }
             }
@@ -2284,11 +2311,11 @@ export function apply(ctx, config) {
             return
           }
           if (run.status !== 'done') {
-            sendJson(res, 409, { error: '运行尚未完成' })
+            sendJson(res, 409, { error: '运行尚未完成', code: 'not-finished' })
             return
           }
           if (run.resumed !== undefined) {
-            sendJson(res, 409, { error: '该结果已回投过' })
+            sendJson(res, 409, { error: '该结果已回投过', code: 'already-resumed' })
             return
           }
           try {
