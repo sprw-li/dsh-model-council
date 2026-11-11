@@ -1,8 +1,9 @@
 /**
- * Host half of @local/council.
+ * Host half of dsh-model-council.
  *
  * Serves the configured model catalog and runs one council:
- *   1. answers  - every selected model answers the question in parallel;
+ *   1. answers  - every selected model answers the question in parallel
+ *                 (read-only subagent seats when enabled, else raw model calls);
  *   2. reviews  - every model reviews the anonymized answers and ranks them;
  *   3. chairman - one elected model synthesizes consensus, dissent and advice.
  *
@@ -10,10 +11,15 @@
  * streams, so no long-lived socket is required.
  *
  * Routes (same origin, cookie auth):
- *   GET  /council/models            configured providers and text models
- *   POST /council/run               { question, models: [{ provider, model }] }
- *   GET  /council/run/<id>          run snapshot
- *   POST /council/run/<id>/cancel   abort every in-flight call
+ *   GET  /council/                build marker
+ *   GET  /council/models          configured providers and text models
+ *   GET  /council/workspace       session workspace resolution (cwd / registry)
+ *   GET  /council/runs            recent runs for one session (reattach after reload)
+ *   GET  /council/diag            runs and live agents, for diagnosis
+ *   POST /council/run             { question, models, ... } -> { runId }
+ *   GET  /council/run/<id>        run snapshot
+ *   POST /council/run/<id>/resume { mode: 'silent' | 'wake' } deliver the conclusion
+ *   POST /council/run/<id>/cancel stop the run and dispose every live seat
  */
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
@@ -38,17 +44,17 @@ const CALL_TIMEOUT_MS = 300000
 /** A subagent seat must finish startup within this bound. */
 const SEAT_START_TIMEOUT_MS = 60000
 /** A subagent seat must return a result within this bound after startup. */
-const SEAT_RESULT_TIMEOUT_MS = 120000
+const SEAT_RESULT_TIMEOUT_MS = 240000
 /** Whole-run watchdog: a stuck stage can never hold the UI forever. */
 const RUN_TIMEOUT_MS = 30 * 60 * 1000
 /** Concurrent subagent seats; the delegation runtime has a shared capacity pool (default 8). */
 const SEAT_CONCURRENCY = 3
 /** Global per-provider concurrency, enforced in the Host so tabs/chats cannot multiply it. */
 const PROVIDER_CONCURRENCY = 4
-/** One run may degrade at most this many seats; prevents a provider outage fallback storm. */
-const MAX_FALLBACKS_PER_RUN = 3
-/** Transport/provider failures worth one retry with backoff. */
-const TRANSIENT_FAILURE = /(429|5\d\d|ECONN|ETIMEDOUT|EAI_AGAIN|timeout|rate.?limit|overload|temporarily unavailable|fetch failed)/i
+/** One run may degrade at most one seat per participant. */
+const MAX_FALLBACKS_PER_RUN = 6
+/** Transport/provider failures worth one retry with backoff (word-bounded so "5000 tokens" never matches). */
+const TRANSIENT_FAILURE = /(\b429\b|\b5\d\d\b|ECONN|ETIMEDOUT|EAI_AGAIN|timeout|rate.?limit|overload|temporarily unavailable|fetch failed)/i
 const RUN_TTL_MS = 30 * 60 * 1000
 const MAX_RUNS = 16
 const MODEL_CACHE_MS = 60000
@@ -67,11 +73,27 @@ const SKIP_DIRS = new Set([
 const TEXT_EXTENSIONS = new Set([
   '.md', '.py', '.toml', '.json', '.yml', '.yaml', '.txt', '.cfg', '.ini',
   '.csv', '.jsonl', '.sh', '.ps1', '.html', '.css', '.js', '.ts', '.jsx',
-  '.tsx', '.mjs', '.cjs', '.c', '.h', '.cpp', '.rs', '.go', '.java',
+  '.tsx', '.mjs', '.cjs', '.c', '.h', '.cpp', '.rs', '.go', '.java', '.rb',
+  '.php', '.cs', '.kt', '.kts', '.swift', '.scala', '.lua', '.sql', '.vue',
+  '.svelte', '.proto', '.gradle', '.env.example',
 ])
+/** Extension-less files worth reading as text. */
+const TEXT_FILENAMES = /^(Makefile|Dockerfile|LICENSE|NOTICE|Procfile|Gemfile|Rakefile|Justfile)$/
 const SECRET_NAME = /(^|[\\/])(\.env[^\\/]*|id_(rsa|ed25519|ecdsa)[^\\/]*|credentials[^\\/]*|\.npmrc|\.pypirc|\.netrc|\.git-credentials|[^\\/]*\.(pem|key|pfx|p12|kdbx)|secrets?[^\\/]*|passwords?[^\\/]*|\.ssh|\.aws|\.kube)$/i
 /** A question that means the session workspace even without an explicit path. */
 const WORKSPACE_INTENT = /(工作区|项目|仓库|代码库|目录|本仓库|本项目|workspace|repository|repo\b|project|codebase)/i
+/** A question that asks for a review, so the source pack is worth attaching. */
+const REVIEW_INTENT = /(评审|审查|审计|review|audit|全项目|代码质量|安全审查)/i
+/** Bounded source pack so llm-mode seats can cite real files instead of guessing. */
+const CODE_MAX_CHARS = 40000
+const CODE_MAX_FILES = 24
+const CODE_FILE_CHARS = 4000
+const CODE_WALK_ENTRIES = 2000
+const CODE_EXTENSIONS = new Set([
+  '.py', '.pyi', '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs',
+  '.go', '.rs', '.java', '.kt', '.kts', '.cs', '.rb', '.php', '.c', '.h', '.cpp',
+  '.hpp', '.cc', '.lua', '.swift', '.scala', '.sh', '.ps1', '.sql', '.vue', '.svelte',
+])
 /** `@relative/path` mentions inside the question. */
 const AT_MENTION = /@([A-Za-z0-9_.\-]+(?:[\\/][A-Za-z0-9_.\-]+)*)/g
 const KEY_FILE = /(^|[\\/])(README[^\\/]*\.md|SKILL\.md|CLAUDE\.md|AGENTS\.md|CHECKPOINT\.md|pyproject\.toml|package\.json|setup\.py|requirements\.txt|ARCHITECTURE[^\\/]*\.md|STATUS[^\\/]*\.md|DEFAULTS[^\\/]*\.md|RELEASE_NOTES[^\\/]*\.md|DECISIONS[^\\/]*\.md)$/i
@@ -239,7 +261,8 @@ async function readTextFile(path, maxChars) {
     if (link.isSymbolicLink()) return ''
     const info = await stat(path)
     if (!info.isFile() || info.size > 1024 * 1024) return ''
-    if (!TEXT_EXTENSIONS.has(extname(path).toLowerCase())) return ''
+    const base = path.split(/[\\/]/).pop() || ''
+    if (!TEXT_EXTENSIONS.has(extname(path).toLowerCase()) && !TEXT_FILENAMES.test(base)) return ''
     const content = await readFile(path, 'utf8')
     if (content.indexOf('\u0000') !== -1) return ''
     return content.length > maxChars ? `${content.slice(0, maxChars)}\n…（已截断）` : content
@@ -312,21 +335,130 @@ async function keyFiles(root) {
   return found
 }
 
+/** Lowercase ASCII tokens of a question, used to match project directories and rank files. */
+function questionHints(text) {
+  const stop = new Set(['the', 'and', 'for', 'with', 'this', 'that', 'from', 'code', 'review', 'project', 'please', 'audit', 'into', 'your', 'docs', 'test', 'file', 'files'])
+  const hints = []
+  for (const token of String(text || '').split(/[^A-Za-z0-9_.\-]+/)) {
+    const value = token.toLowerCase()
+    if (value.length < 3 || stop.has(value)) continue
+    if (hints.indexOf(value) === -1) hints.push(value)
+  }
+  return hints
+}
+
+/** Source files under a directory: question-relevant paths first, then shallow/large. */
+async function collectSourceFiles(root, hints = []) {
+  const found = []
+  let visited = 0
+  async function walk(dir, depth) {
+    if (depth > 4 || visited >= CODE_WALK_ENTRIES) return
+    let entries
+    try {
+      entries = await readdir(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name))
+    for (const entry of entries) {
+      if (visited >= CODE_WALK_ENTRIES) return
+      visited += 1
+      if (entry.isSymbolicLink()) continue
+      if (entry.name.startsWith('.') && entry.name !== '.gitignore') continue
+      const full = join(dir, entry.name)
+      if (entry.isDirectory()) {
+        if (SKIP_DIRS.has(entry.name)) continue
+        await walk(full, depth + 1)
+      } else if (entry.isFile() && CODE_EXTENSIONS.has(extname(entry.name).toLowerCase())
+        && !SECRET_NAME.test(full)) {
+        let size = 0
+        try {
+          size = (await stat(full)).size
+        } catch {
+          size = 0
+        }
+        if (size === 0 || size > 300 * 1024) continue
+        found.push({ path: full, size, depth })
+      }
+    }
+  }
+  await walk(root, 1)
+  const score = (file) => {
+    const lower = file.path.toLowerCase()
+    let hits = 0
+    for (const hint of hints) if (lower.includes(hint)) hits += 1
+    return hits
+  }
+  found.sort((a, b) => score(b) - score(a) || a.depth - b.depth || b.size - a.size)
+  return found
+}
+
+/** Bounded source-code pack for review questions: real files the models can cite. */
+async function collectCodeContext(roots, maxChars, hints = []) {
+  const files = []
+  for (const root of roots) {
+    if (files.length >= CODE_MAX_FILES) break
+    for (const file of await collectSourceFiles(root, hints)) {
+      if (files.length >= CODE_MAX_FILES) break
+      files.push(file)
+    }
+  }
+  const parts = [`【工作区源码附件】选取 ${files.length} 个源码文件（单文件 ≤${CODE_FILE_CHARS} 字，总预算 ${maxChars} 字）`]
+  let used = 0
+  let included = 0
+  for (const file of files) {
+    const budget = Math.min(CODE_FILE_CHARS, maxChars - used)
+    if (budget < 200) break
+    const content = await readTextFile(file.path, budget)
+    if (content === '') continue
+    parts.push(`--- ${file.path} ---`, content)
+    used += content.length
+    included += 1
+  }
+  return {
+    text: included === 0 ? '' : parts.join('\n'),
+    chars: used,
+    files: included,
+    state: included === 0 ? 'none' : 'ok',
+  }
+}
+
 /** Directory tree plus key-file text for every path the question mentions, or the session workspace. */
-async function collectPathContext(question, maxChars, workspaceCwd) {
-  const candidates = candidatePaths(question, workspaceCwd)
-  if (candidates.length === 0 && typeof workspaceCwd === 'string' && workspaceCwd !== ''
-    && WORKSPACE_INTENT.test(String(question || ''))) {
-    candidates.push(workspaceCwd)
+async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars, allowCode = true, attachRoots = []) {
+  const hints = questionHints(question)
+  const allowedRoots = [workspaceCwd, ...attachRoots].filter((root) => typeof root === 'string' && root !== '')
+  /** With no configured allowlist, an explicitly typed path stays readable (local use). */
+  const permitted = (candidate) => attachRoots.length === 0
+    || allowedRoots.some((root) => candidate === root || isPathInside(candidate, root))
+  const candidates = candidatePaths(question, workspaceCwd).filter(permitted)
+  /* A named project directory wins over the whole workspace: "评审 dsh-council". */
+  if (candidates.length === 0 && typeof workspaceCwd === 'string' && workspaceCwd !== '') {
+    let matched
+    try {
+      const entries = await readdir(workspaceCwd, { withFileTypes: true })
+      for (const entry of entries) {
+        if (!entry.isDirectory() || entry.name.startsWith('.')) continue
+        if (hints.indexOf(entry.name.toLowerCase()) !== -1) {
+          matched = join(workspaceCwd, entry.name)
+          break
+        }
+      }
+    } catch {
+      matched = undefined
+    }
+    if (matched !== undefined) candidates.push(matched)
+    else if (WORKSPACE_INTENT.test(String(question || ''))) candidates.push(workspaceCwd)
   }
   const sections = []
   const valid = []
+  const dirs = []
   let used = 0
   for (const candidate of candidates) {
     const info = await statSafe(candidate)
     if (info === undefined) continue
     valid.push(candidate)
     if (info.isDirectory()) {
+      dirs.push(candidate)
       const tree = await listTree(candidate, MAX_TREE_ENTRIES)
       const files = await keyFiles(candidate)
       const parts = [`【工作区附件：${candidate}】`, `目录树（最多 ${MAX_TREE_ENTRIES} 项）：`, tree.join('\n')]
@@ -348,12 +480,27 @@ async function collectPathContext(question, maxChars, workspaceCwd) {
     }
     if (used >= maxChars) break
   }
+  let codeState = 'off'
+  let codeChars = 0
+  let codeFiles = 0
+  const wantsCode = allowCode && typeof codeMaxChars === 'number' && codeMaxChars > 0
+    && REVIEW_INTENT.test(String(question || '')) && dirs.length > 0
+  if (wantsCode) {
+    const code = await collectCodeContext(dirs, codeMaxChars, hints)
+    codeState = code.state
+    codeChars = code.chars
+    codeFiles = code.files
+    if (code.text !== '') sections.push(code.text)
+  }
   const text = sections.join('\n\n')
   return {
-    text: text === '' ? '' : `${text}\n\n（以上为本地文件内容，供评审参考；不要声称可以访问文件系统。）`,
+    text: text === '' ? '' : `${text}\n\n（以上为本地文件内容，供评审参考；不要声称可以访问文件系统。评审类结论必须引用具体文件路径，附件未覆盖的内容须标注【推断】。）`,
     state: valid.length === 0 ? 'none' : 'ok',
     paths: valid,
     chars: text.length,
+    codeState,
+    codeChars,
+    codeFiles,
   }
 }
 
@@ -368,6 +515,11 @@ export function apply(ctx, config) {
     && Number.isSafeInteger(config.filesMaxChars) && config.filesMaxChars >= 2000
     ? Math.min(config.filesMaxChars, 80000)
     : ATTACH_MAX_CHARS
+  /** Character budget for the source-code pack attached to review questions. */
+  const codeMaxChars = config !== null && typeof config === 'object'
+    && Number.isSafeInteger(config.codeMaxChars) && config.codeMaxChars >= 2000
+    ? Math.min(config.codeMaxChars, 120000)
+    : CODE_MAX_CHARS
   /**
    * Extra read-only skill roots for subagent seats. Configured `skillDirs` wins;
    * otherwise auto-detect the shared agent-library store (~/.dsh/skills already
@@ -375,6 +527,15 @@ export function apply(ctx, config) {
    */
   const configuredSkillDirs = config !== null && typeof config === 'object' && Array.isArray(config.skillDirs)
     ? config.skillDirs.filter((dir) => typeof dir === 'string' && dir !== '')
+    : []
+  /**
+   * Optional allowlist for path attachments. Empty (default) keeps the local
+   * single-user behavior: a path the user typed into the question is read.
+   * Non-empty confines every attachment to these roots plus the session
+   * workspace, so a shared deployment cannot be talked into reading elsewhere.
+   */
+  const attachRoots = config !== null && typeof config === 'object' && Array.isArray(config.attachRoots)
+    ? config.attachRoots.filter((dir) => typeof dir === 'string' && dir !== '')
     : []
   const defaultAgentsHome = process.env.DSH_AGENTS_HOME || join(process.env.USERPROFILE || '', '.agents')
   const defaultSkillStore = process.env.AGLIB_STORE || 'D:\\agent-library'
@@ -787,6 +948,9 @@ export function apply(ctx, config) {
       filesState: run.filesState === undefined ? 'off' : run.filesState,
       filesPaths: run.filesPaths === undefined ? [] : run.filesPaths,
       filesChars: run.filesChars === undefined ? 0 : run.filesChars,
+      codeState: run.codeState === undefined ? 'off' : run.codeState,
+      codeFiles: run.codeFiles === undefined ? 0 : run.codeFiles,
+      codeChars: run.codeChars === undefined ? 0 : run.codeChars,
       workspace: run.workspace === undefined ? { cwd: '', source: 'none', workspaceId: '', name: '' } : run.workspace,
       structure: run.structure === undefined ? { roles: {}, stages: [] } : run.structure,
       seatMode: run.seatMode === undefined ? 'llm' : run.seatMode,
@@ -923,10 +1087,10 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Deliver one finished run back to its session, matching the subagent
-   * settlement boundary: both modes target the NEXT TURN, never the current
-   * step. `silent` only omits the wake; `wake` is exactly a subagent-style
-   * parent delivery (`followup`).
+   * Deliver one finished run back to its session.
+   * `silent` uses `agent.inject()`: the conclusion becomes model-facing context
+   * claimed at the next pre-step, so it never occupies an inbox queue slot and
+   * never opens a turn. `wake` is a subagent-style parent delivery (`followup`).
    * @param run - completed run owning the target session.
    * @param mode - 'silent' or 'wake'.
    */
@@ -938,10 +1102,10 @@ export function apply(ctx, config) {
       id: `msg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
       role: 'user',
       content: [{ type: 'text', text: feedbackText(run) }],
-      source: { kind: 'user' },
+      source: { kind: 'council' },
     }
     if (mode === 'wake') agent.followup(message)
-    else agent.send(message, 'next-turn', false)
+    else agent.inject(message)
     run.resumed = mode
   }
 
@@ -1015,7 +1179,21 @@ export function apply(ctx, config) {
   /** Execute the three stages for one run. */
   async function execute(run, routes) {
     const signal = run.controller.signal
-    const questionBlock = run.contextBlock === '' ? run.question : `${run.contextBlock}\n\n---\n\n问题：${run.question}`
+    const baseQuestion = run.contextBlock === '' ? run.question : `${run.contextBlock}\n\n---\n\n问题：${run.question}`
+    const workspaceLine = run.workspace !== undefined && typeof run.workspace.cwd === 'string' && run.workspace.cwd !== ''
+      ? run.workspace.cwd
+      : ''
+    const attachmentNote = run.seatMode === 'subagent' && workspaceLine !== ''
+      ? `【工作区】你有只读工具（read/glob/grep/skill）。工作区根目录：${workspaceLine}。请自己检索并打开相关文件后再下结论，不要依据附件摘要猜测；结论必须引用具体文件路径，没查到的内容标注【未核实】。`
+      : run.codeState === 'ok'
+        ? '【附件说明】附件包含工作区实际文件与源码片段（路径已标注）。评审结论必须引用具体文件路径；附件未覆盖的内容必须标注【推断】，不得编造文件内容。'
+        : run.filesState === 'ok'
+          ? '【附件说明】附件包含工作区目录树与关键文档（路径已标注）。引用具体文件路径；未覆盖内容标注【推断】。'
+          : ''
+    const questionBlock = attachmentNote === '' ? baseQuestion : `${baseQuestion}\n\n${attachmentNote}`
+    /* Reviews and the chairman get the question plus answers; re-sending the full
+       source pack would triple latency and token cost without adding evidence. */
+    const reviewQuestionBlock = attachmentNote === '' ? run.question : `${run.question}\n\n${attachmentNote}`
     const useSubagentSeats = run.seatMode === 'subagent' && run.parent !== undefined && run.parent !== null
     /**
      * Stage-1 seat: read-only subagent when enabled, falling back to a raw model
@@ -1072,7 +1250,7 @@ export function apply(ctx, config) {
         })
         .join('\n\n')
       const reviewPrompt = [
-        questionBlock,
+        reviewQuestionBlock,
         `各模型对同一问题的匿名回答：\n\n${labeled}`,
         [
           '请完成：',
@@ -1115,7 +1293,7 @@ export function apply(ctx, config) {
         })
         .join('\n\n')
       const chairmanPrompt = [
-        questionBlock,
+        reviewQuestionBlock,
         `各模型的回答：\n\n${answersBlock}`,
         `各模型的匿名互评：\n\n${reviewsBlock}`,
         '你是理事会主席。请综合以上材料输出最终结论：共识、分歧与盲点、最终建议，以及结论依赖的前提。',
@@ -1175,7 +1353,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v15', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v20', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -1184,7 +1362,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v15' })
+          sendJson(res, 200, { ok: true, build: 'v20' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
@@ -1279,11 +1457,21 @@ export function apply(ctx, config) {
           let filesState = 'off'
           let filesPaths = []
           let filesChars = 0
+          let codeState = 'off'
+          let codeFiles = 0
+          let codeChars = 0
           if (body.attachFiles !== false) {
-            const files = await collectPathContext(question, filesMaxChars, workspace.cwd)
+            /* Seats with read-only tools grep the workspace themselves; only
+               tool-less llm seats need the bounded source pack. */
+            const files = await collectPathContext(
+              question, filesMaxChars, workspace.cwd, codeMaxChars, seatMode !== 'subagent', attachRoots,
+            )
             filesState = files.state
             filesPaths = files.paths
             filesChars = files.chars
+            codeState = files.codeState
+            codeFiles = files.codeFiles
+            codeChars = files.codeChars
             if (files.text !== '') contextParts.push(files.text)
           }
           const structure = {
@@ -1311,6 +1499,9 @@ export function apply(ctx, config) {
             filesState,
             filesPaths,
             filesChars,
+            codeState,
+            codeFiles,
+            codeChars,
             workspace,
             structure,
             contextBlock: contextParts.join('\n\n'),
@@ -1474,4 +1665,14 @@ export function apply(ctx, config) {
 }
 
 /* Pure helpers exported for the host harness (`dev/verify-host.mjs`). */
-export { candidatePaths, isPathInside, readTextFile, runLimited, withTimeout }
+export {
+  TRANSIENT_FAILURE,
+  candidatePaths,
+  collectCodeContext,
+  collectPathContext,
+  collectSourceFiles,
+  isPathInside,
+  readTextFile,
+  runLimited,
+  withTimeout,
+}

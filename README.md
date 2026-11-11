@@ -56,7 +56,7 @@ DeepSeek Harness 的多模型理事会插件：一个入口把问题交给多个
 | POST | `/council/run/<id>/resume` | `{ mode: 'silent' \| 'wake' }`：静默注入（`agent.inject`）或直接唤醒（`agent.followup`）；每个结果只接受一次 |
 | POST | `/council/run/<id>/cancel` | 中止全部在途调用 |
 
-运行记录保存在宿主内存：30 分钟过期、最多 16 条，DSH 重启即丢。
+ 运行记录保存在宿主内存（30 分钟过期、最多 `MAX_RUNS = 16` 条），并同步落盘到 `${DSH_HOME:-~/.dsh}/council-runs.json`（最多 20 条、500ms 防抖）；DSH 重启后仍能查到历史运行，重启前仍在跑的那条会标成「Host 重启，运行中断」。
 
 ## 工作区与结构（对齐 subagent / group / workflow）
 
@@ -97,6 +97,7 @@ council 不再只靠正则猜路径，而是按 Harness 自己的结构解析：
   config:
     contextMaxChars: 6000
     filesMaxChars: 20000
+    codeMaxChars: 40000
     skillDirs:
       - D:\agent-library\catalog
 ```
@@ -130,6 +131,7 @@ council 不再只靠正则猜路径，而是按 Harness 自己的结构解析：
 - **降级配额**：每个 run 最多降级 3 席（超时/失败 → 纯模型），超过直接报错，避免 provider 故障时降级风暴；`seat.fallback/fallbackFrom` 与 `run.fallbacks/fallbackLimit` 可在快照里审计。
 - **单会话单 run**：同一 `sessionId` 已有运行中的评审时，`POST /council/run` 返回 409 + 现有 runId，前端改为接回而不是再开一份。
 - **运行注册表持久化**：写入 `${DSH_HOME:-~/.dsh}/council-runs.json`（最多 20 条，500ms 防抖）；Host 重启后仍能查到历史运行，重启前仍在跑的被标注为「Host 重启，运行中断」。
+- **源码包（评审必读）**：问题含 `评审/审查/review/audit` 等意图时，除目录树与关键文档外，还会自动打包**真实源码**：最多 24 个源码文件、单文件 4k 字、总预算 `codeMaxChars`（默认 40k），路径全部标注；提示词要求结论必须引用具体文件、附件未覆盖的内容标注【推断】。快照新增 `codeState/codeFiles/codeChars`，UI 显示「已附带源码 N 个文件（X 字）」。这就是「评审要看工作区就真读工作区」，而不是只读 README 猜。
 - **附件安全**：`@mention` 只解析到工作区内（拒绝 `..` 穿越）；路径附件拒绝符号链接、密钥类文件（`.env`/`.pem`/`.key`/`.ssh`/`.aws`/`.kube`/`id_rsa` 等）、二进制与 >1MB 文件；skill 只读加载、脚本不执行。
 - **自动化回归**：`npm run verify` 现在同时跑 host 与 client harness（路径修复/穿越拒绝/密钥跳过/超时语义/并发窗口）。
 
@@ -140,7 +142,7 @@ council 不再只靠正则猜路径，而是按 Harness 自己的结构解析：
 - 「结果回投」的**直接唤醒**会让主 Agent 立即回复（有意行为）；**静默注入**与 subagent 的投递边界一致：`send(msg, 'next-turn', false)` 只排队、不唤醒，结论在**下一轮用户消息**的 turn 边界进入上下文，不会打断当前 turn。
 - 上下文只取可见文本，不含工具调用与附件；路径附件只读文本类文件（1 MB 内），不读二进制、不跟随符号链接。
 - **运行中可停止**：运行中显示「停止」按钮；页面刷新/重新打开后会自动从 `GET /council/runs` 接回正在跑的 run（仍可点停止）。直接关闭浏览器窗口/标签页时，client 用 `navigator.sendBeacon` 通知 host 取消当前 run（`pagehide`），不会把后台运行留在无人看管状态。**关闭右侧栏 tab 不终止运行**（设计如此：重开 tab 可接回），要终止请点「停止」或关闭页面。
-- **subagent 席位只在作答阶段**：互评与主席走快速纯模型通道，避免 6 席 × 多阶段各开一整轮子代理导致假死；单席有启动 60s / 执行 240s 上限，超时或失败自动降级纯模型（卡片标「完成（降级）」），整轮另有 30 分钟 watchdog。卡片在运行中显示「启动中/运行中 Ns」。
+- **subagent 席位只在作答阶段**：互评与主席走快速纯模型通道，避免 6 席 × 多阶段各开一整轮子代理导致假死；单席有启动 60s / 执行 240s 上限（`SEAT_START_TIMEOUT_MS` / `SEAT_RESULT_TIMEOUT_MS`，与本节一致），超时或失败自动降级纯模型（卡片标「完成（降级）」），整轮另有 30 分钟 watchdog。卡片在运行中显示「启动中/运行中 Ns」。
 - **subagent 模式下路径附件默认关闭**：委员自己用只读工具读工作区，避免重复注入 20k 字；如需同时注入，走 API 显式传 `attachFiles: true`。
 - **subagent 席位较慢**：每席是一轮完整子代理（带工具），比纯模型调用慢数倍；子会话会出现在子代理侧栏。`council-readonly` preset 依赖 DSH 的 `dsh-persona`/`dsh-tool-fs`/`dsh-tool-fs-search`/`dsh-skill-filesystem`/`dsh-tool-skill` 模块名，升级 DSH 后若改名会注册失败并自动退回纯模型模式（UI 会提示）。
 - **输出预算**：作答/互评/主席各 16384 tokens、单次调用超时 300s；推理模型若把预算烧光且无正文，会自动用 32768 重试一次。仍有极小概率失败，属模型侧限制。
