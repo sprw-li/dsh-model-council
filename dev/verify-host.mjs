@@ -106,6 +106,19 @@ try {
     const pack = await collectPathContext(question, 6000, workspace, 5000)
     assert.equal(pack.codeState, 'ok', `source pack must attach for: ${question}`)
   }
+  /* A bogus absolute token in the prose ("无 /cancel", a version string) used
+     to become the ONLY candidate, so validation failed and both workspace
+     fallbacks were skipped — the review then received zero source and could
+     only answer "attachment not covered". */
+  for (const question of [
+    'client.js 签发复审（v0.2.18, a7ab32bb）：pagehide 无 sendBeacon、无 /cancel',
+    '核验 v0.2.18 里 /resume 与 /cancel 的行为，index.js 实现是否一致',
+  ]) {
+    const pack = await collectPathContext(question, 6000, workspace, 5000, true, [], workspace)
+    assert.equal(pack.codeState, 'ok', `bogus path tokens must not suppress the fallback: ${question}`)
+    assert.ok(pack.codeFiles >= 1, `expected code files for: ${question}`)
+  }
+
   /* A pure chat question MUST NOT drag the code base into the prompt. */
   const chatPack = await collectPathContext('今天天气怎么样', 6000, workspace, 5000)
   assert.equal(chatPack.codeState, 'off', 'plain chat must not attach source code')

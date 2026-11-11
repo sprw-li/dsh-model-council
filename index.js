@@ -720,11 +720,33 @@ async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars
     else if ((WORKSPACE_INTENT.test(String(question || '')) || wantsSourcePack(question))
       && permitted(workspaceCwd)) {
       candidates.push(workspaceCwd)
-    }  }
+    }
+  }
   const sections = []
   const valid = []
   const dirs = []
   let used = 0
+  /* Raw path-like tokens that do not exist (a version string such as
+     `v0.2.18` looks like one) used to suppress both fallbacks above, leaving
+     zero attachments even though the question clearly named code. Validate
+     first, then fall back on the workspace when nothing resolved. */
+  const candidatePathsResolved = []
+  for (const candidate of candidates) {
+    const info = await statSafe(candidate)
+    if (info !== undefined) candidatePathsResolved.push(candidate)
+  }
+  if (candidatePathsResolved.length === 0 && candidates.length > 0 && !namedButRefused) {
+    for (const fallback of [callerCwd, workspaceCwd]) {
+      if (typeof fallback !== 'string' || fallback === '') continue
+      if (!permitted(fallback)) continue
+      if (!(WORKSPACE_INTENT.test(String(question || '')) || wantsSourcePack(question))) continue
+      const info = await statSafe(fallback)
+      if (info === undefined) continue
+      candidates.length = 0
+      candidates.push(fallback)
+      break
+    }
+  }
   for (const candidate of candidates) {
     const info = await statSafe(candidate)
     if (info === undefined) continue
@@ -2039,7 +2061,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v48', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v49', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -2048,7 +2070,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v48' })
+          sendJson(res, 200, { ok: true, build: 'v49' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
