@@ -611,6 +611,11 @@ window.__ModuleLoader__.load({
         const rows = data !== null && typeof data === 'object' && Array.isArray(data.runs) ? data.runs : []
         const current = rows.find((row) => row !== null && typeof row === 'object' && row.status === 'running')
         if (current === undefined || typeof current.id !== 'string') return
+        /* Reattaching a different run must not inherit the old counters. */
+        if (store.state.runId !== current.id) {
+          pollFailures = 0
+          streamStalls = 0
+        }
         store.publish({ runId: current.id, run: current, running: true, error: '' })
         watchRun(current.id)
       } catch {
@@ -746,7 +751,11 @@ window.__ModuleLoader__.load({
         return
       }
       store.publish({ ...cached, error: '' })
-      if (cached.running === true && typeof cached.runId === 'string' && cached.runId !== '') watchRun(cached.runId)
+      if (cached.running === true && typeof cached.runId === 'string' && cached.runId !== '') {
+        pollFailures = 0
+        streamStalls = 0
+        watchRun(cached.runId)
+      }
     }
 
     function switchSession(sessionId) {
@@ -792,6 +801,7 @@ window.__ModuleLoader__.load({
     }
 
     let pollFailures = 0
+    let resumeInFlight = ''
 
     async function pollRun(runId) {
       if (store.state.runId !== runId) return
@@ -928,31 +938,35 @@ window.__ModuleLoader__.load({
       if (mode !== 'silent' && mode !== 'wake') return
       const token = `${runId}:${mode}`
       if (store.state.feedbackRunId === token) return
-      /* Record the token in every tab (not just the leader) so a leader change
-         cannot replay the same delivery. */
-      store.publish({ feedbackRunId: token })
+      /* In-tab guard only: the token itself must NOT be written before the
+         POST succeeds. Writing it first let a follower "claim" the delivery,
+         so when it later became leader the guard above short-circuited and
+         nobody ever posted the conclusion. */
+      if (resumeInFlight === token) return
       if (isPollLeader() !== true) {
-        /* A follower tab must not POST; the leader does it and the host is
-           once-only. Say so instead of failing silently. */
+        /* The leader delivers; say so instead of failing silently. */
         store.publish({ feedbackNote: 'another-tab' })
         return
       }
+      resumeInFlight = token
       try {
         await fetchJson(`/council/run/${encodeURIComponent(runId)}/resume`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ mode }),
         })
-        store.publish({ feedbackNote: '' })
+        store.publish({ feedbackRunId: token, feedbackNote: '' })
       } catch (error) {
         /* Only the host's explicit "already delivered" is success. Any other
            409 (not finished / session busy) is a real condition the user must
            see — matching on the bare status code would swallow those. */
         if (error !== null && typeof error === 'object' && error.code === 'already-resumed') {
-          store.publish({ feedbackNote: '' })
+          store.publish({ feedbackRunId: token, feedbackNote: '' })
           return
         }
-        store.publish({ feedbackNote: '', feedbackRunId: '', error: messageOf(error) })
+        store.publish({ feedbackNote: '', error: messageOf(error) })
+      } finally {
+        if (resumeInFlight === token) resumeInFlight = ''
       }
     }
 

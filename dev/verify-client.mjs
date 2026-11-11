@@ -583,6 +583,25 @@ if (!silentHtml.includes('已静默放进上下文')) throw new Error('silent de
   }
 }
 
+/* --- Regression: the delivery token must not be claimed before the POST.
+       A follower used to write feedbackRunId, so when it took over the leader
+       role the guard above short-circuited and nobody delivered. --- */
+{
+  const source = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
+  const resume = /async function resumeRun\(runId, mode\) \{([\s\S]*?)\n    \}/.exec(source)
+  if (resume === null) throw new Error('resumeRun not found')
+  const body = resume[1]
+  const tokenWrite = body.indexOf('feedbackRunId: token')
+  const leaderGate = body.indexOf('isPollLeader() !== true')
+  if (tokenWrite === -1) throw new Error('resumeRun no longer records the delivery token')
+  if (leaderGate === -1) throw new Error('resumeRun lost its leader gate')
+  if (tokenWrite < leaderGate) {
+    throw new Error('resumeRun must not record the token before the leader gate')
+  }
+  if (!body.includes('already-resumed')) throw new Error('resumeRun must recognise already-resumed')
+  if (!body.includes('resumeInFlight')) throw new Error('resumeRun needs an in-tab in-flight guard')
+}
+
 for (const cleanup of cleanups.reverse()) {
   try {
     cleanup()
