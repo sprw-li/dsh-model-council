@@ -1,3 +1,11 @@
+# 0.2.15
+
+终审 6/6 项成立但因一个**真实 P1** 判不通过，本轮修复：
+
+- **回投记账时机**（P1，阻断项）：`resumeRun` 原先在 leader 门禁**之前**就写 `feedbackRunId`。follower 先记账、随后接管 leader 时会被自己的去重守卫短路，结论**无人投递**（且 UI 还显示「另一标签已投递」）。现在 token 只在 POST 成功或 host 明确返回 `already-resumed` 之后才记账；POST 期间用进程内 `resumeInFlight` 防重入。
+- **计数器跨 run 继承**（P1）：`adoptRunningRun` / `restoreSessionState` 进入 `watchRun` 前也清零 `pollFailures`/`streamStalls`。
+- `dev/verify-client.mjs` 新增源码顺序断言：token 写入必须晚于 leader 门禁，且必须存在 `already-resumed` 分支与 `resumeInFlight`。
+
 # 0.2.14
 
 **意图识别根治**：源码包不再依赖意图词表。
