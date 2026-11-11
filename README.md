@@ -69,6 +69,40 @@ council 不再只靠正则猜路径，而是按 Harness 自己的结构解析：
 | **group 角色组** | `structure.roles = { answerers, reviewers, arbiter }`；`POST /council/run` 可传 `reviewers` 子集（缺省=全部作答模型），arbiter 即主席。 |
 | **workflow 阶段** | `structure.stages = ['answers','reviews','synthesize']`（无主席时省略末段），每个阶段对一组角色执行，快照 `structure` 即节点图。 |
 
+## Skill 接入（agent-library / DSH）
+
+`council-readonly` 席位里装了 `skill-filesystem` + `tool-skill`，所以委员**能只读加载 skill**（列在它的 catalog 里、能看到 `skill` 工具）。
+
+扫描根（由 `skill-filesystem` 决定，`includeDefaultRoots` 默认开）：
+
+| 优先级 | 来源 | 路径 |
+|---|---|---|
+| 100 | 项目 DSH | `<项目根>/.dsh/skills` |
+| 200 | 项目 agents | `<项目根>/.agents/skills` |
+| 300 | 自定义 | `config.skillDirs` / 自动探测的 `D:\agent-library\catalog`（或 `$AGLIB_STORE/catalog`） |
+| 400 | 用户 DSH | `~/.dsh/skills`（跳过 `.system`） |
+| 500 | 用户 agents | `~/.agents/skills` |
+| 600 | bundled | DSH 内置 skill 目录 |
+
+用法：
+- **委员自己调用**：问题里点名即可，例如「先用 skill 工具加载 `office-xlsx`，再按它评审表格产物」；席位看到 catalog 后自行调用 `skill` 工具。
+- **只读**：席位没有写/执行工具，skill 只用于读指令；skill 里的脚本不会被执行（要执行请让主 Agent 做）。
+- **主会话里的 DSH skill**：模型自动调用 `skill` 工具，或用户输入 `/skill-name`（`user-invocable` 的 skill）显式注入；council 席位不响应 `/name`，只在问题里点名或用 `skill` 工具。
+
+配置示例（profile 插件行）：
+
+```yaml
+- id: council
+  name: dsh-model-council
+  config:
+    contextMaxChars: 6000
+    filesMaxChars: 20000
+    skillDirs:
+      - D:\agent-library\catalog
+```
+
+不配 `skillDirs` 时，会自动探测 `$AGLIB_STORE/catalog`，否则 `D:\agent-library\catalog`（存在才加）。
+
 ## 配置
 
 在 profile 的插件行上传 `config`（无需构建）：
