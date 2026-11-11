@@ -44,7 +44,7 @@ function dispatchWindowEvent(type, event) {
 
 const resumeCalls = []
 /* Fault injection for the resilience cases below. */
-let failNextResumeWith409 = false
+let failNextResumeWith409 = null
 let failNextRunPolls = 0
 
 /* "Wake the chat agent" enabled before the bundle loads. */
@@ -140,8 +140,12 @@ const fakeWindow = {
     if (resumeMatch !== null) {
       const payload = JSON.parse(options === undefined || options === null || options.body === undefined ? '{}' : options.body)
       if (failNextResumeWith409) {
-        failNextResumeWith409 = false
-        return { ok: false, status: 409, json: async () => ({ error: '该结果已回投过' }) }
+        const kind = failNextResumeWith409
+        failNextResumeWith409 = null
+        /* Two distinct host conditions share status 409: only the explicit
+           "already delivered" is success. */
+        if (kind === 'already') return { ok: false, status: 409, json: async () => ({ error: '该结果已回投过', code: 'already-resumed' }) }
+        return { ok: false, status: 409, json: async () => ({ error: '运行尚未完成', code: 'not-finished' }) }
       }
       resumeCalls.push({ runId: resumeMatch[1], mode: payload.mode })
       return { ok: true, json: async () => ({ ok: true, mode: payload.mode }) }
@@ -535,10 +539,10 @@ if (silentResume === undefined || silentResume.mode !== 'silent') {
 const silentHtml = render(React.createElement(tabBody, { t }))
 if (!silentHtml.includes('已静默放进上下文')) throw new Error('silent delivery note is missing')
 
-/* --- Resilience: a 409 from /resume means "already delivered", not failure --- */
+/* --- Resilience: a 409 with code=already-resumed means delivered, not failure --- */
 {
   const before = resumeCalls.length
-  failNextResumeWith409 = true
+  failNextResumeWith409 = 'already'
   const button = findRunButton(build(tabBody({ t })))
   if (button === undefined) throw new Error('run button missing for the 409 case')
   button.props.onClick()
@@ -547,6 +551,19 @@ if (!silentHtml.includes('已静默放进上下文')) throw new Error('silent de
   const html409 = render(React.createElement(tabBody, { t }))
   if (html409.includes('该结果已回投过')) {
     throw new Error('a 409 (already delivered) must not surface as a red error')
+  }
+}
+
+/* --- Narrowing: any OTHER 409 must surface, not be swallowed --- */
+{
+  failNextResumeWith409 = 'other'
+  const button = findRunButton(build(tabBody({ t })))
+  if (button === undefined) throw new Error('run button missing for the other-409 case')
+  button.props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 1800))
+  const htmlOther = render(React.createElement(tabBody, { t }))
+  if (!htmlOther.includes('运行尚未完成')) {
+    throw new Error('a non-"already delivered" 409 must be shown to the user')
   }
 }
 

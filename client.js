@@ -55,6 +55,8 @@ window.__ModuleLoader__.load({
       'panel.feedbackHint': '静默用 agent.inject()：结论作为上下文在下一次请求前注入，不占用队列、不唤醒主 Agent；唤醒用 followup，立即让主 Agent 回复。',
       'panel.feedbackSilentSent': '已静默放进上下文（不排队）',
       'panel.feedbackWakeSent': '已唤醒主聊天',
+      /* A follower tab does not POST the conclusion; the leader does. */
+      'panel.feedbackOtherTab': '结论由另一个标签页回投（本页不重复提交）',
       'panel.privacy': '接上下文时，最近约 {chars} 字会话内容会发送至所选模型提供商；回投会再发一条消息。',
       'panel.cost': '预计 {count} 次模型调用',
       'panel.partialFailure': '{failed}/{total} 个模型失败，其余结果仍有效',
@@ -142,6 +144,7 @@ window.__ModuleLoader__.load({
       'panel.feedbackHint': 'Silent inject does not wake the main Agent; the conclusion becomes context at the next turn. Wake starts a follow-up turn now.',
       'panel.feedbackSilentSent': 'Placed into context (not queued)',
       'panel.feedbackWakeSent': 'Posted and woke the main Agent',
+      'panel.feedbackOtherTab': 'Another tab posted the conclusion (not re-sent here)',
       'panel.privacy': 'With context on, about {chars} characters of this chat are sent to the selected model providers; posting back adds one more message.',
       'panel.cost': 'About {count} model calls',
       'panel.partialFailure': '{failed}/{total} models failed; the other results still stand',
@@ -300,6 +303,8 @@ window.__ModuleLoader__.load({
         useChairman: persisted.useChairman !== false,
         sessionId: '',
         feedbackRunId: '',
+        /* '' | 'another-tab' — why this tab did not deliver the conclusion. */
+        feedbackNote: '',
         contextMaxChars: 6000,
         filesMaxChars: 20000,
         workspace: null,
@@ -387,8 +392,21 @@ window.__ModuleLoader__.load({
       } catch {
         data = {}
       }
-      if (!response.ok) throw new Error(data && data.error ? String(data.error) : `HTTP ${response.status}`)
+      if (!response.ok) {
+        const error = new Error(data && data.error ? String(data.error) : `HTTP ${response.status}`)
+        /* Structured code + status travel with the error so callers never have
+           to pattern-match a human-readable message (or guess which 409 it is). */
+        error.status = response.status
+        error.code = data !== null && typeof data === 'object' && typeof data.code === 'string' ? data.code : ''
+        if (data !== null && typeof data === 'object' && typeof data.runId === 'string') error.runId = data.runId
+        throw error
+      }
       return data
+    }
+
+    /** Human-readable text of any thrown value. */
+    function messageOf(error) {
+      return String(error && error.message ? error.message : error)
     }
 
     let loadPromise = null
@@ -495,6 +513,9 @@ window.__ModuleLoader__.load({
     let pollTimer = 0
     let eventSource = null
     let streamWatchdog = 0
+    /* A half-open proxy can make the stream stall repeatedly. After a couple of
+       stalls this run stays on polling instead of churning open→stall→open. */
+    let streamStalls = 0
     /** No SSE frame for this long while running => the stream is half-open. */
     const STREAM_STALL_MS = 8000
 
@@ -524,6 +545,7 @@ window.__ModuleLoader__.load({
       streamWatchdog = window.setTimeout(() => {
         streamWatchdog = 0
         if (store.state.runId !== runId || store.state.running !== true) return
+        streamStalls += 1
         stopEventStream()
         schedulePoll(runId)
       }, STREAM_STALL_MS)
@@ -533,6 +555,11 @@ window.__ModuleLoader__.load({
       stopPolling()
       stopEventStream()
       if (typeof window === 'undefined' || typeof window.EventSource !== 'function') {
+        schedulePoll(runId)
+        return
+      }
+      /* Two stalls are enough evidence: keep this run on polling. */
+      if (streamStalls >= 2) {
         schedulePoll(runId)
         return
       }
@@ -563,7 +590,10 @@ window.__ModuleLoader__.load({
         }
       }
       eventSource.onerror = () => {
-        /* The stream reconnected or died; fall back to polling until it heals. */
+        /* The stream died: fall back to polling. Count it like a stall so a
+           proxy that always blocks SSE cannot cause a 320ms open→error→poll
+           loop — after two failures this run stays on polling. */
+        streamStalls += 1
         stopEventStream()
         if (store.state.runId === runId && store.state.running === true) schedulePoll(runId)
       }
@@ -655,11 +685,18 @@ window.__ModuleLoader__.load({
         if (leaderChannel === null) return
         const now = Date.now()
         const claim = () => {
+          const wasLeader = isPollLeader()
           myClaimAt = now
           try {
             leaderChannel.postMessage({ leader: leaderTab, sessionId: store.state.sessionId })
           } catch {
             /* best effort */
+          }
+          /* Takeover: the previous leader may have owned the only poll timer,
+             so re-arm one or the run would sit unobserved. */
+          if (wasLeader !== true && store.state.running === true && pollTimer === 0 && eventSource === null
+            && store.state.runId !== '') {
+            schedulePoll(store.state.runId)
           }
         }
         if (myClaimAt > leaderSeenAt) {
@@ -721,6 +758,8 @@ window.__ModuleLoader__.load({
          previous BroadcastChannel kept mutating the shared leader clock. */
       stopPolling()
       stopEventStream()
+      pollFailures = 0
+      streamStalls = 0
       saveSessionState()
       store.publish({ sessionId })
       restoreSessionState(sessionId)
@@ -756,9 +795,18 @@ window.__ModuleLoader__.load({
 
     async function pollRun(runId) {
       if (store.state.runId !== runId) return
+      if (store.state.running !== true) {
+        stopPolling()
+        return
+      }
       if (isPollLeader() !== true) {
-        /* Still follow the run even when another tab owns the delivery. */
-        schedulePollRetry(runId, 1)
+        /* Followers do not poll (that used to re-arm every 640ms without ever
+           fetching, so a follower never learned the run had finished). They
+           keep their own SSE stream instead; if that is down too, the
+           election hands leadership over and the new leader polls. */
+        if (eventSource === null && typeof window !== 'undefined' && typeof window.EventSource === 'function') {
+          watchRun(runId)
+        }
         return
       }
       try {
@@ -793,7 +841,9 @@ window.__ModuleLoader__.load({
            sustained streak. Dropping it let the user start a second run while
            the first one's conclusion had nowhere to land. */
         pollFailures += 1
-        store.publish({ error: pollFailures >= 3 ? message : '' })
+        /* Only publish the message once it is worth showing — and never blank
+           an error that some other path just set. */
+        if (pollFailures >= 3) store.publish({ error: message })
         if (pollFailures >= 8) {
           stopPolling()
           stopEventStream()
@@ -840,7 +890,11 @@ window.__ModuleLoader__.load({
         sessionId,
       }
       stopPolling()
-      store.publish({ running: true, error: '', run: null, runId: '', feedbackRunId: '' })
+      /* Failure/stall counters are per-run: a previous run that died after 8
+         failed polls must not make the next run fail on its first blip. */
+      pollFailures = 0
+      streamStalls = 0
+      store.publish({ running: true, error: '', run: null, runId: '', feedbackRunId: '', feedbackNote: '' })
       try {
         const data = await fetchJson('/council/run', {
           method: 'POST',
@@ -872,25 +926,33 @@ window.__ModuleLoader__.load({
      */
     async function resumeRun(runId, mode) {
       if (mode !== 'silent' && mode !== 'wake') return
-      /* Only the leader tab delivers. Every tab watches the same stream, so
-         ungated delivery raced the same POST: the loser surfaced the host's
-         409 ("already delivered") as a red error next to the success note. */
-      if (isPollLeader() !== true) return
       const token = `${runId}:${mode}`
       if (store.state.feedbackRunId === token) return
+      /* Record the token in every tab (not just the leader) so a leader change
+         cannot replay the same delivery. */
       store.publish({ feedbackRunId: token })
+      if (isPollLeader() !== true) {
+        /* A follower tab must not POST; the leader does it and the host is
+           once-only. Say so instead of failing silently. */
+        store.publish({ feedbackNote: 'another-tab' })
+        return
+      }
       try {
         await fetchJson(`/council/run/${encodeURIComponent(runId)}/resume`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ mode }),
         })
+        store.publish({ feedbackNote: '' })
       } catch (error) {
-        const message = String(error && error.message ? error.message : error)
-        /* 409 = another tab (or an earlier attempt) already delivered this
-           run. The host is once-only, so this is success, not failure. */
-        if (message.includes('已回投') || /\b409\b/.test(message)) return
-        store.publish({ feedbackRunId: '', error: message })
+        /* Only the host's explicit "already delivered" is success. Any other
+           409 (not finished / session busy) is a real condition the user must
+           see — matching on the bare status code would swallow those. */
+        if (error !== null && typeof error === 'object' && error.code === 'already-resumed') {
+          store.publish({ feedbackNote: '' })
+          return
+        }
+        store.publish({ feedbackNote: '', feedbackRunId: '', error: messageOf(error) })
       }
     }
 
@@ -1381,6 +1443,9 @@ window.__ModuleLoader__.load({
                       ? h('span', { className: 'dsc-note' },
                           resumedMode === 'silent' ? t('panel.feedbackSilentSent') : t('panel.feedbackWakeSent'))
                       : null,
+                    run.status === 'done' && resumedMode === '' && state.feedbackNote === 'another-tab'
+                      ? h('span', { className: 'dsc-note' }, t('panel.feedbackOtherTab'))
+                      : null,
                   ),
                   h('div', { className: 'dsc-grid' },
                     run.answers.map((answer) => h('div', { className: 'dsc-card', key: answer.key },
@@ -1455,7 +1520,18 @@ window.__ModuleLoader__.load({
         const disposers = []
         let retired = false
         const track = (dispose) => {
-          if (typeof dispose === 'function') disposers.push(dispose)
+          if (typeof dispose !== 'function') return dispose
+          /* A disposer registered after teardown would never run: run it now
+             instead of leaking whatever it was meant to clean up. */
+          if (retired) {
+            try {
+              dispose()
+            } catch {
+              /* best effort */
+            }
+            return () => {}
+          }
+          disposers.push(dispose)
           return dispose
         }
         const teardown = () => {
