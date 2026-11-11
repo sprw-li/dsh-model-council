@@ -25,7 +25,7 @@ window.__ModuleLoader__.load({
       'panel.models': '参与模型（{count} 个已选，2–6 个）',
       'panel.run': '开始评审',
       'panel.running': '运行中…',
-      'panel.cancel': '取消',
+      'panel.cancel': '停止',
       'panel.copy': '复制结论',
       'panel.copied': '已复制',
       'panel.stage': '当前阶段：{stage}',
@@ -97,7 +97,7 @@ window.__ModuleLoader__.load({
       'panel.models': 'Participants ({count} selected, 2–6)',
       'panel.run': 'Run council',
       'panel.running': 'Running…',
-      'panel.cancel': 'Cancel',
+      'panel.cancel': 'Stop',
       'panel.copy': 'Copy conclusion',
       'panel.copied': 'Copied',
       'panel.stage': 'Stage: {stage}',
@@ -460,6 +460,43 @@ window.__ModuleLoader__.load({
 
     let pollTimer = 0
 
+    /** Reattach a run that kept running in the host after a refresh or window close. */
+    async function adoptRunningRun() {
+      if (store.state.runId !== '' && store.state.run !== null) return
+      const sessionId = store.state.sessionId !== ''
+        ? store.state.sessionId
+        : typeof draftBridge.sessionId === 'string' ? draftBridge.sessionId : ''
+      if (sessionId === '') return
+      try {
+        const data = await fetchJson(`/council/runs?sessionId=${encodeURIComponent(sessionId)}`)
+        const rows = data !== null && typeof data === 'object' && Array.isArray(data.runs) ? data.runs : []
+        const current = rows.find((row) => row !== null && typeof row === 'object' && row.status === 'running')
+        if (current === undefined || typeof current.id !== 'string') return
+        store.publish({ runId: current.id, run: current, running: true, error: '' })
+        schedulePoll(current.id)
+      } catch {
+        /* best effort: the tab still works without reattachment */
+      }
+    }
+
+    /** Cancel every run still running when the page goes away (window/tab close). */
+    function cancelOnPageHide() {
+      if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+        window.addEventListener('pagehide', () => {
+          const runId = store.state.runId
+          if (store.state.running !== true || typeof runId !== 'string' || runId === '') return
+          try {
+            if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+              navigator.sendBeacon(`/council/run/${encodeURIComponent(runId)}/cancel`)
+            }
+          } catch {
+            /* best effort */
+          }
+        })
+      }
+    }
+    cancelOnPageHide()
+
     function stopPolling() {
       if (pollTimer !== 0) {
         window.clearTimeout(pollTimer)
@@ -771,6 +808,7 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => {
         if (state.catalog.length === 0) void loadModels()
+        void adoptRunningRun()
       }, [])
 
       React.useEffect(() => {
@@ -917,7 +955,7 @@ window.__ModuleLoader__.load({
                 disabled: state.running,
                 onClick: () => void startRun(),
               }, state.running ? t('panel.running') : t('panel.run')),
-              state.running
+              state.running === true || (run !== null && run.status === 'running')
                 ? h('button', {
                     type: 'button',
                     className: 'dsc-secondary',

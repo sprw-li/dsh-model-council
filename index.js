@@ -773,7 +773,7 @@ export function apply(ctx, config) {
   }
 
   /** One read-only subagent seat, built on the same delegation runtime as the subagent tool. */
-  async function callSeatSubagent(parent, route, system, userText, maxTokens, signal, cwd, seat) {
+  async function callSeatSubagent(parent, route, system, userText, maxTokens, signal, cwd, seat, liveSeats) {
     const timeout = AbortSignal.timeout(CALL_TIMEOUT_MS)
     const combined = typeof AbortSignal.any === 'function' ? AbortSignal.any([signal, timeout]) : timeout
     if (seat !== undefined && seat !== null) {
@@ -799,6 +799,7 @@ export function apply(ctx, config) {
         seat.phase = 'running'
         seat.childId = typeof activation.childId === 'string' ? activation.childId : ''
       }
+      if (liveSeats !== undefined && liveSeats !== null) liveSeats.add(activation)
       const result = await withTimeout(
         activation.result,
         SEAT_RESULT_TIMEOUT_MS,
@@ -822,6 +823,7 @@ export function apply(ctx, config) {
     } finally {
       if (seat !== undefined && seat !== null && seat.phase !== 'done') seat.phase = 'closed'
       if (activation !== undefined) {
+        if (liveSeats !== undefined && liveSeats !== null) liveSeats.delete(activation)
         try {
           await activation.dispose()
         } catch {
@@ -845,8 +847,9 @@ export function apply(ctx, config) {
     const invokeAnswer = async (route, system, prompt, maxTokens, onDelta, seat) => {
       if (!useSubagentSeats) return callModel(route, system, prompt, maxTokens, signal, onDelta)
       try {
-        return await callSeatSubagent(run.parent, route, system, prompt, maxTokens, signal, run.cwd, seat)
-      } catch {
+        return await callSeatSubagent(run.parent, route, system, prompt, maxTokens, signal, run.cwd, seat, run.liveSeats)
+      } catch (error) {
+        if (signal.aborted) throw new Error('已取消')
         if (seat !== undefined && seat !== null) {
           seat.phase = 'fallback'
           seat.fallback = true
@@ -868,6 +871,7 @@ export function apply(ctx, config) {
         }
         answer.done = true
       })
+      if (signal.aborted) throw new Error('已取消')
       const usable = run.answers.filter((answer) => answer.error === '' && answer.text !== '')
       if (usable.length === 0) {
         run.status = 'error'
@@ -905,6 +909,7 @@ export function apply(ctx, config) {
         review.done = true
       })
 
+      if (signal.aborted) throw new Error('已取消')
       if (run.useChairman === false) {
         run.stage = 'done'
         run.status = 'done'
@@ -945,8 +950,10 @@ export function apply(ctx, config) {
       run.stage = 'done'
       run.status = 'done'
     } catch (error) {
-      run.status = 'error'
-      run.error = signal.aborted ? '已取消' : errorText(error)
+      if (run.status !== 'error') {
+        run.status = 'error'
+        run.error = signal.aborted ? '已取消' : errorText(error)
+      }
     }
   }
 
@@ -963,6 +970,17 @@ export function apply(ctx, config) {
           sendJson(res, 200, { providers: cat.providers, contextMaxChars, filesMaxChars })
           return
         }
+        if (req.method === 'GET' && path === '/runs') {
+          const sessionId = url.searchParams.get('sessionId') || ''
+          const list = []
+          for (const run of runs.values()) {
+            if (sessionId !== '' && run.sessionId !== sessionId) continue
+            list.push(snapshot(run))
+          }
+          list.sort((a, b) => b.createdAt - a.createdAt)
+          sendJson(res, 200, { runs: list.slice(0, 5) })
+          return
+        }
         if (req.method === 'GET' && path === '/diag') {
           const runsOut = []
           for (const run of runs.values()) runsOut.push(snapshot(run))
@@ -976,7 +994,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v10', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v12', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -985,7 +1003,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v10' })
+          sendJson(res, 200, { ok: true, build: 'v12' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
@@ -1140,6 +1158,7 @@ export function apply(ctx, config) {
               error: '',
               seat: { phase: 'idle' },
             },
+            liveSeats: new Set(),
           }
           const routes = {}
           for (const route of selected) routes[route.key] = route
@@ -1215,10 +1234,20 @@ export function apply(ctx, config) {
             sendJson(res, 404, { error: 'run not found' })
             return
           }
+          run.status = 'error'
+          run.error = '已取消'
           try {
             run.controller.abort()
           } catch {
             /* best effort */
+          }
+          const live = run.liveSeats === undefined ? [] : Array.from(run.liveSeats)
+          for (const activation of live) {
+            try {
+              await activation.dispose()
+            } catch {
+              /* best effort */
+            }
           }
           sendJson(res, 200, { ok: true })
           return
@@ -1241,6 +1270,12 @@ export function apply(ctx, config) {
         run.controller.abort()
       } catch {
         /* best effort */
+      }
+      if (run.watchdog !== undefined) clearTimeout(run.watchdog)
+      if (run.liveSeats !== undefined) {
+        for (const activation of run.liveSeats) {
+          void activation.dispose().catch(() => {})
+        }
       }
     }
     runs.clear()
