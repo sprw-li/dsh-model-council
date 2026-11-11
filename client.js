@@ -34,6 +34,10 @@ window.__ModuleLoader__.load({
       'panel.chairmanPick': '主席模型（由它汇总结论）',
       'panel.options': '选项',
       'panel.optContext': '接当前对话上下文',
+      'panel.optFiles': '自动附带问题里的本地路径',
+      'panel.filesHint': '问题中出现的本地路径（如 D:\\dev\\项目）会自动读取目录树和关键文件，最多 {chars} 字；没写路径但提到工作区/项目时用当前会话工作区；跳过 .git/node_modules/密钥文件。',
+      'panel.workspace': '当前会话工作区：{path}',
+      'panel.filesAttached': '已附带 {count} 个路径的文件内容（{chars} 字）',
       'panel.optFeedback': '结果回投主聊天',
       'panel.optChairman': '主席汇总（关闭=无主）',
       'panel.feedbackSent': '已回投主聊天',
@@ -94,6 +98,10 @@ window.__ModuleLoader__.load({
       'panel.chairmanPick': 'Chairman model (writes the synthesis)',
       'panel.options': 'Options',
       'panel.optContext': 'Attach current chat context',
+      'panel.optFiles': 'Attach local paths named in the question',
+      'panel.filesHint': 'Local paths in the question (e.g. D:\\dev\\project) attach their directory tree and key files, up to {chars} characters; a workspace/project question without a path uses the session workspace; .git/node_modules/secret files are skipped.',
+      'panel.workspace': 'Session workspace: {path}',
+      'panel.filesAttached': 'Attached {count} path(s), {chars} characters',
       'panel.optFeedback': 'Post the result back to the chat',
       'panel.optChairman': 'Chairman synthesis (off = no chair)',
       'panel.feedbackSent': 'Posted back to the chat',
@@ -235,6 +243,7 @@ window.__ModuleLoader__.load({
         selected: Array.isArray(persisted.selected) ? persisted.selected.filter((key) => typeof key === 'string').slice(0, MAX_MODELS) : [],
         chairmanKey: typeof persisted.chairmanKey === 'string' ? persisted.chairmanKey : '',
         useContext: persisted.useContext !== false,
+        attachFiles: persisted.attachFiles !== false,
         feedbackMode: persisted.feedbackMode === 'silent' || persisted.feedbackMode === 'wake'
           ? persisted.feedbackMode
           : persisted.useFeedback === true ? 'wake' : 'off',
@@ -242,6 +251,8 @@ window.__ModuleLoader__.load({
         sessionId: '',
         feedbackRunId: '',
         contextMaxChars: 6000,
+        filesMaxChars: 20000,
+        workspace: null,
         loading: false,
         loadError: '',
         question: '',
@@ -272,6 +283,7 @@ window.__ModuleLoader__.load({
           selected: store.state.selected,
           chairmanKey: store.state.chairmanKey,
           useContext: store.state.useContext,
+          attachFiles: store.state.attachFiles,
           feedbackMode: store.state.feedbackMode,
           useChairman: store.state.useChairman,
         }))
@@ -356,7 +368,11 @@ window.__ModuleLoader__.load({
             && Number.isSafeInteger(data.contextMaxChars) && data.contextMaxChars > 0
             ? data.contextMaxChars
             : 6000
-          store.publish({ catalog: rows, contextMaxChars, loading: false, loadError: '' })
+          const filesMaxChars = typeof data.filesMaxChars === 'number'
+            && Number.isSafeInteger(data.filesMaxChars) && data.filesMaxChars > 0
+            ? data.filesMaxChars
+            : 20000
+          store.publish({ catalog: rows, contextMaxChars, filesMaxChars, loading: false, loadError: '' })
           pruneSelection(rows)
         })
         .catch((error) => {
@@ -482,6 +498,7 @@ window.__ModuleLoader__.load({
         models,
         chairman,
         context: store.state.useContext === true,
+        attachFiles: store.state.attachFiles !== false,
         useChairman,
         sessionId,
       }
@@ -532,6 +549,26 @@ window.__ModuleLoader__.load({
       }
     }
 
+    let workspacePromise = null
+
+    /** Identify the session workspace once (session header cwd / workspace registry). */
+    function loadWorkspace() {
+      const sessionId = typeof draftBridge.sessionId === 'string' ? draftBridge.sessionId : store.state.sessionId
+      if (typeof sessionId !== 'string' || sessionId === '') return Promise.resolve()
+      if (workspacePromise !== null) return workspacePromise
+      workspacePromise = fetchJson(`/council/workspace?sessionId=${encodeURIComponent(sessionId)}`)
+        .then((data) => {
+          if (data !== null && typeof data === 'object') store.publish({ workspace: data })
+        })
+        .catch(() => {
+          /* the workspace hint is best effort */
+        })
+        .finally(() => {
+          workspacePromise = null
+        })
+      return workspacePromise
+    }
+
     /** Draft minus a bare /council token; composer residue like a lone "/" is not a question. */
     function draftQuestion() {
       let text = String(draftBridge.draft || '')
@@ -563,6 +600,7 @@ window.__ModuleLoader__.load({
       }
       const sessionId = request !== null && request !== undefined && typeof request.sessionId === 'string' ? request.sessionId : ''
       if (sessionId !== '') store.publish({ sessionId })
+      void loadWorkspace()
       const layout = service('layout')
       if (layout !== undefined) {
         try {
@@ -789,9 +827,18 @@ window.__ModuleLoader__.load({
               h('span', { className: 'dsc-field-label' }, t('panel.options')),
               h('div', { className: 'dsc-toggles' },
                 optionToggle('useContext', 'panel.optContext'),
+                optionToggle('attachFiles', 'panel.optFiles'),
                 optionToggle('useChairman', 'panel.optChairman'),
               ),
+              h('div', { className: 'dsc-hint' }, t('panel.workspace', {
+                path: state.workspace !== null && typeof state.workspace === 'object'
+                  ? (typeof state.workspace.name === 'string' && state.workspace.name !== ''
+                      ? state.workspace.name
+                      : String(state.workspace.cwd || '?'))
+                  : '…',
+              })),
               h('div', { className: 'dsc-hint' }, t('panel.privacy', { chars: state.contextMaxChars })),
+              h('div', { className: 'dsc-hint' }, t('panel.filesHint', { chars: state.filesMaxChars })),
             ),
             h('div', { className: 'dsc-field' },
               h('span', { className: 'dsc-field-label' }, t('panel.feedbackMode')),
@@ -869,6 +916,12 @@ window.__ModuleLoader__.load({
                       : null,
                     run.contextState === 'unavailable'
                       ? h('span', { className: 'dsc-warn' }, t('panel.contextUnavailable'))
+                      : null,
+                    run.filesState === 'ok' && run.filesChars > 0
+                      ? h('span', { className: 'dsc-note' }, t('panel.filesAttached', {
+                          count: Array.isArray(run.filesPaths) ? run.filesPaths.length : 0,
+                          chars: run.filesChars,
+                        }))
                       : null,
                     run.status === 'done' && resumedMode !== ''
                       ? h('span', { className: 'dsc-note' },
