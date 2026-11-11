@@ -119,6 +119,25 @@ try {
     assert.ok(pack.codeFiles >= 1, `expected code files for: ${question}`)
   }
 
+  /* Nested project selection: an alphabetical walk spent the entry budget on
+     unrelated sibling dirs, so a review of one project received another's
+     files. A question naming the project must surface ITS files. */
+  {
+    const nested = join(workspace, 'many')
+    await mkdir(join(nested, 'aaa-unrelated'), { recursive: true })
+    await mkdir(join(nested, 'zzz-target'), { recursive: true })
+    for (let index = 0; index < 30; index += 1) {
+      await writeFile(join(nested, 'aaa-unrelated', `f${index}.py`), `# unrelated ${index}\n`)
+    }
+    await writeFile(join(nested, 'zzz-target', 'wanted.py'), 'WANTED_MARKER = True\n')
+    const pack = await collectCodeContext([nested], 8000, ['zzz-target', 'wanted'])
+    assert.ok(pack.text.includes('WANTED_MARKER'), 'a named nested project must be walked first')
+  }
+
+  /* Bogus absolute tokens must not suppress the fallback. */
+  const bogus = await collectPathContext('核验 v0.2.19 里 /cancel 的行为，index.js 是否一致', 6000, workspace, 5000, true, [], workspace)
+  assert.equal(bogus.codeState, 'ok', 'bogus path tokens must not suppress the workspace fallback')
+
   /* A pure chat question MUST NOT drag the code base into the prompt. */
   const chatPack = await collectPathContext('今天天气怎么样', 6000, workspace, 5000)
   assert.equal(chatPack.codeState, 'off', 'plain chat must not attach source code')
