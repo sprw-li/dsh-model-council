@@ -15,6 +15,8 @@
 - 修复推理模型「断线」：作答 16384 tokens、单次调用超时 300s；流以 max-tokens 收尾且无正文时自动翻倍到 32768 重试一次。
 - 席位调度：subagent 只用于作答阶段，互评/主席走快速纯模型；席位启动 60s / 执行 240s 超时、失败自动降级纯模型；卡片显示「启动中/运行中 Ns」「完成（降级）」；整轮 30 分钟 watchdog；`GET /council/diag` 暴露运行与子代理诊断。
 - 停止与接回：运行中显示「停止」；`GET /council/runs?sessionId=` 让页面刷新/重开后自动接回在跑的 run；`pagehide` 时用 `sendBeacon` 取消当前 run（关闭窗口不再留下失控后台运行）。
+- 稳定性硬化：终态写一次（`finishRun`）；watchdog/cancel 统一 dispose 席位；每 provider 全局 4 并发 + 瞬态失败退避重试；每 run 降级配额 3；同会话单 run（409）+ 前端自动接回；运行注册表持久化到 `~/.dsh/council-runs.json`（Host 重启显示「运行中断」）。
+- 安全硬化：`@mention` 拒绝工作区穿越；路径附件拒绝符号链接与密钥类文件（`.env`/`.pem`/`.key`/`.ssh`/`.aws`/`.kube` 等）；`npm run verify` 增加 host harness（路径/穿越/密钥/超时/并发窗口）。
 - Skill 接入：只读席位可加载 skill（`skill-filesystem` + `tool-skill`）；`skillDirs` 配置/自动探测 `D:\agent-library\catalog`，实测席位成功加载 `office-xlsx` 并复述 `# Excel workbooks`；席位只读，不执行 skill 脚本。
 - 体验：卡片显示席位当前动作（思考中/调用工具/工具返回/生成回复）与「等待响应」；互评/主席卡片按阶段出现；subagent 模式下正文占位说明「完成后出正文」；席位超时 120s、并发 3、失败自动降级纯模型。
 - 三元回投对齐 subagent 的 turn 边界：`silent` 走 `agent.send(msg, 'next-turn', false)`（不唤醒，下一轮用户消息的 turn 才进入上下文），`wake` 走 `agent.followup()`（立即触发主 Agent 回复）；每个结果只回投一次，重复回投返回 409。

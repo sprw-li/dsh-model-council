@@ -27,7 +27,8 @@
     "dsh": ">=0.2.2-rc.1 <0.3.0"
   },
   "scripts": {
-    "verify": "node dev/verify-client.mjs",
+    "verify": "node dev/verify-client.mjs && node dev/verify-host.mjs",
+    "verify:host": "node dev/verify-host.mjs",
     "syntax": "node --check index.js && node --check client.js"
   },
   "exports": {
