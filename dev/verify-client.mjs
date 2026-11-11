@@ -43,6 +43,9 @@ function dispatchWindowEvent(type, event) {
 }
 
 const resumeCalls = []
+/* Fault injection for the resilience cases below. */
+let failNextResumeWith409 = false
+let failNextRunPolls = 0
 
 /* "Wake the chat agent" enabled before the bundle loads. */
 storage.set(LS_KEY, JSON.stringify({ feedbackMode: 'wake', useContext: true, useChairman: true }))
@@ -136,11 +139,21 @@ const fakeWindow = {
     const resumeMatch = /\/council\/run\/(run-\d+)\/resume$/.exec(String(url))
     if (resumeMatch !== null) {
       const payload = JSON.parse(options === undefined || options === null || options.body === undefined ? '{}' : options.body)
+      if (failNextResumeWith409) {
+        failNextResumeWith409 = false
+        return { ok: false, status: 409, json: async () => ({ error: '该结果已回投过' }) }
+      }
       resumeCalls.push({ runId: resumeMatch[1], mode: payload.mode })
       return { ok: true, json: async () => ({ ok: true, mode: payload.mode }) }
     }
+    const cancelMatch = /\/council\/run\/(run-\d+)\/cancel$/.exec(String(url))
+    if (cancelMatch !== null) return { ok: true, json: async () => ({ ok: true }) }
     const runMatch = /\/council\/run\/(run-\d+)$/.exec(String(url))
     if (runMatch !== null) {
+      if (failNextRunPolls > 0) {
+        failNextRunPolls -= 1
+        throw new Error('fetch failed')
+      }
       const index = Number(runMatch[1].slice('run-'.length)) - 1
       return { ok: true, json: async () => SCENARIOS[index] || SCENARIOS[0] }
     }
@@ -164,12 +177,31 @@ const fakeDocument = {
   removeEventListener() {},
 }
 
+/* Minimal effect scheduler: enough to prove side effects actually run.
+   The old no-op useEffect could not catch a bridge that only wrote state
+   during render, nor a component whose effects never fire. */
+const effectQueue = []
+const pendingCleanups = []
+let renderedComponentCount = 0
+
 const React = {
   createElement(type, props, ...children) {
     return { type, props: props === null || props === undefined ? {} : props, children: children.flat(Infinity) }
   },
   useState(initial) { return [typeof initial === 'function' ? initial() : initial, () => {}] },
-  useEffect() {},
+  useEffect(fn) { if (typeof fn === 'function') effectQueue.push(fn) },
+}
+
+/** Run queued effects the way React does after commit. */
+function flushEffects() {
+  let guard = 0
+  while (effectQueue.length > 0) {
+    if (guard++ > 200) throw new Error('effect flush did not settle')
+    const fn = effectQueue.shift()
+    const cleanup = fn()
+    if (typeof cleanup === 'function') pendingCleanups.push(cleanup)
+  }
+  return renderedComponentCount
 }
 
 const context = {
@@ -283,9 +315,19 @@ function render(node) {
   if (node === null || node === undefined || node === false || node === true) return ''
   if (typeof node === 'string' || typeof node === 'number') return String(node)
   if (Array.isArray(node)) return node.map(render).join('')
-  if (typeof node.type === 'function') return render(node.type(Object.assign({}, node.props, { children: node.children })))
+  if (typeof node.type === 'function') {
+    renderedComponentCount += 1
+    return render(node.type(Object.assign({}, node.props, { children: node.children })))
+  }
   const children = node.children !== undefined && node.children.length > 0 ? node.children : node.props.children
   return render(children)
+}
+
+/** Render a component tree and run its effects, as a real commit would. */
+function renderAndFlush(node) {
+  const html = render(node)
+  flushEffects()
+  return html
 }
 
 /** Materialize a React element tree with the fake React. */
@@ -342,7 +384,7 @@ const inputActions = {
   submit: () => {},
 }
 
-bridge({ t, sessionId: 'session-test', useInput: (selector) => selector({ draft: '/' }), inputActions })
+renderAndFlush(React.createElement(bridge, { t, sessionId: 'session-test', useInput: (selector) => selector({ draft: '/' }), inputActions }))
 
 if (typeof command.icon !== 'function') throw new Error('command has no slash-menu icon')
 
@@ -355,7 +397,7 @@ if (fetchCalls.some((call) => call.url === '/council/run' && call.method === 'PO
 }
 
 /* A real question is carried into the tab but still does NOT auto-start. */
-bridge({ t, sessionId: 'session-test', useInput: (selector) => selector({ draft: '/council 测试问题' }), inputActions })
+renderAndFlush(React.createElement(bridge, { t, sessionId: 'session-test', useInput: (selector) => selector({ draft: '/council 测试问题' }), inputActions }))
 command.ui.run({ sessionId: 'session-test' })
 await new Promise((resolve) => setTimeout(resolve, 500))
 if (fetchCalls.some((call) => call.url === '/council/run' && call.method === 'POST')) {
@@ -492,6 +534,37 @@ if (silentResume === undefined || silentResume.mode !== 'silent') {
 }
 const silentHtml = render(React.createElement(tabBody, { t }))
 if (!silentHtml.includes('已静默放进上下文')) throw new Error('silent delivery note is missing')
+
+/* --- Resilience: a 409 from /resume means "already delivered", not failure --- */
+{
+  const before = resumeCalls.length
+  failNextResumeWith409 = true
+  const button = findRunButton(build(tabBody({ t })))
+  if (button === undefined) throw new Error('run button missing for the 409 case')
+  button.props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 1800))
+  if (resumeCalls.length !== before) throw new Error('the 409 attempt should not be recorded as delivered')
+  const html409 = render(React.createElement(tabBody, { t }))
+  if (html409.includes('该结果已回投过')) {
+    throw new Error('a 409 (already delivered) must not surface as a red error')
+  }
+}
+
+/* --- Resilience: one failed poll must not discard a still-running run --- */
+{
+  failNextRunPolls = 1
+  const button = findRunButton(build(tabBody({ t })))
+  if (button === undefined) throw new Error('run button missing for the poll-blip case')
+  button.props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 1800))
+  const htmlBlip = render(React.createElement(tabBody, { t }))
+  if (htmlBlip.includes('fetch failed')) {
+    throw new Error('a single poll failure must not be shown as a run error')
+  }
+  if (!htmlBlip.includes('开始评审') && !htmlBlip.includes('停止')) {
+    throw new Error('the run button vanished after one failed poll')
+  }
+}
 
 for (const cleanup of cleanups.reverse()) {
   try {

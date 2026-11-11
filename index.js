@@ -88,7 +88,7 @@ const WORKSPACE_INTENT = /(工作区|项目|仓库|代码库|目录|本仓库|�
 /** A question that asks for a review, so the source pack is worth attaching. */
 const REVIEW_INTENT = /(评审|审查|审计|验收|复审|检查|review|audit|acceptance|全项目|代码质量|安全审查)/i
 /** Bounded source pack so llm-mode seats can cite real files instead of guessing. */
-const CODE_MAX_CHARS = 40000
+const CODE_MAX_CHARS = 60000
 const CODE_MAX_FILES = 24
 const CODE_FILE_CHARS = 10000
 const CODE_WALK_ENTRIES = 2000
@@ -514,17 +514,26 @@ async function readCodeSegments(path, budget, hints = []) {
      * close at the SAME indent as their `function` line — match that brace.
      * `function name(` declarations win over `const name =` variable forms. */
     const defLines = []
+    /* Only REAL function forms count as definitions. A bare `const runId = ...`
+       or `const React = require('react')` used to match, and the def window
+       then replaced a 340-line keyword cluster — deleting exactly the code the
+       question asked about (SSE watchRun / leader election in client.js). */
+    const isFunctionDecl = (line) => /(const|let|var)\s+\w+\s*=\s*(async\s+)?(function\b|\()/.test(line)
     for (const hint of lowerHints) {
       let found = -1
       for (let index = 0; index < totalLines; index += 1) {
-        if (new RegExp(`function\\s+${escapeRegExp(hint)}\\b`, 'i').test(lines[index] || '')) {
+        if (new RegExp(`function\\s+${escapeRegExp(hint)}\\s*\\(`, 'i').test(lines[index] || '')) {
           found = index
           break
         }
       }
       if (found === -1) {
         for (let index = 0; index < totalLines; index += 1) {
-          if (new RegExp(`const\\s+${escapeRegExp(hint)}\\s*=`, 'i').test(lines[index] || '')) {
+          const text = lines[index] || ''
+          /* Function expression or arrow assigned to the name — not any
+             assignment (a plain value is not a definition). */
+          const pattern = new RegExp(`(const|let|var)\\s+${escapeRegExp(hint)}\\s*=\\s*(async\\s+)?(function\\b|\\()`, 'i')
+          if (pattern.test(text) && isFunctionDecl(text)) {
             found = index
             break
           }
@@ -548,13 +557,13 @@ async function readCodeSegments(path, budget, hints = []) {
           break
         }
       }
-      /* A def window REPLACES any keyword-cluster region that only partially
-         covered the function: the whole body wins over a dense fragment.
-         (The old `continue`-on-overlap let a truncated cluster swallow
-         callModel's definition line, hiding its tail from reviewers.) */
-      const partial = regions.findIndex((region) => index >= region.from && index < region.to)
-      if (partial !== -1) regions.splice(partial, 1)
-      regions.push({ from: index, to, share: Number.MAX_SAFE_INTEGER })
+      /* Keep the whole-function window as its OWN labeled region and leave the
+         keyword cluster untouched. Merging them (union) or replacing them both
+         lost coverage: replacing deleted every other hit in the cluster, and
+         unioning made one huge region that pushed other clusters out of
+         budget. Overlap duplicates a few hundred chars — cheap and safe. */
+      const duplicate = regions.some((region) => region.from === index && region.to === to)
+      if (!duplicate) regions.push({ from: index, to, share: Number.MAX_SAFE_INTEGER })
     }
   } else {
     const mid = Math.floor(totalLines / 2)
@@ -1989,7 +1998,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v41', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v42', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -1998,7 +2007,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v41' })
+          sendJson(res, 200, { ok: true, build: 'v42' })
           return
         }
         if (req.method === 'POST' && path === '/run') {

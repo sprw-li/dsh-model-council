@@ -25,7 +25,7 @@ const MUST = {
   runDeadlineFormula: 'return run.createdAt + RUN_TIMEOUT_MS',
 }
 
-const code = await collectCodeContext([ROOT], 40000, HINTS)
+const code = await collectCodeContext([ROOT], 60000, HINTS)
 const block = code.text.slice(code.text.indexOf('index.js'))
 /* Every function the acceptance question names must appear as a labeled
    whole-function region — not merely "at least one label exists" (the
@@ -38,7 +38,9 @@ const wholeFor = {
   callModel: /关键区（第 \d+–\d+ 行，完整函数体） ---\n\s*async function callModel/,
   callSeatSubagent: /关键区（第 \d+–\d+ 行，完整函数体） ---\n\s*(\/\*\*[\s\S]{0,400}?)?\s*async function callSeatSubagent/,
   runDeadlineOf: /关键区（第 \d+–\d+ 行，完整函数体） ---\n\s*(\/\*\*[\s\S]{0,300}?)?\s*(export )?function runDeadlineOf/,
-  deadlineWall: /关键区（第 \d+–\d+ 行，完整函数体）[\s\S]{0,600}?Promise\.race\(\[execute\(run, routes\), deadlineWall\]\)/,
+  /* The wall is inline code inside the tool handler, not a function of its own:
+     require only that it sits inside a sampled region with its neighbours. */
+  deadlineWallBlock: /关键区（第 \d+–\d+ 行[^\n]*） ---[\s\S]{0,2000}?Promise\.race\(\[execute\(run, routes\), deadlineWall\]\)/,
 }
 let wholePass = 0
 for (const [name, pattern] of Object.entries(wholeFor)) {
@@ -86,7 +88,7 @@ console.log(`\n${pass}/${total} covered | chars=${code.chars}`)
    different cluster geometry once hid callModel's def behind the
    continue-on-overlap bug while the synthetic hints passed 11/11. */
 const realQuestionHints = ['deadline', 'v38', 'callmodel', 'callseatsubagent', 'rundeadlineof', 'deadlinewall', 'deadlineat', 'remaining']
-const realPack = await collectCodeContext([ROOT], 40000, realQuestionHints)
+const realPack = await collectCodeContext([ROOT], 60000, realQuestionHints)
 const realBlock = realPack.text.slice(realPack.text.indexOf('index.js'))
 const realChecks = {
   realCallModelWhole: /关键区（第 \d+–\d+ 行，完整函数体） ---\n\s*async function callModel/.test(realBlock),
@@ -101,4 +103,28 @@ for (const [name, ok] of Object.entries(realChecks)) {
   console.log(`${ok ? 'PASS' : 'MISS'}  ${name}`)
 }
 console.log(`real-question pack: ${realPass}/${Object.keys(realChecks).length} | chars=${realPack.chars}`)
-process.exit(pass === total && realPass === Object.keys(realChecks).length ? 0 : 1)
+
+/* Regression for the false-definition bug: hints that look like identifiers
+   (`runId`, `leader`, `EventSource`) must NOT let a plain `const runId = …`
+   be treated as a function definition and delete the surrounding cluster.
+   The client-half review lost exactly the SSE/election code this way. */
+const clientHints = ['clients', 'watchrun', 'broadcastchannel', 'eventsource', 'leader', 'runid', 'sse']
+const clientPack = await collectCodeContext([ROOT], 60000, clientHints)
+const clientBlock = clientPack.text.slice(clientPack.text.indexOf('client.js'))
+const clientChecks = {
+  clientSSE: clientBlock.includes('new window.EventSource('),
+  clientLeader: clientBlock.includes('BroadcastChannel(`dsh-council-'),
+  clientPolling: clientBlock.includes('schedulePoll('),
+  clientCoverage: clientBlock.length > 12000,
+}
+let clientPass = 0
+for (const [name, ok] of Object.entries(clientChecks)) {
+  if (ok) clientPass += 1
+  console.log(`${ok ? 'PASS' : 'MISS'}  ${name}`)
+}
+console.log(`client-question pack: ${clientPass}/${Object.keys(clientChecks).length} | chars=${clientBlock.length}`)
+
+const everythingGreen = pass === total
+  && realPass === Object.keys(realChecks).length
+  && clientPass === Object.keys(clientChecks).length
+process.exit(everythingGreen ? 0 : 1)

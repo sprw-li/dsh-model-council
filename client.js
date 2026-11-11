@@ -494,9 +494,16 @@ window.__ModuleLoader__.load({
 
     let pollTimer = 0
     let eventSource = null
+    let streamWatchdog = 0
+    /** No SSE frame for this long while running => the stream is half-open. */
+    const STREAM_STALL_MS = 8000
 
     /** Preferred live channel: SSE with automatic fallback to 320ms polling. */
     function stopEventStream() {
+      if (streamWatchdog !== 0) {
+        window.clearTimeout(streamWatchdog)
+        streamWatchdog = 0
+      }
       if (eventSource !== null) {
         try {
           eventSource.close()
@@ -505,6 +512,21 @@ window.__ModuleLoader__.load({
         }
         eventSource = null
       }
+    }
+
+    /**
+     * A stream that opens but never sends (dead proxy, half-open socket) fires
+     * neither onmessage nor onerror, so `running` stayed true forever. This
+     * watchdog re-arms on every frame and hands over to polling when it stalls.
+     */
+    function armStreamWatchdog(runId) {
+      if (streamWatchdog !== 0) window.clearTimeout(streamWatchdog)
+      streamWatchdog = window.setTimeout(() => {
+        streamWatchdog = 0
+        if (store.state.runId !== runId || store.state.running !== true) return
+        stopEventStream()
+        schedulePoll(runId)
+      }, STREAM_STALL_MS)
     }
 
     function watchRun(runId) {
@@ -520,8 +542,10 @@ window.__ModuleLoader__.load({
         schedulePoll(runId)
         return
       }
+      armStreamWatchdog(runId)
       eventSource.onmessage = (event) => {
         if (store.state.runId !== runId) return
+        armStreamWatchdog(runId)
         let data
         try {
           data = JSON.parse(event.data)
@@ -591,50 +615,83 @@ window.__ModuleLoader__.load({
     /*
      * Multi-tab election: only one tab per session polls and delivers, so two
      * open tabs cannot double-poll or double-deliver the conclusion. The leader
-     * publishes its role; a tab that stops seeing heartbeats takes over.
+     * republishes its claim well inside the lease; a follower takes over only
+     * after a full TTL of silence. Renewal and takeover therefore use
+     * different thresholds — using the same one made the leader time itself out
+     * roughly every third tick and stall its own polling.
      */
     const LEADER_TTL_MS = 2500
+    const LEADER_RENEW_MS = 800
+    const LEADER_TICK_MS = 400
     let leaderChannel = null
     let leaderTab = ''
-    let leaderSeenAt = 0
     let leaderTimer = 0
+    let myClaimAt = 0
+    let leaderSeenAt = 0
 
     function initLeaderElection(sessionId) {
       if (typeof window === 'undefined' || typeof window.BroadcastChannel !== 'function') return
+      closeLeaderChannel()
       try {
         leaderChannel = new window.BroadcastChannel(`dsh-council-${sessionId}`)
         leaderChannel.onmessage = (event) => {
           const data = event !== null && typeof event === 'object' ? event.data : null
           if (data === null || typeof data !== 'object') return
-          if (typeof data.leader === 'string' && data.leader !== leaderTab) {
-            leaderSeenAt = Date.now()
-          }
+          if (typeof data.leader !== 'string' || data.leader === leaderTab) return
+          leaderSeenAt = Date.now()
+          /* Deterministic tie-break so two simultaneous claims converge:
+             the lexicographically smaller tab id keeps the lease. */
+          if (data.leader < leaderTab) myClaimAt = 0
         }
       } catch {
         leaderChannel = null
         return
       }
       leaderTab = `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+      myClaimAt = 0
       leaderSeenAt = 0
       if (leaderTimer !== 0) window.clearInterval(leaderTimer)
       leaderTimer = window.setInterval(() => {
         if (leaderChannel === null) return
-        /* Another tab claimed leadership recently: stay a follower. */
-        if (Date.now() - leaderSeenAt < LEADER_TTL_MS) return
-        leaderSeenAt = Date.now()
+        const now = Date.now()
+        const claim = () => {
+          myClaimAt = now
+          try {
+            leaderChannel.postMessage({ leader: leaderTab, sessionId: store.state.sessionId })
+          } catch {
+            /* best effort */
+          }
+        }
+        if (myClaimAt > leaderSeenAt) {
+          /* I hold the lease: keep it fresh so followers never time me out. */
+          if (now - myClaimAt >= LEADER_RENEW_MS) claim()
+          return
+        }
+        /* I am a follower: take over only after the leader goes fully silent. */
+        if (now - leaderSeenAt >= LEADER_TTL_MS) claim()
+      }, LEADER_TICK_MS)
+    }
+
+    function closeLeaderChannel() {
+      if (leaderTimer !== 0) {
+        window.clearInterval(leaderTimer)
+        leaderTimer = 0
+      }
+      if (leaderChannel !== null) {
         try {
-          leaderChannel.postMessage({ leader: leaderTab, sessionId: store.state.sessionId })
+          leaderChannel.close()
         } catch {
           /* best effort */
         }
-      }, 1000)
+        leaderChannel = null
+      }
     }
 
     /** True when this tab owns polling for the current session. */
     function isPollLeader() {
       /* Without BroadcastChannel every tab degrades to independent polling. */
       if (leaderChannel === null) return true
-      return Date.now() - leaderSeenAt < LEADER_TTL_MS
+      return myClaimAt >= leaderSeenAt
     }
 
     function saveSessionState() {
@@ -659,6 +716,11 @@ window.__ModuleLoader__.load({
       if (typeof sessionId !== 'string' || sessionId === '') return
       const current = store.state.sessionId
       if (sessionId === current) return
+      /* Tear the old session's channels down first: leaving the previous
+         EventSource/poller alive leaked a live connection per switch, and the
+         previous BroadcastChannel kept mutating the shared leader clock. */
+      stopPolling()
+      stopEventStream()
       saveSessionState()
       store.publish({ sessionId })
       restoreSessionState(sessionId)
@@ -681,12 +743,28 @@ window.__ModuleLoader__.load({
       }, 320)
     }
 
+    /** Same loop, longer delay: used while the network is failing. */
+    function schedulePollRetry(runId, attempt) {
+      stopPolling()
+      const delay = Math.min(8000, 320 * Math.pow(2, Math.min(5, attempt)))
+      pollTimer = window.setTimeout(() => {
+        void pollRun(runId)
+      }, delay)
+    }
+
+    let pollFailures = 0
+
     async function pollRun(runId) {
       if (store.state.runId !== runId) return
-      if (isPollLeader() !== true) return
+      if (isPollLeader() !== true) {
+        /* Still follow the run even when another tab owns the delivery. */
+        schedulePollRetry(runId, 1)
+        return
+      }
       try {
         const data = await fetchJson(`/council/run/${encodeURIComponent(runId)}`)
         if (store.state.runId !== runId) return
+        pollFailures = 0
         const running = data.status === 'running'
         store.publish({ run: data, running })
         if (running) {
@@ -701,7 +779,28 @@ window.__ModuleLoader__.load({
         }
       } catch (error) {
         if (store.state.runId !== runId) return
-        store.publish({ running: false, run: null, error: String(error && error.message ? error.message : error) })
+        const message = String(error && error.message ? error.message : error)
+        /* A 404 means the host no longer knows this run: that really is
+           terminal, unlike a transport blip. */
+        if (/\b404\b/.test(message) || message.includes('run not found')) {
+          stopPolling()
+          stopEventStream()
+          store.publish({ running: false, run: null, runId: '', error: message })
+          return
+        }
+        /* A single failed poll must NOT discard a run that is still executing
+           on the host: keep runId/running, back off, and only give up after a
+           sustained streak. Dropping it let the user start a second run while
+           the first one's conclusion had nowhere to land. */
+        pollFailures += 1
+        store.publish({ error: pollFailures >= 3 ? message : '' })
+        if (pollFailures >= 8) {
+          stopPolling()
+          stopEventStream()
+          store.publish({ running: false, error: message })
+          return
+        }
+        schedulePollRetry(runId, pollFailures)
       }
     }
 
@@ -773,6 +872,10 @@ window.__ModuleLoader__.load({
      */
     async function resumeRun(runId, mode) {
       if (mode !== 'silent' && mode !== 'wake') return
+      /* Only the leader tab delivers. Every tab watches the same stream, so
+         ungated delivery raced the same POST: the loser surfaced the host's
+         409 ("already delivered") as a red error next to the success note. */
+      if (isPollLeader() !== true) return
       const token = `${runId}:${mode}`
       if (store.state.feedbackRunId === token) return
       store.publish({ feedbackRunId: token })
@@ -783,7 +886,11 @@ window.__ModuleLoader__.load({
           body: JSON.stringify({ mode }),
         })
       } catch (error) {
-        store.publish({ feedbackRunId: '', error: String(error && error.message ? error.message : error) })
+        const message = String(error && error.message ? error.message : error)
+        /* 409 = another tab (or an earlier attempt) already delivered this
+           run. The host is once-only, so this is success, not failure. */
+        if (message.includes('已回投') || /\b409\b/.test(message)) return
+        store.publish({ feedbackRunId: '', error: message })
       }
     }
 
@@ -971,18 +1078,48 @@ window.__ModuleLoader__.load({
       )
     }
 
-    /** Invisible composer bridge: keeps the latest draft and write verbs for /council. */
-    function CouncilBridge(props) {
-      const draft = typeof props.useInput === 'function'
-        ? props.useInput((state) => (state !== null && state !== undefined && typeof state.draft === 'string' ? state.draft : ''))
-        : ''
-      draftBridge.draft = draft
-      if (props.sessionId !== undefined) draftBridge.sessionId = props.sessionId
-      if (props.inputActions !== undefined) draftBridge.inputActions = props.inputActions
+    /** Draft selector shared by both bridge variants. */
+    function selectDraft(state) {
+      return state !== null && state !== undefined && typeof state.draft === 'string' ? state.draft : ''
+    }
+
+    /** Publishes bridge values from an effect — never during render. */
+    function CouncilBridgeWriter(props) {
+      const draft = typeof props.draft === 'string' ? props.draft : ''
+      React.useEffect(() => {
+        draftBridge.draft = draft
+      }, [draft])
+      React.useEffect(() => {
+        if (typeof props.sessionId === 'string') draftBridge.sessionId = props.sessionId
+      }, [props.sessionId])
+      React.useEffect(() => {
+        if (props.inputActions !== undefined) draftBridge.inputActions = props.inputActions
+      }, [props.inputActions])
       React.useEffect(() => {
         if (typeof props.sessionId === 'string' && props.sessionId !== '') switchSession(props.sessionId)
       }, [props.sessionId])
       return h('span', { hidden: true, 'aria-hidden': true, style: { display: 'none' } })
+    }
+
+    /**
+     * The host's input hook may or may not be provided, and a hook cannot be
+     * called conditionally. The decision therefore picks a component TYPE:
+     * React remounts when the type changes, so hook order stays stable.
+     */
+    function CouncilBridgeWithInput(props) {
+      const draft = props.useInput(selectDraft)
+      return h(CouncilBridgeWriter, { draft, sessionId: props.sessionId, inputActions: props.inputActions })
+    }
+
+    function CouncilBridgeStatic(props) {
+      return h(CouncilBridgeWriter, { draft: '', sessionId: props.sessionId, inputActions: props.inputActions })
+    }
+
+    /** Invisible composer bridge: keeps the latest draft and write verbs for /council. */
+    function CouncilBridge(props) {
+      return typeof props.useInput === 'function'
+        ? h(CouncilBridgeWithInput, { useInput: props.useInput, sessionId: props.sessionId, inputActions: props.inputActions })
+        : h(CouncilBridgeStatic, { sessionId: props.sessionId, inputActions: props.inputActions })
     }
 
     /** Sidebar tab body: question, participants, three-stage results. */
