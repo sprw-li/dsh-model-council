@@ -584,6 +584,35 @@ export function apply(ctx, config) {
     if (typeof persistTimer.unref === 'function') persistTimer.unref()
   }
 
+  /** SSE subscribers by run id; each receives snapshots after every revision. */
+  const streamSubscribers = new Map()
+
+  /** Bump a run's revision and push one snapshot to every SSE subscriber. */
+  function publishRun(run) {
+    run.seq = (typeof run.seq === 'number' ? run.seq : 0) + 1
+    const listeners = streamSubscribers.get(run.id)
+    if (listeners === undefined) return
+    const payload = `data: ${JSON.stringify(snapshot(run))}\n\n`
+    for (const [write] of [...listeners]) {
+      try {
+        write(payload)
+      } catch {
+        listeners.delete(write)
+      }
+    }
+  }
+
+  /** Emit a throttled stream tick while a run streams (seat text grows). */
+  let streamTickTimer
+  function scheduleRunStreamTick(run) {
+    if (streamTickTimer !== undefined) return
+    streamTickTimer = setTimeout(() => {
+      streamTickTimer = undefined
+      publishRun(run)
+    }, 250)
+    if (typeof streamTickTimer.unref === 'function') streamTickTimer.unref()
+  }
+
   function loadPersistedRuns() {
     let data
     try {
@@ -630,6 +659,20 @@ export function apply(ctx, config) {
       run.watchdog = undefined
     }
     persistRuns()
+    publishRun(run)
+    /* Terminal snapshot delivered; no further events for this run. */
+    const listeners = streamSubscribers.get(run.id)
+    if (listeners !== undefined) {
+      streamSubscribers.delete(run.id)
+      for (const [write, close] of [...listeners]) {
+        try {
+          write(`event: end\ndata: ${JSON.stringify({ id: run.id, status: run.status, seq: run.seq })}\n\n`)
+          close()
+        } catch {
+          /* best effort */
+        }
+      }
+    }
     return true
   }
   /** Cached catalog; agent/account changes refresh it after MODEL_CACHE_MS. */
@@ -950,6 +993,8 @@ export function apply(ctx, config) {
   function snapshot(run) {
     return {
       id: run.id,
+      /* Monotonic per-run revision: lets an SSE stream resume exactly where it left off. */
+      seq: typeof run.seq === 'number' ? run.seq : 0,
       status: run.status,
       stage: run.stage,
       question: run.question,
@@ -966,6 +1011,7 @@ export function apply(ctx, config) {
       workspace: run.workspace === undefined ? { cwd: '', source: 'none', workspaceId: '', name: '' } : run.workspace,
       structure: run.structure === undefined ? { roles: {}, stages: [] } : run.structure,
       seatMode: run.seatMode === undefined ? 'llm' : run.seatMode,
+      subagentSeats: run.subagentSeats === undefined ? 0 : run.subagentSeats,
       fallbacks: run.fallbacks === undefined ? 0 : run.fallbacks,
       fallbackLimit: MAX_FALLBACKS_PER_RUN,
       resumed: run.resumed === undefined ? '' : run.resumed,
@@ -1196,7 +1242,7 @@ export function apply(ctx, config) {
     const workspaceLine = run.workspace !== undefined && typeof run.workspace.cwd === 'string' && run.workspace.cwd !== ''
       ? run.workspace.cwd
       : ''
-    const attachmentNote = run.seatMode === 'subagent' && workspaceLine !== ''
+    const attachmentNote = run.seatMode === 'subagent' && run.subagentSeats > 0 && workspaceLine !== ''
       ? `【工作区】你有只读工具（read/glob/grep/skill）。工作区根目录：${workspaceLine}。请自己检索并打开相关文件后再下结论，不要依据附件摘要猜测；结论必须引用具体文件路径，没查到的内容标注【未核实】。`
       : run.codeState === 'ok'
         ? '【附件说明】附件包含工作区实际文件与源码片段（路径已标注）。评审结论必须引用具体文件路径；附件未覆盖的内容必须标注【推断】，不得编造文件内容。'
@@ -1208,14 +1254,26 @@ export function apply(ctx, config) {
        source pack would triple latency and token cost without adding evidence. */
     const reviewQuestionBlock = attachmentNote === '' ? run.question : `${run.question}\n\n${attachmentNote}`
     const useSubagentSeats = run.seatMode === 'subagent' && run.parent !== undefined && run.parent !== null
+    /* Hybrid roster: only the first `subagentSeats` answerers are subagents;
+       the rest take the fast streaming path so a large panel stays responsive. */
+    const subagentSeatLimit = Number.isSafeInteger(run.subagentSeats) && run.subagentSeats >= 0
+      ? Math.min(run.subagentSeats, run.answers.length)
+      : (useSubagentSeats ? run.answers.length : 0)
+    let subagentSeatCount = 0
     /**
-     * Stage-1 seat: read-only subagent when enabled, falling back to a raw model
+     * Stage-1 seat: read-only subagent when enabled, fallinging back to a raw model
      * call when the seat times out or fails. Reviews and the chairman always use
      * the fast raw path so a six-model run cannot spend a whole subagent turn
      * per reviewer.
      */
     const invokeAnswer = async (route, system, prompt, maxTokens, onDelta, seat) => {
-      if (!useSubagentSeats) return callModel(route, system, prompt, maxTokens, signal, onDelta, seat)
+      if (!useSubagentSeats || subagentSeatCount >= subagentSeatLimit) {
+        if (useSubagentSeats && subagentSeatCount >= subagentSeatLimit && seat !== undefined && seat !== null) {
+          seat.phase = 'fast'
+        }
+        return callModel(route, system, prompt, maxTokens, signal, onDelta, seat)
+      }
+      subagentSeatCount += 1
       try {
         return await callSeatSubagent(run.parent, route, system, prompt, maxTokens, signal, run.cwd, seat, run.liveSeats)
       } catch (error) {
@@ -1236,26 +1294,29 @@ export function apply(ctx, config) {
     try {
       /* Stage 1: independent answers. */
       run.stage = 'answers'
+      publishRun(run)
       await runLimited(run.answers, concurrency, async (answer) => {
         try {
           answer.text = await invokeAnswer(routes[answer.key], ANSWER_SYSTEM, questionBlock, ANSWER_MAX_TOKENS, (text) => {
             answer.text = text
+            scheduleRunStreamTick(run)
           }, answer.seat)
         } catch (error) {
           answer.error = errorText(error)
         }
         answer.done = true
+        publishRun(run)
       })
       if (signal.aborted) throw new Error('已取消')
       const usable = run.answers.filter((answer) => answer.error === '' && answer.text !== '')
       if (usable.length === 0) {
-        run.status = 'error'
-        run.error = '所有模型作答失败'
+        finishRun(run, 'error', '所有模型作答失败')
         return
       }
 
       /* Stage 2: anonymous peer review and ranking. */
       run.stage = 'reviews'
+      publishRun(run)
       const labeled = run.answers
         .map((answer, index) => {
           if (answer.error !== '' || answer.text === '') return `【回答 ${letter(index)}】\n（该模型作答失败）`
@@ -1277,11 +1338,13 @@ export function apply(ctx, config) {
         try {
           review.text = await callModel(routes[review.key], REVIEW_SYSTEM, reviewPrompt, REVIEW_MAX_TOKENS, signal, (text) => {
             review.text = text
+            scheduleRunStreamTick(run)
           }, review.seat)
         } catch (error) {
           review.error = errorText(error)
         }
         review.done = true
+        publishRun(run)
       })
 
       if (signal.aborted) throw new Error('已取消')
@@ -1293,6 +1356,7 @@ export function apply(ctx, config) {
 
       /* Stage 3: chairman synthesis. */
       run.stage = 'chairman'
+      publishRun(run)
       const answersBlock = run.answers
         .map((answer, index) => {
           if (answer.error !== '' || answer.text === '') return `【回答 ${letter(index)}｜${answer.name}】\n（失败）`
@@ -1367,7 +1431,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v20', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v22', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -1376,7 +1440,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v20' })
+          sendJson(res, 200, { ok: true, build: 'v22' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
@@ -1425,15 +1489,23 @@ export function apply(ctx, config) {
           const workspace = resolveWorkspace(sessionId)
           let seatMode = 'llm'
           let seatParent
+          /* Hybrid roster size: how many answerers run as read-only subagents. */
+          const requestedSeats = Number.isSafeInteger(body.subagentSeats) && body.subagentSeats >= 0
+            ? body.subagentSeats
+            : undefined
           if (body.seatMode === 'subagent') {
+            /* A hybrid roster with zero subagent seats is just the fast path. */
+            const wantsAnySeat = typeof requestedSeats !== 'number' || requestedSeats > 0
             let presetReady = false
-            try {
-              presetReady = await Promise.race([
-                readOnlyPresetReady,
-                new Promise((resolve) => setTimeout(() => resolve(false), 3000)),
-              ])
-            } catch {
-              presetReady = false
+            if (wantsAnySeat) {
+              try {
+                presetReady = await Promise.race([
+                  readOnlyPresetReady,
+                  new Promise((resolve) => setTimeout(() => resolve(false), 3000)),
+                ])
+              } catch {
+                presetReady = false
+              }
             }
             if (presetReady) {
               try {
@@ -1474,11 +1546,13 @@ export function apply(ctx, config) {
           let codeState = 'off'
           let codeFiles = 0
           let codeChars = 0
+          /* Hybrid roster: the fast seats have no tools, so any non-subagent
+             seat keeps the bounded source pack attached. */
+          const allowCode = seatMode !== 'subagent'
+            || (typeof requestedSeats === 'number' && requestedSeats < selected.length)
           if (body.attachFiles !== false) {
-            /* Seats with read-only tools grep the workspace themselves; only
-               tool-less llm seats need the bounded source pack. */
             const files = await collectPathContext(
-              question, filesMaxChars, workspace.cwd, codeMaxChars, seatMode !== 'subagent', attachRoots,
+              question, filesMaxChars, workspace.cwd, codeMaxChars, allowCode, attachRoots,
             )
             filesState = files.state
             filesPaths = files.paths
@@ -1507,6 +1581,9 @@ export function apply(ctx, config) {
             sessionId,
             useChairman,
             seatMode,
+            subagentSeats: seatMode === 'subagent' && seatParent !== undefined
+              ? (requestedSeats === undefined ? selected.length : Math.min(requestedSeats, selected.length))
+              : 0,
             cwd: workspace.cwd,
             ...(seatParent === undefined ? {} : { parent: seatParent }),
             contextState,
@@ -1585,6 +1662,40 @@ export function apply(ctx, config) {
             return
           }
           sendJson(res, 200, snapshot(run))
+          return
+        }
+
+        /* Server-sent events with resume: `Last-Event-ID` is the run's seq. */
+        const streamMatch = /^\/run\/([A-Za-z0-9]+)\/stream$/.exec(path)
+        if (req.method === 'GET' && streamMatch !== null) {
+          const run = runs.get(streamMatch[1])
+          if (run === undefined) {
+            sendJson(res, 404, { error: 'run not found' })
+            return
+          }
+          res.writeHead(200, {
+            'content-type': 'text/event-stream; charset=utf-8',
+            'cache-control': 'no-store',
+            connection: 'keep-alive',
+          })
+          const write = (chunk) => res.write(chunk)
+          let listeners = streamSubscribers.get(run.id)
+          if (listeners === undefined) {
+            listeners = new Map()
+            streamSubscribers.set(run.id, listeners)
+          }
+          listeners.set(write, () => res.end())
+          const drop = () => listeners.delete(write)
+          req.on('close', drop)
+          /* Catch-up first: the current snapshot, no matter the stored seq. */
+          write(`retry: 1000\n`)
+          write(`id: ${typeof run.seq === 'number' ? run.seq : 0}\n`)
+          write(`data: ${JSON.stringify(snapshot(run))}\n\n`)
+          if (run.status !== 'running') {
+            write(`event: end\ndata: ${JSON.stringify({ id: run.id, status: run.status, seq: run.seq })}\n\n`)
+            drop()
+            res.end()
+          }
           return
         }
 
@@ -1673,8 +1784,11 @@ export function apply(ctx, config) {
           void activation.dispose().catch(() => {})
         }
       }
+      const listeners = streamSubscribers.get(run.id)
+      if (listeners !== undefined) streamSubscribers.delete(run.id)
     }
     runs.clear()
+    streamSubscribers.clear()
   }, 'council: runs')
 }
 

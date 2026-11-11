@@ -11,6 +11,14 @@
 - **文本文件覆盖面**：补 `.rb/.php/.cs/.kt/.kts/.swift/.scala/.lua/.sql/.vue/.svelte/.proto/.gradle`，以及无扩展名的 `Makefile/Dockerfile/LICENSE` 等。
 - **文档纠错**：删除 README 中自相矛盾的「运行记录只在内存、重启即丢」；隐私提示写明**文件内容同样会发送给所选模型提供商**；`index.js` 头部 route 注释补齐。
 
+## P1/P2（本轮新增）
+
+- **SSE 事件流**：`GET /council/run/<id>/stream`，快照带递增 `seq`、终态 `event: end`；client 优先用 EventSource，断流自动回退 320ms 轮询。实测 16 事件、`seq=13` 结束。
+- **多标签选主**：`BroadcastChannel` 每会话一个 leader，只有 leader 轮询/回投/关页取消；失联 2.5s 接管。
+- **混合席位**：`subagentSeats`（1–5，默认 2）个只读 subagent + 其余快速流式；快照 `subagentSeats` 与 UI 滑杆；有快速席位时源码包照常附带。
+- **每席指标**：`seat.ttftMs/elapsedMs` + 卡片「首字 Xs · 总 Ys」。
+- **文档/常量一致性门禁**：`verify-host` 断言 README 引用的超时/并发/降级配额数字与代码常量相等（首跑即抓到 README 写 3、常量是 6 的漂移）。
+
 ## 稳定性
 
 - 终态写一次（`finishRun()`）：取消/超时/完成竞态下，迟到结果不覆盖终态；watchdog 与 cancel 都会 dispose 活跃席位。
