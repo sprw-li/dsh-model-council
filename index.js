@@ -415,6 +415,63 @@ async function collectSourceFiles(root, hints = []) {
   return found
 }
 
+/**
+ * Read one file for the code pack with hint-ANCHORED sampling: find lines
+ * matching the question's key terms and take windows around the densest
+ * cluster, plus the head. Head+middle+tail slicing could not cover a
+ * 2000-line file in 4k chars — the implementation region never showed, so
+ * acceptance reviews kept failing on "constants only". Anchoring puts the
+ * code the question asks about into the budget.
+ */
+async function readCodeSegments(path, budget, hints = []) {
+  let whole
+  try {
+    whole = await readFile(path, 'utf8')
+  } catch {
+    return ''
+  }
+  if (whole === '') return ''
+  const lines = whole.split('\n')
+  if (whole.length <= budget) {
+    return { text: whole, truncated: false, totalLines: lines.length }
+  }
+  /* Locate hint hits; cluster windows around the densest run of hits. */
+  const lowerHints = hints.filter((hint) => typeof hint === 'string' && hint.length >= 4)
+  const hits = []
+  if (lowerHints.length > 0) {
+    for (let index = 0; index < lines.length; index += 1) {
+      const lower = lines[index].toLowerCase()
+      if (lowerHints.some((hint) => lower.includes(hint))) hits.push(index)
+    }
+  }
+  let anchorStart = Math.floor(lines.length / 2)
+  let bestCount = -1
+  if (hits.length > 0) {
+    const windowLines = Math.max(20, Math.floor((budget * 0.7) / 60))
+    for (const start of [0, ...hits]) {
+      const from = Math.max(0, start - Math.floor(windowLines / 4))
+      const count = hits.filter((line) => line >= from && line < from + windowLines).length
+      if (count > bestCount) {
+        bestCount = count
+        anchorStart = from
+      }
+    }
+  }
+  const anchorEnd = Math.min(lines.length, anchorStart + Math.max(20, Math.floor((budget * 0.7) / 60))
+    + Math.max(1, bestCount > 0 ? 0 : 0))
+  const anchor = lines.slice(anchorStart, anchorEnd).join('\n')
+  const headLines = Math.max(5, Math.floor((budget * 0.2) / 80))
+  const head = lines.slice(0, headLines).join('\n')
+  const text = [
+    `（文件共 ${lines.length} 行 / ${whole.length} 字，采样：头部 ${headLines} 行 + 关键区（第 ${anchorStart + 1}–${anchorEnd} 行${hits.length > 0 ? `，按问题关键词命中 ${hits.length} 处定位` : '，中段'}），其余省略）`,
+    '--- 头部 ---',
+    head,
+    '--- 关键区（问题相关） ---',
+    anchor,
+  ].join('\n')
+  return { text: text.length > budget ? text.slice(0, budget) : text, truncated: true, totalLines: lines.length }
+}
+
 /** Bounded source-code pack for review questions: real files the models can cite. */
 async function collectCodeContext(roots, maxChars, hints = []) {
   const files = []
@@ -429,20 +486,23 @@ async function collectCodeContext(roots, maxChars, hints = []) {
     }
   }
   const parts = [
-    `【工作区源码附件】发现 ${discovered} 个源码文件，选取 ${files.length} 个（单文件 ≤${CODE_FILE_CHARS} 字，总预算 ${maxChars} 字）。`,
+    `【工作区源码附件】发现 ${discovered} 个源码文件，选取 ${files.length} 个（单文件 ≤${CODE_FILE_CHARS} 字，总预算 ${maxChars} 字；大文件按问题关键词锚定采样，头部+关键区）。`,
     `覆盖率声明：以下为抽样初审而非全项目审查；未附文件约 ${Math.max(0, discovered - files.length)} 个，结论未覆盖处须标【推断】。`,
   ]
   let used = 0
   let included = 0
   let truncated = 0
+  /* Every selected file gets a reserved slice, so an early big file cannot
+     starve the rest into empty "--- path ---" stubs. */
+  const reserve = Math.max(600, Math.floor(maxChars / Math.max(1, files.length)))
   for (const file of files) {
-    const budget = Math.min(CODE_FILE_CHARS, maxChars - used)
+    const budget = Math.min(Math.max(CODE_FILE_CHARS, reserve), Math.max(0, maxChars - used))
     if (budget < 200) break
-    const content = await readTextFile(file.path, budget)
-    if (content === '') continue
-    if (content.includes('…（已截断）')) truncated += 1
-    parts.push(`--- ${file.path} ---`, content)
-    used += content.length
+    const segmented = await readCodeSegments(file.path, budget, hints)
+    if (segmented === '' || segmented === undefined) continue
+    if (segmented.truncated === true) truncated += 1
+    parts.push(`--- ${file.path} ---`, segmented.text)
+    used += segmented.text.length
     included += 1
   }
   return {
@@ -1794,7 +1854,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v32', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v33', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -1803,7 +1863,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v32' })
+          sendJson(res, 200, { ok: true, build: 'v33' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
