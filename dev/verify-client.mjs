@@ -475,7 +475,7 @@ const failHtml = render(React.createElement(tabBody, { t }))
 if (!failHtml.includes('所有模型作答失败')) throw new Error('all-fail error state is missing')
 if (resumeCalls.length !== 2) throw new Error('a failed run must not be delivered to the chat')
 
-/* Silent delivery: inject the conclusion without waking the main Agent. */
+/* Silent delivery: place the conclusion in context without waking the main Agent. */
 const silentRadio = findRadioByLabel(build(tabBody({ t })), '静默放进上下文')
 if (silentRadio === undefined) throw new Error('silent feedback option is missing')
 silentRadio.props.onChange()

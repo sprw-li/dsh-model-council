@@ -1,3 +1,33 @@
+# 0.2.0
+
+可靠性、安全与「真读工作区」硬化。接口仍可能变化（`v1.0.0` 之前为 pre-release）。
+
+## 修复（v0.1.0 之后的审查结论）
+
+- **静默回投改成 `agent.inject()`**：结论作为上下文在下一次请求前注入，不再占用 inbox 队列、不唤醒主 Agent；「唤醒」仍是 `agent.followup()`。
+- **席位超时对齐**：`SEAT_RESULT_TIMEOUT_MS` 120s → **240s**（此前比纯模型通道 300s 还短，慢通道反被更少预算）；降级配额 3 → 6（每席位最多一次）。
+- **重试分类加词边界**：`TRANSIENT_FAILURE` 原 `5\d\d` 会把「5000 tokens」误判为 5xx 重试，改为 `\b5\d\d\b`。
+- **路径附件允许清单**：新增 `config.attachRoots`；非空时附件只能落在工作区或这些根目录内（默认空 = 保持本机单用户行为，问题里显式写出的路径可读）。
+- **文本文件覆盖面**：补 `.rb/.php/.cs/.kt/.kts/.swift/.scala/.lua/.sql/.vue/.svelte/.proto/.gradle`，以及无扩展名的 `Makefile/Dockerfile/LICENSE` 等。
+- **文档纠错**：删除 README 中自相矛盾的「运行记录只在内存、重启即丢」；隐私提示写明**文件内容同样会发送给所选模型提供商**；`index.js` 头部 route 注释补齐。
+
+## 稳定性
+
+- 终态写一次（`finishRun()`）：取消/超时/完成竞态下，迟到结果不覆盖终态；watchdog 与 cancel 都会 dispose 活跃席位。
+- 每 provider 全局 4 并发（多聊天/多标签页不放大）；瞬态失败退避重试最多 3 次；`max-tokens` 无正文自动翻倍重试。
+- 同 `sessionId` 已有运行中评审时返回 409 + 现有 runId，前端自动接回。
+- 运行注册表落盘 `${DSH_HOME:-~/.dsh}/council-runs.json`（20 条、500ms 防抖）：Host 重启后可查历史，中断的运行标注「Host 重启，运行中断」。
+- 按会话隔离前端状态：不同聊天各开各的 run，切回来自动接回。
+
+## 评审源码包
+
+- 评审类问题自动附加真实源码（≤24 文件、单文件 4k、总预算 `codeMaxChars` 默认 40k，路径标注），提示词强制引用文件路径、未覆盖处标【推断】；快照 `codeState/codeFiles/codeChars`。
+- **有工具的席位不塞源码**：`seatMode='subagent'` 时只给目录树 + 工作区根目录，要求席位自己 `read/grep/glob` 核验。
+
+## 测试
+
+- `npm run verify` = `dev/verify-client.mjs`（入口/开关/回投三元/部分失败/全失败/防重入/桥接/工作区提示）+ `dev/verify-host.mjs`（路径 typo 修复/`@mention` 穿越拒绝/密钥跳过/超时语义/并发窗口/重试词边界/允许清单/源码包与席位豁免）。
+
 # 0.1.0-alpha
 
 首个公开 alpha。接口与行为仍可能变化（`v1.0.0` 之前为 pre-release）。
