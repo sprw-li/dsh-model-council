@@ -1,3 +1,13 @@
+# 0.2.1
+
+外部审查报告（2026-11-11）整改：
+
+- **P0 补验收**：报告指出「最后一次修改没有完成验收」（seq 5206 中断）。本版完成全量验收：`npm run syntax` / `dev/verify-host.mjs` / `dev/verify-client.mjs` 三条 exit code 0。
+- **P1 文档漂移修复**：README 三处——静默回投改为描述 `agent.inject()`（删掉 `send(next-turn)` 旧语义）；npm 段明确「已发布 0.1.0 / 本仓库 0.2.x 未发布」（不再混称）；subagent 席位默认关与代码一致。
+- **P1 文档测试升级为行为契约断言**：verify-host 现在断言 README 必须含 `agent.inject()`、禁止出现 `send(msg,'next-turn',false)`、反馈默认=不做、席位默认=关、npm 版本二分表述——不再只查数字。
+- **P2 附件覆盖率报告**：源码包头部自带「发现 N / 选取 M / 未附约 K / 抽样初审非全项目审查」声明；快照新增 `codeDiscovered/codeTruncated`。
+- **P2 安全边界文档化**：`attachRoots` 为空时的本机行为（显式路径可读）在 README 中明示；部署到共享环境时应配置白名单。
+
 # 0.2.0
 
 可靠性、安全与「真读工作区」硬化。接口仍可能变化（`v1.0.0` 之前为 pre-release）。
