@@ -877,8 +877,7 @@ export function apply(ctx, config) {
   loadPersistedRuns()
 
   /** Write-once terminal state: late stage/seat results must not overwrite a stop. */
-  function finishRun(run, status, error, stopReason) {
-    if (run.finished === true) return false
+  function finishRun(run, status, error, stopReason) {    if (run.finished === true) return false
     run.finished = true
     run.status = status
     run.error = typeof error === 'string' ? error : ''
@@ -905,6 +904,26 @@ export function apply(ctx, config) {
       }
     }
     return true
+  }
+
+  /**
+   * Terminal settlement for an out-of-band stop (watchdog or tool deadline):
+   * writes the terminal state AND releases resources. Both paths must use
+   * this — the deadline wall used to only call finishRun and then clear the
+   * watchdog in `finally`, so in-flight provider calls and live subagent
+   * seats were never aborted (the wall resolves a few ms before the
+   * watchdog, which made the leak the normal outcome, not an edge case).
+   */
+  function terminateRun(run, message) {
+    finishRun(run, 'error', message, 'watchdog')
+    try {
+      run.controller.abort()
+    } catch {
+      /* best effort */
+    }
+    for (const activation of run.liveSeats) {
+      void activation.dispose().catch(() => {})
+    }
   }
   /** Cached catalog; agent/account changes refresh it after MODEL_CACHE_MS. */
   let catalogCache = { at: 0, value: undefined }
@@ -1888,15 +1907,7 @@ export function apply(ctx, config) {
       }
       run.watchdog = setTimeout(() => {
         if (run.status !== 'running') return
-        finishRun(run, 'error', '运行超时（30 分钟），已中止', 'watchdog')
-        try {
-          run.controller.abort()
-        } catch {
-          /* best effort */
-        }
-        for (const activation of run.liveSeats) {
-          void activation.dispose().catch(() => {})
-        }
+        terminateRun(run, '运行超时（30 分钟），已中止')
       }, RUN_TIMEOUT_MS)
       if (typeof run.watchdog.unref === 'function') run.watchdog.unref()
       const signal = exec !== null && typeof exec === 'object' ? exec.signal : undefined
@@ -1925,7 +1936,10 @@ export function apply(ctx, config) {
       })
       try {
         await Promise.race([execute(run, routes), deadlineWall])
-        if (run.status === 'running') finishRun(run, 'error', '整轮预算耗尽', 'watchdog')
+        /* Wall won (or execute settled without a terminal state): settle AND
+           release — aborting in-flight calls and disposing seats is mandatory,
+           because `finally` below clears the watchdog that would have done it. */
+        if (run.status === 'running') terminateRun(run, '整轮预算耗尽')
       } finally {
         if (run.watchdog !== undefined) clearTimeout(run.watchdog)
         if (run.deadlineTimer !== undefined) clearTimeout(run.deadlineTimer)
@@ -1975,7 +1989,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v40', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v41', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -1984,7 +1998,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v40' })
+          sendJson(res, 200, { ok: true, build: 'v41' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
@@ -2186,15 +2200,7 @@ export function apply(ctx, config) {
           for (const route of selected) routes[route.key] = route
           run.watchdog = setTimeout(() => {
             if (run.status !== 'running') return
-            finishRun(run, 'error', '运行超时（30 分钟），已中止', 'watchdog')
-            try {
-              run.controller.abort()
-            } catch {
-              /* best effort */
-            }
-            for (const activation of run.liveSeats) {
-              void activation.dispose().catch(() => {})
-            }
+            terminateRun(run, '运行超时（30 分钟），已中止')
           }, RUN_TIMEOUT_MS)
           if (typeof run.watchdog.unref === 'function') run.watchdog.unref()
           runs.set(run.id, run)

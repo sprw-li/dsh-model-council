@@ -1,3 +1,16 @@
+# 0.2.11
+
+**修复终审标【推断】的一条真实资源泄漏**（自我循环第 10 圈自检发现）：
+
+- **deadline 墙胜出时不释放资源**：`Promise.race` 的墙分支原先只调 `finishRun` 写终态，随后 `finally`
+  清掉 `run.watchdog`——于是 watchdog 里的 `controller.abort()` 与 `liveSeats` dispose **永远不会执行**。
+  因为 `deadlineTimer` 按 `runDeadlineOf(run) - Date.now()` 计算、比 watchdog 早触发几毫秒，**这是常态路径而非边角**：
+  在途 provider 调用会继续跑到自身超时（最长 300s），子代理会话也会泄漏。
+- 新增 `terminateRun(run, message)`：写终态 + `controller.abort()` + dispose 全部 liveSeats；
+  tool 与 HTTP 两处 watchdog、以及 deadline 墙分支统一走它。
+- `dev/verify-host.mjs` 增加源码契约断言：`terminateRun` 必须包含三件事，两处 watchdog 必须调它，
+  墙分支不得回退到裸 `finishRun(...)`。
+
 # 0.2.10
 
 **自我循环收敛：理事会终审通过。**
