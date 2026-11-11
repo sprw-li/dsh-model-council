@@ -630,6 +630,17 @@ if (!silentHtml.includes('已静默放进上下文')) throw new Error('silent de
   if (!/isPollLeader\(\) === true/.test(constructorBlock)) {
     throw new Error('the EventSource constructor catch must be leader-gated')
   }
+  /* pagehide must NOT cancel: it also fires on refresh, which would kill a
+     running council and make the documented reattach path impossible. */
+  const pagehideAt = source.indexOf("addEventListener('pagehide'")
+  if (pagehideAt === -1) throw new Error('pagehide handler not found')
+  const pagehideBlock = source.slice(pagehideAt, pagehideAt + 500)
+  if (/sendBeacon/.test(pagehideBlock) || /\/cancel/.test(pagehideBlock)) {
+    throw new Error('pagehide must not cancel the run (it also fires on refresh)')
+  }
+  if (!/stopEventStream\(\)/.test(pagehideBlock)) {
+    throw new Error('pagehide should release the tab channels')
+  }
 }
 
 for (const cleanup of cleanups.reverse()) {

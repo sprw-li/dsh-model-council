@@ -1,3 +1,12 @@
+# 0.2.18
+
+签发复审判出的 **P0**（一直存在，此前未被指认）：`pagehide` 取消运行与「刷新后接回」契约冲突。
+
+- **刷新会杀掉正在跑的评审**：`pagehide` 在刷新/跳转/bfcache 时同样触发，client 却对 `/cancel` 发 `sendBeacon`，于是「刷新后从 `GET /council/runs` 接回」永远接不到（run 已被取消）。改为 `releaseOnPageHide`：关页只释放本页的轮询/SSE/channel，**不取消 run**；run 交由宿主 30 分钟 watchdog 兜底，显式「停止」仍会取消。README 167/168 两处契约同步更新。
+- **`claim()` 接管判定不可靠**（P2）：`setTimeout` 回调没把 `pollTimer` 归零，过期的非 0 句柄让接管检查误以为轮询还在 → 补挂被跳过。两处调度器现在在回调入口归零。
+- **问题文本串会话**（P2）：`openCouncilTab` 先 publish question 再 `switchSession`，`saveSessionState` 把新问题写进旧会话缓存。现在切完会话再 publish。
+- `dev/verify-client.mjs` 新增 `pagehide` 断言：处理函数不得出现 `sendBeacon` 或 `/cancel`，且必须释放本页通道。
+
 # 0.2.16
 
 验证者独立复核本轮又找出 3 个真实 P1（council 未覆盖），连同上一轮 P1 一并修复：

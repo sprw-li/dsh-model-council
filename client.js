@@ -634,25 +634,23 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** Cancel every run still running when the page goes away (window/tab close). */
-    function cancelOnPageHide() {
+    /**
+     * The page is going away: release this tab's channels but DO NOT cancel the
+     * run. `pagehide` also fires on refresh and navigation, so cancelling here
+     * killed a running council whenever the user reloaded — which contradicts
+     * the documented reattach path (`GET /council/runs`). A closed tab now
+     * leaves the run to the host watchdog; an explicit 停止 still cancels.
+     */
+    function releaseOnPageHide() {
       if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
         window.addEventListener('pagehide', () => {
-          const runId = store.state.runId
-          if (store.state.running !== true || typeof runId !== 'string' || runId === '') return
-          /* A follower tab must not cancel the leader's run on hide. */
-          if (isPollLeader() !== true) return
-          try {
-            if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
-              navigator.sendBeacon(`/council/run/${encodeURIComponent(runId)}/cancel`)
-            }
-          } catch {
-            /* best effort */
-          }
+          stopPolling()
+          stopEventStream()
+          closeLeaderChannel()
         })
       }
     }
-    cancelOnPageHide()
+    releaseOnPageHide()
 
     /** Per-session council state so different chats do not share one run. */
     const sessionCache = new Map()
@@ -798,6 +796,9 @@ window.__ModuleLoader__.load({
     function schedulePoll(runId) {
       stopPolling()
       pollTimer = window.setTimeout(() => {
+        /* Clear the handle when it fires: a stale non-zero id made the
+           takeover check in claim() believe a poll was still armed. */
+        pollTimer = 0
         void pollRun(runId)
       }, 320)
     }
@@ -807,6 +808,7 @@ window.__ModuleLoader__.load({
       stopPolling()
       const delay = Math.min(8000, 320 * Math.pow(2, Math.min(5, attempt)))
       pollTimer = window.setTimeout(() => {
+        pollTimer = 0
         void pollRun(runId)
       }, delay)
     }
@@ -1016,9 +1018,9 @@ window.__ModuleLoader__.load({
      */
     async function openCouncilTab(request) {
       const asked = request !== null && request !== undefined && typeof request.question === 'string' ? request.question.trim() : ''
-      /* Always take the freshly derived question: a stale one from the previous
-         run must not reappear when /council is invoked with no draft text. */
-      store.publish({ question: asked })
+      /* Publish the question AFTER the session switch below: publishing first
+         made switchSession's saveSessionState write the new question into the
+         OLD session's cache, so switching back showed the other chat's text. */
       const rawDraft = String(draftBridge.draft || '')
       const leftoversOnly = rawDraft.replace(/\/council\b/gi, '').replace(/[\s/]+/g, '') === ''
       if (leftoversOnly && rawDraft !== '' && draftBridge.inputActions !== undefined
@@ -1037,6 +1039,9 @@ window.__ModuleLoader__.load({
         if (sessionId === store.state.sessionId) store.publish({ sessionId })
         else switchSession(sessionId)
       }
+      /* Now that the session is settled, the fresh question cannot leak into
+         the previous session's cache. */
+      store.publish({ question: asked })
       void loadWorkspace()
       const layout = service('layout')
       if (layout !== undefined) {
