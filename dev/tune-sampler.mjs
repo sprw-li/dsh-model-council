@@ -10,7 +10,7 @@
 import { collectCodeContext } from '../index.js'
 
 const ROOT = 'D:\\Documents\\deepseek-harness\\default-workspace\\dsh-council'
-const HINTS = ['deadline', 'deadlineat', 'callmodel', 'attempttimeout', 'callseatsubagent', 'council_review', 'deadlinewall']
+const HINTS = ['deadline', 'callmodel', 'attempttimeout', 'callseatsubagent', 'deadlinewall', 'rundeadlineof']
 
 const MUST = {
   backoffClamp: '800 * (attempt + 1), remaining',
@@ -22,6 +22,7 @@ const MUST = {
   deadlineWall: 'Promise.race([execute(run, routes), deadlineWall])',
   zeroBudget: 'if (left <= 0)',
   fullClamp: 'Math.min(CALL_TIMEOUT_MS, left)',
+  runDeadlineFormula: 'return run.createdAt + RUN_TIMEOUT_MS',
 }
 
 const code = await collectCodeContext([ROOT], 40000, HINTS)
@@ -32,5 +33,11 @@ for (const [name, literal] of Object.entries(MUST)) {
   if (ok) pass += 1
   console.log(`${ok ? 'PASS' : 'MISS'}  ${name}`)
 }
-console.log(`\n${pass}/${Object.keys(MUST).length} covered | chars=${code.chars}`)
-process.exit(pass === Object.keys(MUST).length ? 0 : 1)
+/* The pack must also LABEL the whole-function regions, so a reviewer knows
+   which regions are complete bodies rather than sampled fragments. */
+const labeled = (block.match(/完整函数体/g) || []).length
+console.log(`${labeled > 0 ? 'PASS' : 'MISS'}  wholeFunctionLabels(${labeled})`)
+if (labeled > 0) pass += 1
+const total = Object.keys(MUST).length + 1
+console.log(`\n${pass}/${total} covered | chars=${code.chars}`)
+process.exit(pass === total ? 0 : 1)
