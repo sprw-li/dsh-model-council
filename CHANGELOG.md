@@ -1,3 +1,12 @@
+# 0.2.3
+
+理事会验收（self-loop 第 2 圈）整改——本轮「不通过」判定点出的真实盲点全部修复：
+
+- **席位预算纳入整轮 deadline**：`callSeatSubagent` 的启动/执行/组合超时全部 `Math.min(自身预算, remaining)`，到期即拒启（此前席位可越过整轮 deadline）。
+- **工具超时加缓冲**：`council_review` 的 `timeoutMs` = run deadline + 30s——run 自己的 watchdog 先结算并给出精确 `stopReason`，工具超时只作兜底，消除归因竞态。
+- **deadline 可审计**：快照新增 `deadlineAt` / `remainingMs`。
+- **回归补齐**：`clampAttempt`/`clampSeat` 边界断言（过期=0 不为负、席位窗口随剩余预算裁剪、无 deadline 保持全量）。
+
 # 0.2.2
 
 理事会自评审（self-loop）整改——本轮缺陷全部由「cwd 在插件目录的 subagent 调 `council_review`」的评审发现：
