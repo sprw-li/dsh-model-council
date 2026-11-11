@@ -102,9 +102,9 @@ function wantsSourcePack(question) {
   return REVIEW_INTENT.test(text) || CODE_MENTION.test(text)
 }
 /** Bounded source pack so llm-mode seats can cite real files instead of guessing. */
-const CODE_MAX_CHARS = 60000
+const CODE_MAX_CHARS = 120000
 const CODE_MAX_FILES = 24
-const CODE_FILE_CHARS = 10000
+const CODE_FILE_CHARS = 12000
 const CODE_WALK_ENTRIES = 2000
 const CODE_EXTENSIONS = new Set([
   '.py', '.pyi', '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs',
@@ -723,7 +723,7 @@ async function collectCodeContext(roots, maxChars, hints = []) {
   const reserve = Math.max(600, Math.floor(maxChars / Math.max(1, files.length)))
   for (const file of files) {
     const primary = file === files[0]
-    const baseBudget = primary ? Math.floor(maxChars * 0.55) : CODE_FILE_CHARS
+    const baseBudget = primary ? Math.floor(maxChars * 0.8) : CODE_FILE_CHARS
     const budget = Math.min(Math.max(baseBudget, reserve), Math.max(0, maxChars - used))
     if (budget < 200) break
     const segmented = await readCodeSegments(file.path, budget, hints)
@@ -2129,7 +2129,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v54', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v55', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -2138,7 +2138,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v54' })
+          sendJson(res, 200, { ok: true, build: 'v55' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
