@@ -16,9 +16,9 @@
  *   POST /council/run/<id>/cancel   abort every in-flight call
  */
 
-import { existsSync } from 'node:fs'
-import { readdir, readFile, stat } from 'node:fs/promises'
-import { extname, isAbsolute, join } from 'node:path'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { lstat, readdir, readFile, stat } from 'node:fs/promises'
+import { extname, isAbsolute, join, relative, sep } from 'node:path'
 
 export const inject = ['webServer', 'llm', 'agents', 'subagents']
 
@@ -43,6 +43,12 @@ const SEAT_RESULT_TIMEOUT_MS = 120000
 const RUN_TIMEOUT_MS = 30 * 60 * 1000
 /** Concurrent subagent seats; the delegation runtime has a shared capacity pool (default 8). */
 const SEAT_CONCURRENCY = 3
+/** Global per-provider concurrency, enforced in the Host so tabs/chats cannot multiply it. */
+const PROVIDER_CONCURRENCY = 4
+/** One run may degrade at most this many seats; prevents a provider outage fallback storm. */
+const MAX_FALLBACKS_PER_RUN = 3
+/** Transport/provider failures worth one retry with backoff. */
+const TRANSIENT_FAILURE = /(429|5\d\d|ECONN|ETIMEDOUT|EAI_AGAIN|timeout|rate.?limit|overload|temporarily unavailable|fetch failed)/i
 const RUN_TTL_MS = 30 * 60 * 1000
 const MAX_RUNS = 16
 const MODEL_CACHE_MS = 60000
@@ -63,7 +69,7 @@ const TEXT_EXTENSIONS = new Set([
   '.csv', '.jsonl', '.sh', '.ps1', '.html', '.css', '.js', '.ts', '.jsx',
   '.tsx', '.mjs', '.cjs', '.c', '.h', '.cpp', '.rs', '.go', '.java',
 ])
-const SECRET_NAME = /(^|[\\/])(\.env[^\\/]*|id_rsa[^\\/]*|id_ed25519[^\\/]*|credentials[^\\/]*|\.npmrc|\.pypirc|\.netrc)$/i
+const SECRET_NAME = /(^|[\\/])(\.env[^\\/]*|id_(rsa|ed25519|ecdsa)[^\\/]*|credentials[^\\/]*|\.npmrc|\.pypirc|\.netrc|\.git-credentials|[^\\/]*\.(pem|key|pfx|p12|kdbx)|secrets?[^\\/]*|passwords?[^\\/]*|\.ssh|\.aws|\.kube)$/i
 /** A question that means the session workspace even without an explicit path. */
 const WORKSPACE_INTENT = /(工作区|项目|仓库|代码库|目录|本仓库|本项目|workspace|repository|repo\b|project|codebase)/i
 /** `@relative/path` mentions inside the question. */
@@ -176,6 +182,12 @@ async function runLimited(items, limit, worker) {
   await Promise.all(runners)
 }
 
+/** True when `child` stays inside `parent` (no traversal out of the workspace). */
+function isPathInside(child, parent) {
+  const rel = relative(parent, child)
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel) && !rel.split(sep).includes('..')
+}
+
 /** Local paths mentioned by the question: absolute tokens, `@mentions`, or workspace-relative. */
 function candidatePaths(text, workspaceCwd) {
   const candidates = []
@@ -202,7 +214,10 @@ function candidatePaths(text, workspaceCwd) {
     if (candidates.length >= MAX_ATTACH_PATHS) break
     const value = mention[1]
     if (isAbsolute(value)) push(value)
-    else if (typeof workspaceCwd === 'string' && workspaceCwd !== '') push(join(workspaceCwd, value))
+    else if (typeof workspaceCwd === 'string' && workspaceCwd !== '') {
+      const resolved = join(workspaceCwd, value)
+      if (isPathInside(resolved, workspaceCwd)) push(resolved)
+    }
   }
   return candidates
 }
@@ -216,10 +231,12 @@ async function statSafe(path) {
   }
 }
 
-/** Read one text file with the attachment budget; binary/missing files are skipped. */
+/** Read one text file with the attachment budget; binary/missing/symlinked files are skipped. */
 async function readTextFile(path, maxChars) {
   if (SECRET_NAME.test(path)) return ''
   try {
+    const link = await lstat(path)
+    if (link.isSymbolicLink()) return ''
     const info = await stat(path)
     if (!info.isFile() || info.size > 1024 * 1024) return ''
     if (!TEXT_EXTENSIONS.has(extname(path).toLowerCase())) return ''
@@ -376,6 +393,84 @@ export function apply(ctx, config) {
     seat.activity = activity
     seat.activityAt = Date.now()
   }), 'council: seat activity')
+
+  /** Run registry file: survives a Host restart, bounded and best effort. */
+  const persistFile = join(process.env.DSH_HOME || join(process.env.USERPROFILE || '', '.dsh'), 'council-runs.json')
+  let persistTimer
+  function persistRuns() {
+    if (persistTimer !== undefined) return
+    persistTimer = setTimeout(() => {
+      persistTimer = undefined
+      const rows = []
+      for (const run of runs.values()) {
+        rows.push({
+          id: run.id,
+          sessionId: run.sessionId,
+          status: run.status,
+          stage: run.stage,
+          question: String(run.question || '').slice(0, 120),
+          createdAt: run.createdAt,
+          seatMode: run.seatMode,
+          error: run.error,
+        })
+      }
+      try {
+        writeFileSync(persistFile, JSON.stringify({ version: 1, runs: rows.slice(-20) }), 'utf8')
+      } catch {
+        /* persistence is best effort */
+      }
+    }, 500)
+    if (typeof persistTimer.unref === 'function') persistTimer.unref()
+  }
+
+  function loadPersistedRuns() {
+    let data
+    try {
+      data = JSON.parse(readFileSync(persistFile, 'utf8'))
+    } catch {
+      return
+    }
+    for (const row of Array.isArray(data === null ? undefined : data.runs) ? data.runs : []) {
+      if (row === null || typeof row !== 'object' || typeof row.id !== 'string') continue
+      if (Date.now() - Number(row.createdAt) > RUN_TTL_MS) continue
+      runs.set(row.id, {
+        id: row.id,
+        sessionId: typeof row.sessionId === 'string' ? row.sessionId : '',
+        status: row.status === 'running' ? 'error' : String(row.status || 'error'),
+        stage: String(row.stage || 'done'),
+        question: String(row.question || ''),
+        createdAt: Number(row.createdAt) || Date.now(),
+        seatMode: row.seatMode === 'subagent' ? 'subagent' : 'llm',
+        error: row.status === 'running' ? 'Host 重启，运行中断' : String(row.error || ''),
+        historic: true,
+        contextBlock: '',
+        contextState: 'off',
+        filesState: 'off',
+        filesPaths: [],
+        filesChars: 0,
+        useChairman: true,
+        answers: [],
+        reviews: [],
+        chairman: { key: '', provider: '', model: '', name: '', text: '', done: false, error: '' },
+        structure: { roles: {}, stages: [] },
+      })
+    }
+  }
+  loadPersistedRuns()
+
+  /** Write-once terminal state: late stage/seat results must not overwrite a stop. */
+  function finishRun(run, status, error) {
+    if (run.finished === true) return false
+    run.finished = true
+    run.status = status
+    run.error = typeof error === 'string' ? error : ''
+    if (run.watchdog !== undefined) {
+      clearTimeout(run.watchdog)
+      run.watchdog = undefined
+    }
+    persistRuns()
+    return true
+  }
   /** Cached catalog; agent/account changes refresh it after MODEL_CACHE_MS. */
   let catalogCache = { at: 0, value: undefined }
 
@@ -567,49 +662,84 @@ export function apply(ctx, config) {
     return undefined
   }
 
-  /** Stream one model call, reporting cumulative text. */
+  /** Global per-provider slot so tabs/chats cannot multiply provider concurrency. */
+  const providerActive = new Map()
+  async function withProviderSlot(provider, signal, run) {
+    while ((providerActive.get(provider) || 0) >= PROVIDER_CONCURRENCY) {
+      if (signal !== undefined && signal.aborted) throw new Error('已取消')
+      await new Promise((resolve) => setTimeout(resolve, 40))
+    }
+    providerActive.set(provider, (providerActive.get(provider) || 0) + 1)
+    try {
+      return await run()
+    } finally {
+      providerActive.set(provider, Math.max(0, (providerActive.get(provider) || 1) - 1))
+    }
+  }
+
+  /** Stream one model call; retries transient provider failures with backoff. */
   async function callModel(route, system, userText, maxTokens, signal, onDelta) {
     let budget = maxTokens
     let lastError
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (signal.aborted) throw new Error('已取消')
       const timeout = AbortSignal.timeout(CALL_TIMEOUT_MS)
       const combined = typeof AbortSignal.any === 'function' ? AbortSignal.any([signal, timeout]) : timeout
       let text = ''
       let finish
-      const stream = ctx.llm.stream({
-        provider: route.provider,
-        model: route.model,
-        system,
-        messages: [{ role: 'user', content: [{ type: 'text', text: userText }] }],
-        maxTokens: budget,
-        signal: combined,
-      })
-      for await (const chunk of stream) {
-        if (chunk === null || typeof chunk !== 'object') continue
-        if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
-          text += chunk.text
-          if (typeof onDelta === 'function') onDelta(text)
-        } else if (chunk.type === 'block-end' && text === '' && chunk.block !== null && typeof chunk.block === 'object') {
-          if (chunk.block.type === 'text' && typeof chunk.block.text === 'string') {
-            text = chunk.block.text
-            if (typeof onDelta === 'function') onDelta(text)
+      let thrown
+      try {
+        await withProviderSlot(route.provider, signal, async () => {
+          const stream = ctx.llm.stream({
+            provider: route.provider,
+            model: route.model,
+            system,
+            messages: [{ role: 'user', content: [{ type: 'text', text: userText }] }],
+            maxTokens: budget,
+            signal: combined,
+          })
+          for await (const chunk of stream) {
+            if (chunk === null || typeof chunk !== 'object') continue
+            if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
+              text += chunk.text
+              if (typeof onDelta === 'function') onDelta(text)
+            } else if (chunk.type === 'block-end' && text === '' && chunk.block !== null && typeof chunk.block === 'object') {
+              if (chunk.block.type === 'text' && typeof chunk.block.text === 'string') {
+                text = chunk.block.text
+                if (typeof onDelta === 'function') onDelta(text)
+              }
+            } else if (chunk.type === 'finish') {
+              finish = chunk.reason
+            }
           }
-        } else if (chunk.type === 'finish') {
-          finish = chunk.reason
+        })
+      } catch (error) {
+        thrown = error
+      }
+      if (thrown !== undefined) {
+        lastError = thrown instanceof Error ? thrown : new Error(String(thrown))
+        if (signal.aborted) throw new Error('已取消')
+        if (attempt < 2 && TRANSIENT_FAILURE.test(lastError.message)) {
+          await new Promise((resolve) => setTimeout(resolve, 800 * (attempt + 1)))
+          continue
         }
+        throw lastError
       }
       /* Adapter and transport failures settle as a terminal finish chunk rather
          than a throw; surfacing them keeps one failed seat from looking empty. */
       if (finish !== null && typeof finish === 'object') {
-        if (finish.kind === 'aborted') {
-          lastError = new Error('调用被中止或超时')
-          break
-        }
+        if (finish.kind === 'aborted') throw new Error('调用被中止或超时')
         if (finish.kind === 'error') {
           const failure = finish.failure
-          const detail = failure !== null && typeof failure === 'object' ? `${failure.message} (${failure.code})` : '未知错误'
+          const detail = failure !== null && typeof failure === 'object'
+            ? `${String(failure.message)} (${String(failure.code)})`
+            : '未知错误'
           lastError = new Error(detail)
-          break
+          if (attempt < 2 && TRANSIENT_FAILURE.test(detail)) {
+            await new Promise((resolve) => setTimeout(resolve, 800 * (attempt + 1)))
+            continue
+          }
+          throw lastError
         }
       }
       const trimmed = text.trim()
@@ -637,6 +767,7 @@ export function apply(ctx, config) {
       childId: typeof seat.childId === 'string' ? seat.childId : '',
       elapsedMs: startedAt === 0 ? 0 : Math.max(0, finishedAt - startedAt),
       fallback: seat.fallback === true,
+      fallbackFrom: typeof seat.fallbackFrom === 'string' ? seat.fallbackFrom : '',
       activity: typeof seat.activity === 'string' ? seat.activity : '',
       activityMs: typeof seat.activityAt === 'number' ? Math.max(0, Date.now() - seat.activityAt) : 0,
     }
@@ -659,6 +790,8 @@ export function apply(ctx, config) {
       workspace: run.workspace === undefined ? { cwd: '', source: 'none', workspaceId: '', name: '' } : run.workspace,
       structure: run.structure === undefined ? { roles: {}, stages: [] } : run.structure,
       seatMode: run.seatMode === undefined ? 'llm' : run.seatMode,
+      fallbacks: run.fallbacks === undefined ? 0 : run.fallbacks,
+      fallbackLimit: MAX_FALLBACKS_PER_RUN,
       resumed: run.resumed === undefined ? '' : run.resumed,
       useChairman: run.useChairman !== false,
       answers: run.answers.map((answer) => ({
@@ -843,6 +976,8 @@ export function apply(ctx, config) {
         if (seat.childId !== '') liveSeatByChild.set(seat.childId, seat)
       }
       if (liveSeats !== undefined && liveSeats !== null) liveSeats.add(activation)
+      /* The race below may abandon this promise; keep a late settlement handled. */
+      void activation.result.catch(() => {})
       const result = await withTimeout(
         activation.result,
         SEAT_RESULT_TIMEOUT_MS,
@@ -894,9 +1029,14 @@ export function apply(ctx, config) {
         return await callSeatSubagent(run.parent, route, system, prompt, maxTokens, signal, run.cwd, seat, run.liveSeats)
       } catch (error) {
         if (signal.aborted) throw new Error('已取消')
+        if (run.fallbacks >= MAX_FALLBACKS_PER_RUN) {
+          throw new Error(`${errorText(error)}（降级配额已用尽：本 run 最多降级 ${MAX_FALLBACKS_PER_RUN} 席）`)
+        }
+        run.fallbacks += 1
         if (seat !== undefined && seat !== null) {
           seat.phase = 'fallback'
           seat.fallback = true
+          seat.fallbackFrom = 'subagent'
         }
         return callModel(route, system, prompt, maxTokens, signal, onDelta)
       }
@@ -956,7 +1096,7 @@ export function apply(ctx, config) {
       if (signal.aborted) throw new Error('已取消')
       if (run.useChairman === false) {
         run.stage = 'done'
-        run.status = 'done'
+        finishRun(run, 'done', '')
         return
       }
 
@@ -992,12 +1132,9 @@ export function apply(ctx, config) {
       )
       run.chairman.done = true
       run.stage = 'done'
-      run.status = 'done'
+      finishRun(run, 'done', '')
     } catch (error) {
-      if (run.status !== 'error') {
-        run.status = 'error'
-        run.error = signal.aborted ? '已取消' : errorText(error)
-      }
+      finishRun(run, 'error', signal.aborted ? '已取消' : errorText(error))
     }
   }
 
@@ -1038,7 +1175,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v14', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v15', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -1047,7 +1184,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v14' })
+          sendJson(res, 200, { ok: true, build: 'v15' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
@@ -1084,6 +1221,14 @@ export function apply(ctx, config) {
           }
           prune()
           const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
+          if (sessionId !== '') {
+            for (const existing of runs.values()) {
+              if (existing.historic !== true && existing.sessionId === sessionId && existing.status === 'running') {
+                sendJson(res, 409, { error: '该会话已有运行中的评审', runId: existing.id })
+                return
+              }
+            }
+          }
           const useChairman = body.useChairman !== false
           const workspace = resolveWorkspace(sessionId)
           let seatMode = 'llm'
@@ -1203,22 +1348,25 @@ export function apply(ctx, config) {
               seat: { phase: 'idle' },
             },
             liveSeats: new Set(),
+            fallbacks: 0,
           }
           const routes = {}
           for (const route of selected) routes[route.key] = route
           run.watchdog = setTimeout(() => {
-            if (run.status === 'running') {
-              run.status = 'error'
-              run.error = '运行超时（30 分钟），已中止'
-              try {
-                run.controller.abort()
-              } catch {
-                /* best effort */
-              }
+            if (run.status !== 'running') return
+            finishRun(run, 'error', '运行超时（30 分钟），已中止')
+            try {
+              run.controller.abort()
+            } catch {
+              /* best effort */
+            }
+            for (const activation of run.liveSeats) {
+              void activation.dispose().catch(() => {})
             }
           }, RUN_TIMEOUT_MS)
           if (typeof run.watchdog.unref === 'function') run.watchdog.unref()
           runs.set(run.id, run)
+          persistRuns()
           void execute(run, routes)
           sendJson(res, 200, { runId: run.id })
           return
@@ -1278,8 +1426,7 @@ export function apply(ctx, config) {
             sendJson(res, 404, { error: 'run not found' })
             return
           }
-          run.status = 'error'
-          run.error = '已取消'
+          finishRun(run, 'error', '已取消')
           try {
             run.controller.abort()
           } catch {
@@ -1325,3 +1472,6 @@ export function apply(ctx, config) {
     runs.clear()
   }, 'council: runs')
 }
+
+/* Pure helpers exported for the host harness (`dev/verify-host.mjs`). */
+export { candidatePaths, isPathInside, readTextFile, runLimited, withTimeout }

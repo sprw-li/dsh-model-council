@@ -123,6 +123,16 @@ council 不再只靠正则猜路径，而是按 Harness 自己的结构解析：
 - **断线修复**：此前在 6 模型评审中因 max-tokens/超时失败的 `bohrium/hy4`（Hunyuan 4）与 `bohrium/kimi-k3`（Kimi K3），现在纯模型模式各返回 239 / 238 字有效答案。
 - **客户端 harness**：`node dev/verify-client.mjs` 覆盖入口/开关/回投三元/部分失败/全失败/防重入/选中文字桥接/工作区提示。
 
+## 可靠性、安全与并发（v0.2 硬化）
+
+- **终态只写一次**：`finishRun()` 是唯一终态入口；取消/超时/正常完成竞态下，迟到的阶段结果不会覆盖「已取消/已超时」；watchdog 与 cancel 都会 dispose 活跃席位。
+- **并发上收到 Host**：每 provider 全局 4 并发槽（多聊天/多标签页不会放大）；429/5xx/超时/ECONN 等瞬态失败退避重试（最多 3 次）；`max-tokens` 无正文自动翻倍重试。
+- **降级配额**：每个 run 最多降级 3 席（超时/失败 → 纯模型），超过直接报错，避免 provider 故障时降级风暴；`seat.fallback/fallbackFrom` 与 `run.fallbacks/fallbackLimit` 可在快照里审计。
+- **单会话单 run**：同一 `sessionId` 已有运行中的评审时，`POST /council/run` 返回 409 + 现有 runId，前端改为接回而不是再开一份。
+- **运行注册表持久化**：写入 `${DSH_HOME:-~/.dsh}/council-runs.json`（最多 20 条，500ms 防抖）；Host 重启后仍能查到历史运行，重启前仍在跑的被标注为「Host 重启，运行中断」。
+- **附件安全**：`@mention` 只解析到工作区内（拒绝 `..` 穿越）；路径附件拒绝符号链接、密钥类文件（`.env`/`.pem`/`.key`/`.ssh`/`.aws`/`.kube`/`id_rsa` 等）、二进制与 >1MB 文件；skill 只读加载、脚本不执行。
+- **自动化回归**：`npm run verify` 现在同时跑 host 与 client harness（路径修复/穿越拒绝/密钥跳过/超时语义/并发窗口）。
+
 ## 已知限制
 
 - `ctx.agents.get(sessionId).session.snapshotEvents()` 是 DSH 内部接口，已用 try/catch 降级为“只发问题”，UI 会标注「上下文读取失败」；升级 DSH 后请重新验证。
