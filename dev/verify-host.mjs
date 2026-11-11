@@ -9,7 +9,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { readFileSync } from 'node:fs'
-import { TRANSIENT_FAILURE, SEAT_RESULT_TIMEOUT_MS, SEAT_START_TIMEOUT_MS, PROVIDER_CONCURRENCY, MAX_FALLBACKS_PER_RUN, RUN_TIMEOUT_MS, candidatePaths, collectCodeContext, collectPathContext, isPathInside, readTextFile, runLimited, withTimeout } from '../index.js'
+import { TRANSIENT_FAILURE, SEAT_RESULT_TIMEOUT_MS, SEAT_START_TIMEOUT_MS, PROVIDER_CONCURRENCY, MAX_FALLBACKS_PER_RUN, RUN_TIMEOUT_MS, defaultRoutesFromCatalog, candidatePaths, collectCodeContext, collectPathContext, isPathInside, readTextFile, runLimited, withTimeout } from '../index.js'
 
 const root = await mkdtemp(join(tmpdir(), 'council-host-'))
 try {
@@ -87,6 +87,29 @@ try {
   assert.equal(Number(watchdog[1]), Math.round(RUN_TIMEOUT_MS / 60000), 'README watchdog drifted from RUN_TIMEOUT_MS')
   assert.ok(readme.includes(`${PROVIDER_CONCURRENCY} 并发`), 'README must state the provider concurrency')
   assert.ok(readme.includes(`降级配额 ${MAX_FALLBACKS_PER_RUN}`), 'README must state the fallback quota')
+
+  /* The tool's auto-pick must be heterogeneous: one provider, one model name each. */
+  const catalog = {
+    providers: [
+      { id: 'deepseek', name: 'DeepSeek', models: [
+        { id: 'flash', name: 'DeepSeek-V4.1-Flash', contextWindow: 64000, maxTokens: 8192 },
+        { id: 'pro', name: 'DeepSeek-V4-Pro', contextWindow: 64000, maxTokens: 8192 },
+      ] },
+      { id: 'deepseek-account', name: 'DeepSeek Account', models: [
+        { id: 'deepseek-flash', name: 'DeepSeek-V4.1-Flash', contextWindow: 64000, maxTokens: 8192 },
+      ] },
+      { id: 'bohrium', name: 'bohrium', models: [
+        { id: 'hy4', name: 'Hunyuan 4', contextWindow: 64000, maxTokens: 8192 },
+        { id: 'glm', name: 'GLM-5.3', contextWindow: 64000, maxTokens: 8192 },
+      ] },
+    ],
+  }
+  const picks = defaultRoutesFromCatalog(catalog)
+  assert.ok(picks.length >= 2, `auto-pick needs >=2 routes: ${JSON.stringify(picks.map((r) => r.key))}`)
+  const providers = new Set(picks.map((route) => route.provider))
+  const names = new Set(picks.map((route) => route.name))
+  assert.equal(providers.size, picks.length, 'auto-pick must not repeat a provider')
+  assert.equal(names.size, picks.length, 'auto-pick must not repeat a model name')
 
   /* runLimited never exceeds its window. */
   let active = 0
