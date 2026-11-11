@@ -119,6 +119,26 @@ try {
   assert.equal(TRANSIENT_FAILURE.test('timeoutMs is 300000'), false)
   assert.equal(TRANSIENT_FAILURE.test('超过 500 毫秒'), false)
 
+  /* Out-of-band termination must release resources, not just write a state.
+     The deadline wall used to call finishRun only; `finally` then cleared the
+     watchdog, so in-flight provider calls and live seats were never aborted
+     (and because the wall fires a few ms before the watchdog, that was the
+     normal path). Assert the shared terminateRun helper and every caller. */
+  {
+    const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+    const terminate = /function terminateRun\(run, message\) \{([\s\S]*?)\n  \}/.exec(source)
+    assert.ok(terminate !== null, 'terminateRun helper must exist')
+    assert.ok(terminate[1].includes("finishRun(run, 'error', message, 'watchdog')"), 'terminateRun settles the run')
+    assert.ok(terminate[1].includes('run.controller.abort()'), 'terminateRun aborts in-flight work')
+    assert.ok(terminate[1].includes('activation.dispose()'), 'terminateRun disposes live seats')
+    /* The wall branch and both watchdogs go through it. */
+    assert.ok(source.includes("terminateRun(run, '整轮预算耗尽')"), 'deadline wall must use terminateRun')
+    const watchdogCalls = (source.match(/terminateRun\(run, '运行超时（30 分钟），已中止'\)/g) || []).length
+    assert.equal(watchdogCalls, 2, `both watchdogs (tool + HTTP) must use terminateRun, got ${watchdogCalls}`)
+    assert.equal(/finishRun\(run, 'error', '整轮预算耗尽'/.test(source), false,
+      'the wall branch must not settle without releasing resources')
+  }
+
   /* A configured allowlist confines attachments to the workspace. */
   const confined = await collectPathContext('review D/dev/elsewhere', 2000, workspace, 0, false, [workspace])
   assert.equal(confined.paths.length, 0, `allowlist must refuse outside paths: ${JSON.stringify(confined.paths)}`)
