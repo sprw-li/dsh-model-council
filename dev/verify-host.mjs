@@ -49,7 +49,23 @@ try {
   assert.ok(code.chars <= 1200, `code budget: ${code.chars}`)
   assert.ok(typeof code.discovered === 'number' && code.discovered >= code.files, `coverage discovered: ${JSON.stringify(code)}`)
   assert.ok(code.text.includes('覆盖率声明'), 'code pack must carry the coverage disclaimer')
-  const reviewPack = await collectPathContext('评审这个项目', 2000, workspace, 1200)
+
+  /* Hint-anchored sampling: a large file's pack segment must center on the
+     lines matching the question's key terms, not just the head constants. */
+  {
+    const big = join(workspace, 'pkg', 'big.py')
+    const filler = Array.from({ length: 900 }, (_, index) => `# filler line ${index} ${'x'.repeat(40)}`).join('\n')
+    const head = 'MARKER_HEAD = "top of file"'
+    const impl = 'def implementation_marker():\n    return "the anchor target"'
+    const tail = 'MARKER_TAIL = "bottom of file"'
+    await mkdir(join(workspace, 'pkg'), { recursive: true })
+    await writeFile(big, [head, filler, impl, filler, tail].join('\n'))
+    const pack = await collectCodeContext([join(workspace, 'pkg')], 4000, ['implementation_marker', 'anchor', 'target'])
+    assert.ok(pack.text.includes('MARKER_HEAD'), 'anchored pack keeps the head')
+    assert.ok(pack.text.includes('implementation_marker'), 'anchored pack centers the hint-matching region')
+    assert.ok(pack.text.includes('关键区'), 'anchored pack labels its sampling')
+  }
+  const reviewPack = await collectPathContext('评审这个项目', 6000, workspace, 5000)
   assert.equal(reviewPack.codeState, 'ok')
   assert.ok(reviewPack.codeFiles >= 2, `review code files: ${reviewPack.codeFiles}`)
   assert.ok(reviewPack.text.includes('main.py'), 'review pack must include source text')
@@ -57,9 +73,9 @@ try {
 
   /* Acceptance-style questions also get the source pack: 验收/复审 must not
      silently disable it (a real run regressed this way once). */
-  const acceptancePack = await collectPathContext('验收：deadline 实现是否正确', 2000, workspace, 1200)
+  const acceptancePack = await collectPathContext('验收：deadline 实现是否正确', 6000, workspace, 5000)
   assert.equal(acceptancePack.codeState, 'ok', '验收 questions must attach the source pack')
-  const reAcceptancePack = await collectPathContext('复审：改判通过与否', 2000, workspace, 1200)
+  const reAcceptancePack = await collectPathContext('复审：改判通过与否', 6000, workspace, 5000)
   assert.equal(reAcceptancePack.codeState, 'ok', '复审 questions must attach the source pack')
 
   /* A named project directory inside the workspace wins over the whole workspace. */
