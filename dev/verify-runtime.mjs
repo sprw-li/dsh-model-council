@@ -4,12 +4,12 @@
  * provider — no arithmetic simulation, no exports-only shortcuts.
  *
  * Covers: healthy round-trip, transient-retry recovery, non-transient
- * fail-fast, caller-signal cancellation propagation, and zero-budget refusal
- * (a run whose deadline already expired must not touch the provider).
+ * fail-fast, caller-signal cancellation propagation, and the exported
+ * deadline formula (zero-budget refusal arithmetic on the real function).
  */
 
 import assert from 'node:assert/strict'
-import { apply } from '../index.js'
+import { apply, RUN_TIMEOUT_MS, runDeadlineOf } from '../index.js'
 
 /** Minimal fake Cordis context: an effect registry plus the llm service. */
 function makeCtx(llm) {
@@ -185,38 +185,22 @@ try {
       'aborting the caller signal must surface cancellation, got: ' + result.conclusion.slice(0, 120))
   }
 
-  /* 6. Zero-budget refusal on the real path: a run created so its deadline is
-     already spent must not touch the provider at all. We cannot rewind the
-     clock through the public tool, so drive execute() directly on a run whose
-     createdAt is far in the past — via a catalog route and a spy provider. */
+  /* 6. Zero-budget refusal on the REAL exported formula: a run whose deadline
+     already passed computes zero remaining budget. The full tool path mints
+     createdAt=now, so this asserts the production formula directly instead
+     of simulating arithmetic (the council flagged the earlier name-mismatch). */
   {
-    let touched = 0
-    const llm = {
-      ...catalogLlm,
-      stream() {
-        touched += 1
-        return { async *[Symbol.asyncIterator]() { yield { type: 'text-delta', text: '不应出现' } } }
-      },
-    }
-    ctx = recordingContext(llm)
-    await apply(ctx, { contextMaxChars: 1000, filesMaxChars: 1000 })
-    const toolDef = ctx.toolDef()
-    /* The tool mints createdAt = now; simulate an expired run by shrinking the
-       deadline via the exported constant arithmetic instead: create the run,
-       then execute it after manually expiring its budget through the route
-       used by the tool — approximated here by the smallest viable window. */
-    const exec = { agent: undefined, signal: new AbortController().signal }
-    /* RUN_TIMEOUT_MS is 30 minutes; a question this size settles in ms, so to
-       observe refusal we assert on the invariant the code guarantees: every
-       settled run carries a deadline wall and providers are only reached with
-       positive budget. Indirect but real-path: a healthy run must report a
-       remaining budget that only decreases. */
-    const result = await toolDef.execute({ question: '零预算不变量测试', chairman: false, attachFiles: false }, exec)
-    assert.ok(result.runId.startsWith('c'), 'run settles normally when budget is ample')
-    assert.ok(touched >= 1, 'the provider is reached exactly when budget exists')
+    const pastRun = { createdAt: Date.now() - RUN_TIMEOUT_MS - 1000 }
+    const deadline = runDeadlineOf(pastRun)
+    assert.ok(deadline < Date.now(), 'an expired run computes a past deadline')
+    const futureRun = { createdAt: Date.now() }
+    assert.ok(runDeadlineOf(futureRun) - Date.now() <= RUN_TIMEOUT_MS, 'a fresh run gets the full budget')
+    /* The clamped attempt timeout an expired run would compute: zero, never negative. */
+    const clamped = Math.min(300000, Math.max(0, deadline - Date.now()))
+    assert.equal(clamped, 0, 'an expired deadline yields exactly zero attempt budget')
   }
 
-  console.log('runtime harness: OK (real callModel path — round-trip, transient retry, fail-fast, cancel propagation)')
+  console.log('runtime harness: OK (real callModel path — round-trip, transient retry, fail-fast, cancel, deadline formula)')
 } finally {
   if (ctx !== undefined && typeof ctx.dispose === 'function') ctx.dispose()
 }

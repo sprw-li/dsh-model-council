@@ -1,3 +1,11 @@
+# 0.2.8
+
+self-loop 第 7 圈（采样器收敛为可执行验收）：
+
+- **函数定义保底**：问题点名的函数（`callModel`/`callSeatSubagent` 等）其**完整函数体**无条件进入附件——同缩进 `}` 界定窗口、不按份额截断、变量形式命中不覆盖外层函数定义（该 bug 曾把 callModel 体切掉）。主文件（hint 命中最高的）获得 55% 总预算。
+- **采样器验收门**：新增 `dev/tune-sampler.mjs`——对真实插件目录跑一次验收式采样，断言 9 个 deadline 标识符（两函数定义、退避/席位/尝试钳制、硬封顶、零预算守卫）**全部**出现在 index.js 块中，exit code 验收。已接入 `npm run verify` 与 CI。
+- 大写蛇形标识符（`SEAT_RESULT_TIMEOUT_MS`）从问题文本进入 hint；`runDeadlineOf` 导出公式供测试直接断言。
+
 # 0.2.7
 
 self-loop 第 6 圈（终审附件采样回归修复）：
