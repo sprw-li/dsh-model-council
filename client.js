@@ -547,7 +547,8 @@ window.__ModuleLoader__.load({
         if (store.state.runId !== runId || store.state.running !== true) return
         streamStalls += 1
         stopEventStream()
-        schedulePoll(runId)
+        /* Only the leader converts a stall into polling. */
+        if (isPollLeader() === true) schedulePoll(runId)
       }, STREAM_STALL_MS)
     }
 
@@ -555,12 +556,13 @@ window.__ModuleLoader__.load({
       stopPolling()
       stopEventStream()
       if (typeof window === 'undefined' || typeof window.EventSource !== 'function') {
-        schedulePoll(runId)
+        if (isPollLeader() === true) schedulePoll(runId)
         return
       }
-      /* Two stalls are enough evidence: keep this run on polling. */
+      /* Two stalls are enough evidence: keep this run on polling (leader only —
+         a follower that turns itself into a poller is the idle-loop bug). */
       if (streamStalls >= 2) {
-        schedulePoll(runId)
+        if (isPollLeader() === true) schedulePoll(runId)
         return
       }
       try {
@@ -592,16 +594,22 @@ window.__ModuleLoader__.load({
       eventSource.onerror = () => {
         /* The stream died: fall back to polling. Count it like a stall so a
            proxy that always blocks SSE cannot cause a 320ms open→error→poll
-           loop — after two failures this run stays on polling. */
+           loop — after two failures this run stays on polling. Followers just
+           drop the stream; the election will hand them a poll if needed. */
         streamStalls += 1
         stopEventStream()
-        if (store.state.runId === runId && store.state.running === true) schedulePoll(runId)
+        if (store.state.runId !== runId || store.state.running !== true) return
+        if (isPollLeader() !== true) return
+        schedulePoll(runId)
       }
     }
 
     /** Reattach a run that kept running in the host after a refresh or window close. */
     async function adoptRunningRun() {
-      if (store.state.runId !== '' && store.state.run !== null) return
+      /* Only skip when this tab is actively showing a live run. A tab that
+         gave up after repeated poll failures keeps runId/run but is NOT live;
+         early-returning here left it permanently unable to reattach. */
+      if (store.state.running === true && store.state.runId !== '' && store.state.run !== null) return
       const sessionId = store.state.sessionId !== ''
         ? store.state.sessionId
         : typeof draftBridge.sessionId === 'string' ? draftBridge.sessionId : ''
@@ -810,13 +818,10 @@ window.__ModuleLoader__.load({
         return
       }
       if (isPollLeader() !== true) {
-        /* Followers do not poll (that used to re-arm every 640ms without ever
-           fetching, so a follower never learned the run had finished). They
-           keep their own SSE stream instead; if that is down too, the
-           election hands leadership over and the new leader polls. */
-        if (eventSource === null && typeof window !== 'undefined' && typeof window.EventSource === 'function') {
-          watchRun(runId)
-        }
+        /* Followers do not poll and do not re-arm anything: poll → watchRun →
+           (stall guard) → poll was a 320ms idle loop that never fetched, so a
+           follower's UI sat on "running" forever. A follower waits for the
+           election; `claim()` re-arms a poll when it takes over. */
         return
       }
       try {
@@ -824,7 +829,8 @@ window.__ModuleLoader__.load({
         if (store.state.runId !== runId) return
         pollFailures = 0
         const running = data.status === 'running'
-        store.publish({ run: data, running })
+        /* A recovered poll clears a transport error it itself raised. */
+        store.publish({ run: data, running, ...(store.state.error !== '' ? { error: '' } : {}) })
         if (running) {
           /* The SSE stream may have healed while we were polling. */
           if (eventSource === null && typeof window !== 'undefined' && typeof window.EventSource === 'function') {
@@ -839,8 +845,9 @@ window.__ModuleLoader__.load({
         if (store.state.runId !== runId) return
         const message = String(error && error.message ? error.message : error)
         /* A 404 means the host no longer knows this run: that really is
-           terminal, unlike a transport blip. */
-        if (/\b404\b/.test(message) || message.includes('run not found')) {
+           terminal, unlike a transport blip. Prefer the structured status. */
+        const status = error !== null && typeof error === 'object' ? error.status : undefined
+        if (status === 404 || /\b404\b/.test(message) || message.includes('run not found')) {
           stopPolling()
           stopEventStream()
           store.publish({ running: false, run: null, runId: '', error: message })
@@ -1020,7 +1027,13 @@ window.__ModuleLoader__.load({
         }
       }
       const sessionId = request !== null && request !== undefined && typeof request.sessionId === 'string' ? request.sessionId : ''
-      if (sessionId !== '') store.publish({ sessionId })
+      /* Route through switchSession: publishing sessionId directly bypassed
+         the teardown, so a run started in session A kept streaming (and
+         delivering) into session B. */
+      if (sessionId !== '') {
+        if (sessionId === store.state.sessionId) store.publish({ sessionId })
+        else switchSession(sessionId)
+      }
       void loadWorkspace()
       const layout = service('layout')
       if (layout !== undefined) {

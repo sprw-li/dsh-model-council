@@ -1,3 +1,13 @@
+# 0.2.16
+
+验证者独立复核本轮又找出 3 个真实 P1（council 未覆盖），连同上一轮 P1 一并修复：
+
+- **P1-B follower 320ms 空转**：`pollRun` 的 follower 分支先 watchRun，而 `watchRun` 在 `streamStalls>=2` 时又 schedulePoll → poll → follower → … 永远 fetch 0 次、状态永不更新，follower UI 永久卡「运行中」。现在 follower **不排任何 poll**；看门狗/onerror 也只在 leader 时才转轮询；接管时由 `claim()` 补挂。
+- **P1-C 跨会话串 run**：`openCouncilTab` 直接 `store.publish({sessionId})` 绕过 `switchSession`，会话 A 的 run 会继续往会话 B 投结论。现在统一走 `switchSession`。
+- **P1-D 放弃后接不回**：`pollFailures>=8` 后保留 runId/run，而 `adoptRunningRun` 用 `runId!=='' && run!==null` 早退，导致该 tab 永远无法重新接回。现在只在 `running===true` 时早退。
+- **P2**：404 用 `error.status` 判定；恢复的轮询清除自己写入的错误；`adoptRunningRun`/`restoreSessionState` 也清零计数器。
+- `dev/verify-client.mjs` 新增断言：follower 分支不得 schedulePoll、adopt 不得跳过非活跃 tab、openCouncilTab 必须走 switchSession。
+
 # 0.2.15
 
 终审 6/6 项成立但因一个**真实 P1** 判不通过，本轮修复：

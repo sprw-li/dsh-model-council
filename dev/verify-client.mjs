@@ -602,6 +602,26 @@ if (!silentHtml.includes('已静默放进上下文')) throw new Error('silent de
   if (!body.includes('resumeInFlight')) throw new Error('resumeRun needs an in-tab in-flight guard')
 }
 
+/* --- Regression: followers must not turn themselves into pollers, and a tab
+       that gave up polling must be able to reattach. --- */
+{
+  const source = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
+  const followerBranch = /if \(isPollLeader\(\) !== true\) \{\s*\n\s*\/\*[\s\S]*?\*\/\s*\n\s*return\s*\n\s*\}/.exec(source)
+  if (followerBranch === null) throw new Error('pollRun follower branch must return without re-arming')
+  if (/schedulePoll/.test(followerBranch[0])) throw new Error('follower branch must not schedule a poll')
+  const adopt = /async function adoptRunningRun\(\) \{([\s\S]*?)\n    \}/.exec(source)
+  if (adopt === null) throw new Error('adoptRunningRun not found')
+  if (!/store\.state\.running === true/.test(adopt[1])) {
+    throw new Error('adoptRunningRun must not skip a tab that is not live')
+  }
+  const openAt = source.indexOf('const sessionId = request')
+  if (openAt === -1) throw new Error('openCouncilTab session handling not found')
+  const openWindow = source.slice(openAt, openAt + 600)
+  if (!/switchSession\(sessionId\)/.test(openWindow)) {
+    throw new Error('openCouncilTab must route the session switch through switchSession')
+  }
+}
+
 for (const cleanup of cleanups.reverse()) {
   try {
     cleanup()
