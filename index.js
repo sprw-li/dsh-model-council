@@ -312,6 +312,24 @@ async function readTextFile(path, maxChars) {
   }
 }
 
+/**
+ * Head + tail sample of a text file. Key documentation puts behavioural
+ * contracts in later sections, so showing only the head hid exactly what a
+ * review needed (the README pagehide/reattach contract sat past the cut).
+ */
+async function readTextFileHeadTail(path, maxChars) {
+  try {
+    const content = await readFile(path, 'utf8')
+    if (content.indexOf('\u0000') !== -1) return ''
+    if (content.length <= maxChars) return content
+    const head = Math.floor(maxChars * 0.55)
+    const tail = Math.max(200, maxChars - head)
+    return `${content.slice(0, head)}\n…（中间省略 ${content.length - head - tail} 字）…\n${content.slice(content.length - tail)}`
+  } catch {
+    return ''
+  }
+}
+
 /** Depth-limited directory tree, one entry per line. */
 async function listTree(root, maxEntries) {
   const lines = []
@@ -594,6 +612,21 @@ async function readCodeSegments(path, budget, hints = []) {
           }
         }
       }
+      /* Any identifier the question names gets a small window around its first
+         occurrences, so a review can verify the exact line it asks about even
+         when the symbol sits outside every keyword cluster (draftBridge.draft,
+         stopEventStream, …). */
+      if (/^[A-Za-z][A-Za-z0-9_.]*$/.test(hint) && hint.length >= 5) {
+        let windows = 0
+        for (let index = 0; index < totalLines && windows < 2; index += 1) {
+          if (!(lines[index] || '').toLowerCase().includes(hint)) continue
+          const from = Math.max(0, index - 3)
+          const to = Math.min(totalLines, index + 8)
+          if (regions.some((region) => from >= region.from && to <= region.to)) continue
+          regions.push({ from, to, share: 1200 })
+          windows += 1
+        }
+      }
       /* Skip a variable-form hit that a function-definition line already
          covers — BUT only when that def line is genuinely the same function:
          a 400-line proximity window once swallowed callSeatSubagent's def
@@ -709,13 +742,9 @@ async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars
   /* Did the question name a path that the allowlist refused? Then it must NOT
      silently fall back to the workspace — the caller asked for somewhere else. */
   const namedButRefused = candidatePaths(question, workspaceCwd).some((candidate) => !permitted(candidate))
-  /* The caller's own directory is the primary anchor: a subagent spawned in
-     the plugin directory reviews THAT directory, not the workspace root. */
-  if (candidates.length === 0 && !namedButRefused && typeof callerCwd === 'string' && callerCwd !== ''
-    && (WORKSPACE_INTENT.test(String(question || '')) || wantsSourcePack(question))) {
-    candidates.push(callerCwd)
-  }
-  /* A named project directory wins over the whole workspace: "评审 dsh-council". */
+  /* A NAMED project directory beats the caller's own directory: when the caller
+     sits at the workspace root and the question says "dsh-council", attaching
+     the root buried the plugin under unrelated sibling projects. */
   if (candidates.length === 0 && !namedButRefused && typeof workspaceCwd === 'string' && workspaceCwd !== '') {
     let matched
     try {
@@ -731,10 +760,17 @@ async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars
       matched = undefined
     }
     if (matched !== undefined && permitted(matched)) candidates.push(matched)
-    else if ((WORKSPACE_INTENT.test(String(question || '')) || wantsSourcePack(question))
-      && permitted(workspaceCwd)) {
-      candidates.push(workspaceCwd)
-    }
+  }
+  /* Otherwise the caller's own directory is the primary anchor: a subagent
+     spawned in the plugin directory reviews THAT directory, not the root. */
+  if (candidates.length === 0 && !namedButRefused && typeof callerCwd === 'string' && callerCwd !== ''
+    && (WORKSPACE_INTENT.test(String(question || '')) || wantsSourcePack(question))) {
+    candidates.push(callerCwd)
+  }
+  if (candidates.length === 0 && !namedButRefused && typeof workspaceCwd === 'string' && workspaceCwd !== ''
+    && (WORKSPACE_INTENT.test(String(question || '')) || wantsSourcePack(question))
+    && permitted(workspaceCwd)) {
+    candidates.push(workspaceCwd)
   }
   const sections = []
   const valid = []
@@ -773,8 +809,14 @@ async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars
       for (const file of files) {
         const budget = Math.min(MAX_FILE_CHARS, maxChars - used)
         if (budget <= 0) break
-        const content = await readTextFile(file, budget)
+        /* Key docs carry their contracts in later sections (a README's
+           reliability rules sit past the head), so a head-only read hides
+           exactly what a review asks about. Sample head + tail. */
+        let content = await readTextFile(file, budget)
         if (content === '') continue
+        if (content.includes('…（已截断）')) {
+          content = await readTextFileHeadTail(file, budget)
+        }
         parts.push(`--- ${file} ---`, content)
         used += content.length
       }
@@ -2075,7 +2117,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v51', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v52', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -2084,7 +2126,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v51' })
+          sendJson(res, 200, { ok: true, build: 'v52' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
