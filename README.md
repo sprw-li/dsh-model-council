@@ -88,6 +88,8 @@ council_review({
 - **工作区归属调用方**：用 `exec.agent` 的会话解析 cwd，subagent 在自己工作区里评审自己改的东西；
 - **取消联动**：工具转发 `exec.signal`，调用方中断 → run 立即取消并 dispose；
 - **超时**：工具声明 `RUN_TIMEOUT_MS`（30 分钟）为协作上限；
+- **返回值**：结论文本末尾带「（参与模型：…；runId: c…）」行；结构化字段 `conclusion/runId/models` 全部 required；
+- **自动挑模型保证异构**：每 provider 一个、模型名不重复（≤3 个跨 provider）；
 - **自反馈循环**：边改边评审的标准姿势——改完一批，spawn 一个 subagent 让它带着改动上下文调 `council_review`，读回结论决定下一步；council 自身的很多修复就是这么被理事会指出的。
 
 ## Skill 接入（agent-library / DSH）
