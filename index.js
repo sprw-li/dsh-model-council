@@ -90,7 +90,7 @@ const REVIEW_INTENT = /(评审|审查|审计|验收|复审|检查|review|audit|a
 /** Bounded source pack so llm-mode seats can cite real files instead of guessing. */
 const CODE_MAX_CHARS = 40000
 const CODE_MAX_FILES = 24
-const CODE_FILE_CHARS = 4000
+const CODE_FILE_CHARS = 10000
 const CODE_WALK_ENTRIES = 2000
 const CODE_EXTENSIONS = new Set([
   '.py', '.pyi', '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs',
@@ -150,6 +150,11 @@ function sendJson(res, code, value) {
   res.setHeader('content-type', 'application/json; charset=utf-8')
   res.setHeader('cache-control', 'no-store')
   res.end(JSON.stringify(value))
+}
+
+/** Run deadline as one exported formula, so tests can assert the real path. */
+export function runDeadlineOf(run) {
+  return run.createdAt + RUN_TIMEOUT_MS
 }
 
 /** Human-readable message of any thrown value. */
@@ -366,6 +371,12 @@ function questionHints(text) {
     if (value.length < 3 || stop.has(value)) continue
     if (hints.indexOf(value) === -1) hints.push(value)
   }
+  /* SCREAMING_SNAKE identifiers in the question are strong anchors: they name
+   * exact constants (SEAT_RESULT_TIMEOUT_MS) and must survive lowercasing. */
+  for (const match of String(text || '').matchAll(/\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g)) {
+    const value = match[0].toLowerCase()
+    if (value.length >= 6 && hints.indexOf(value) === -1) hints.push(value)
+  }
   return hints
 }
 
@@ -415,6 +426,11 @@ async function collectSourceFiles(root, hints = []) {
   return found
 }
 
+/** Escape a string for literal matching inside a RegExp. */
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 /**
  * Read one file for the code pack with hint-ANCHORED sampling: find lines
  * matching the question's key terms and take windows around the densest
@@ -461,16 +477,82 @@ async function readCodeSegments(path, budget, hints = []) {
     }
     clusters.push(run)
     clusters.sort((a, b) => b.length - a.length)
-    /* Budget the anchor share (75%) across up to 6 clusters by hit count. */
+    /* Anchor share (75%) across up to 5 clusters, weighted SQUARELY by hit
+     * count: the top cluster gets the bulk (a whole function beats five
+     * mid-cut fragments — equal shares truncated every region last round). */
     const anchorBudget = Math.floor(budget * 0.75)
-    const chosen = clusters.slice(0, 6)
-    const weightSum = chosen.reduce((sum, cluster) => sum + cluster.length, 0)
-    for (const cluster of chosen) {
-      const share = Math.max(600, Math.floor((anchorBudget * cluster.length) / Math.max(1, weightSum)))
-      const clusterLines = Math.max(20, Math.floor(share / 60))
-      const from = Math.max(0, cluster[0] - 5)
-      const to = Math.min(totalLines, cluster[cluster.length - 1] + 6 + clusterLines - (cluster[cluster.length - 1] - cluster[0]))
-      regions.push({ from: Math.max(0, Math.min(from, cluster[0])), to: Math.max(to, cluster[cluster.length - 1] + 1), share })
+    let chosen = clusters.slice(0, 5)
+    const weights = chosen.map((cluster) => cluster.length * cluster.length)
+    const weightSum = weights.reduce((sum, value) => sum + value, 0)
+    for (let index = 0; index < chosen.length; index += 1) {
+      const cluster = chosen[index]
+      const share = index === 0
+        ? Math.floor(anchorBudget * 0.4)
+        : Math.max(700, Math.floor((anchorBudget * 0.6 * weights[index]) / Math.max(1, weightSum - weights[0])))
+      let from = Math.max(0, cluster[0] - 5)
+      for (let line = cluster[0]; line >= Math.max(0, from - 200); line -= 1) {
+        const text = lines[line] || ''
+        if (/^\s*(export\s+)?(async\s+)?function\b|^\s*const\s+\w+\s*=\s*(async\s*)?\(/.test(text)) {
+          from = line
+          break
+        }
+      }
+      let to = Math.min(totalLines, cluster[cluster.length - 1] + 6)
+      for (let line = cluster[cluster.length - 1]; line < Math.min(totalLines, to + 200); line += 1) {
+        if ((lines[line] || '').startsWith('}') || (lines[line] || '').startsWith('  }, ')) {
+          to = line + 1
+          break
+        }
+      }
+      regions.push({ from, to, share })
+    }
+    /* Function names named by the question MUST have their FULL definitions in
+     * the pack even when their keyword density is low (callSeatSubagent scored
+     * n=3 and missed the cut — its clamps are exactly what reviewers need).
+     * Definition windows are not share-truncated: a cut function body was the
+     * exact failure mode of the last two acceptance rounds. Nested functions
+     * close at the SAME indent as their `function` line — match that brace.
+     * `function name(` declarations win over `const name =` variable forms. */
+    const defLines = []
+    for (const hint of lowerHints) {
+      let found = -1
+      for (let index = 0; index < totalLines; index += 1) {
+        if (new RegExp(`function\\s+${escapeRegExp(hint)}\\b`, 'i').test(lines[index] || '')) {
+          found = index
+          break
+        }
+      }
+      if (found === -1) {
+        for (let index = 0; index < totalLines; index += 1) {
+          if (new RegExp(`const\\s+${escapeRegExp(hint)}\\s*=`, 'i').test(lines[index] || '')) {
+            found = index
+            break
+          }
+        }
+      }
+      /* Skip a variable-form hit that a function-definition line already
+         covers: replacing the enclosing function with the inner const
+         definition once cut callModel's body out of the pack. */
+      if (found !== -1 && !defLines.some((line) => found > line && found < line + 400)) defLines.push(found)
+    }
+    for (const index of defLines) {
+      const text = lines[index] || ''
+      const indent = text.length - text.trimStart().length
+      const pad = ' '.repeat(indent)
+      let to = Math.min(totalLines, index + 400)
+      for (let line = index + 1; line < Math.min(totalLines, index + 400); line += 1) {
+        const candidate = lines[line] || ''
+        if (candidate === `${pad}}` || candidate === `${pad}}, ` || (indent === 0 && candidate.startsWith('}'))) {
+          to = line + 1
+          break
+        }
+      }
+      /* A line already inside another def window adds nothing; and a def
+         window never REPLACES a wider one (the inner-const bug). */
+      if (regions.some((region) => index >= region.from && index < region.to)) continue
+      const partial = regions.findIndex((region) => index >= region.from && index < region.to)
+      if (partial !== -1) regions.splice(partial, 1)
+      regions.push({ from: index, to, share: Number.MAX_SAFE_INTEGER })
     }
   } else {
     const mid = Math.floor(totalLines / 2)
@@ -482,15 +564,21 @@ async function readCodeSegments(path, budget, hints = []) {
   const regionTexts = []
   for (const region of regions) {
     const text = lines.slice(region.from, region.to).join('\n')
-    regionTexts.push(`--- 关键区（第 ${region.from + 1}–${region.to} 行） ---\n${text.length > region.share ? text.slice(0, region.share) + '\n…（区内截断）' : text}`)
-  }
+    regionTexts.push(`--- 关键区（第 ${region.from + 1}–${region.to} 行） ---\n${text.length > region.share ? text.slice(0, region.share) + '\n…（区内截断，本区共 ' + (region.to - region.from) + ' 行）' : text}`)
+  }  /* Function-definition regions are exempt from every clamp: they were
+     hand-picked by the question and a cut body was the recurring failure. */
+  const defRegions = regions.filter((region) => region.share === Number.MAX_SAFE_INTEGER)
+  const defAllowance = defRegions.reduce((sum, region) => {
+    const body = lines.slice(region.from, region.to).join('\n')
+    return sum + body.length + 80
+  }, 0)
   const text = [
     `（文件共 ${totalLines} 行 / ${whole.length} 字，采样：头部 ${headLines} 行 + ${regions.length} 个关键区（按问题关键词命中 ${hits.length} 处定位），其余省略）`,
     '--- 头部 ---',
     head,
     ...regionTexts,
   ].join('\n')
-  return { text: text.length > budget ? text.slice(0, budget) : text, truncated: true, totalLines }
+  return { text: text.length > budget + defAllowance ? text.slice(0, budget + defAllowance) : text, truncated: true, totalLines }
 }
 
 /** Bounded source-code pack for review questions: real files the models can cite. */
@@ -514,10 +602,14 @@ async function collectCodeContext(roots, maxChars, hints = []) {
   let included = 0
   let truncated = 0
   /* Every selected file gets a reserved slice, so an early big file cannot
-     starve the rest into empty "--- path ---" stubs. */
+     starve the rest into empty "--- path ---" stubs. The file with the most
+     hint hits is the review's subject: it gets the lion's share, because its
+     function definitions must fit whole. */
   const reserve = Math.max(600, Math.floor(maxChars / Math.max(1, files.length)))
   for (const file of files) {
-    const budget = Math.min(Math.max(CODE_FILE_CHARS, reserve), Math.max(0, maxChars - used))
+    const primary = file === files[0]
+    const baseBudget = primary ? Math.floor(maxChars * 0.55) : CODE_FILE_CHARS
+    const budget = Math.min(Math.max(baseBudget, reserve), Math.max(0, maxChars - used))
     if (budget < 200) break
     const segmented = await readCodeSegments(file.path, budget, hints)
     if (segmented === '' || segmented === undefined) continue
@@ -1195,8 +1287,8 @@ export function apply(ctx, config) {
       seatMode: run.seatMode === undefined ? 'llm' : run.seatMode,
       stopReason: run.stopReason === undefined ? '' : run.stopReason,
       /* Deadline audit: when the run budget ends and how much is left. */
-      deadlineAt: run.createdAt + RUN_TIMEOUT_MS,
-      remainingMs: Math.max(0, run.createdAt + RUN_TIMEOUT_MS - Date.now()),
+      deadlineAt: runDeadlineOf(run),
+      remainingMs: Math.max(0, runDeadlineOf(run) - Date.now()),
       subagentSeats: run.subagentSeats === undefined ? 0 : run.subagentSeats,
       fallbacks: run.fallbacks === undefined ? 0 : run.fallbacks,
       fallbackLimit: MAX_FALLBACKS_PER_RUN,
@@ -1430,7 +1522,7 @@ export function apply(ctx, config) {
     const signal = run.controller.signal
     /* Absolute budget: every attempt and backoff is clamped to this instant,
        so retries settle before (not after) the run-level watchdog. */
-    const deadlineAt = run.createdAt + RUN_TIMEOUT_MS
+    const deadlineAt = runDeadlineOf(run)
     const baseQuestion = run.contextBlock === '' ? run.question : `${run.contextBlock}\n\n---\n\n问题：${run.question}`
     const workspaceLine = run.workspace !== undefined && typeof run.workspace.cwd === 'string' && run.workspace.cwd !== ''
       ? run.workspace.cwd
@@ -1819,7 +1911,7 @@ export function apply(ctx, config) {
        * so the visible wait never exceeds remainingMs.
        */
       const deadlineWall = new Promise((resolve) => {
-        const left = run.createdAt + RUN_TIMEOUT_MS - Date.now()
+        const left = runDeadlineOf(run) - Date.now()
         run.deadlineTimer = setTimeout(() => resolve(undefined), Math.max(0, left))
         if (typeof run.deadlineTimer.unref === 'function') run.deadlineTimer.unref()
       })
@@ -1875,7 +1967,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v34', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v36', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -1884,7 +1976,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v34' })
+          sendJson(res, 200, { ok: true, build: 'v36' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
