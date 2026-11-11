@@ -36,7 +36,7 @@ window.__ModuleLoader__.load({
       'panel.optContext': '接当前对话上下文',
       'panel.optFiles': '自动附带问题里的本地路径',
       'panel.optSeats': 'subagent 只读席位（可读文件/skill）',
-      'panel.seatsHint': '开启后每个委员是一个只读子代理：可读文件、搜索、加载 skill，不能写；更慢但能自行查证。关闭则用纯模型调用。开启时路径附件默认关闭（委员自己读文件）。',
+      'panel.seatsHint': '开启后每个委员是一个只读子代理：可读文件、搜索、加载 skill，不能写；更慢但能自行查证。关闭则用纯模型调用。开启时路径附件默认关闭（委员自己读文件）。subagent 席位整轮结束才出正文，想看逐字输出请关闭此开关。',
       'panel.seatModeSub': '本次使用只读 subagent 席位',
       'panel.seatModeFallback': 'subagent 席位不可用，本次退回纯模型调用',
       'panel.filesHint': '问题中出现的本地路径（如 D:\\dev\\项目）会自动读取目录树和关键文件，最多 {chars} 字；没写路径但提到工作区/项目时用当前会话工作区；跳过 .git/node_modules/密钥文件。',
@@ -72,6 +72,15 @@ window.__ModuleLoader__.load({
       'status.seatRunning': '运行中 {s}s',
       'status.seatClosed': '已关闭',
       'status.fallback': '完成（降级）',
+      'seat.activity.step': '思考中',
+      'seat.activity.tool': '调用工具',
+      'seat.activity.result': '工具返回',
+      'seat.activity.reply': '生成回复',
+      'seat.activity.start': '开始',
+      'seat.activity.end': '收尾',
+      'seat.activity.retry': '重试中',
+      'seat.activity.waiting': '等待响应',
+      'seat.subagentWaiting': 'subagent 席位运行中，完成后出正文',
       'error.empty': '问题不能为空',
       'error.minModels': '至少选择两个模型',
       'command.label': '理事会评审',
@@ -108,7 +117,7 @@ window.__ModuleLoader__.load({
       'panel.optContext': 'Attach current chat context',
       'panel.optFiles': 'Attach local paths named in the question',
       'panel.optSeats': 'Read-only subagent seats (files + skills)',
-      'panel.seatsHint': 'Each seat becomes a read-only subagent: it can read files, search, and load skills, but cannot write. Slower, but it can verify things itself. Off = raw model calls. With seats on, path attachments default off (the seats read files themselves).',
+      'panel.seatsHint': 'Each seat becomes a read-only subagent: it can read files, search, and load skills, but cannot write. Slower, but it can verify things itself. Off = raw model calls. With seats on, path attachments default off (the seats read files themselves). Subagent seats emit text only when a turn finishes; turn this off for token-by-token output.',
       'panel.seatModeSub': 'Used read-only subagent seats',
       'panel.seatModeFallback': 'Subagent seats unavailable; fell back to raw model calls',
       'panel.filesHint': 'Local paths in the question (e.g. D:\\dev\\project) attach their directory tree and key files, up to {chars} characters; a workspace/project question without a path uses the session workspace; .git/node_modules/secret files are skipped.',
@@ -144,6 +153,15 @@ window.__ModuleLoader__.load({
       'status.seatRunning': 'Running {s}s',
       'status.seatClosed': 'Closed',
       'status.fallback': 'Done (fallback)',
+      'seat.activity.step': 'Thinking',
+      'seat.activity.tool': 'Using tools',
+      'seat.activity.result': 'Tool returned',
+      'seat.activity.reply': 'Writing',
+      'seat.activity.start': 'Started',
+      'seat.activity.end': 'Finishing',
+      'seat.activity.retry': 'Retrying',
+      'seat.activity.waiting': 'waiting for model',
+      'seat.subagentWaiting': 'subagent seat is running; the answer appears when its turn finishes',
       'error.empty': 'The question is empty',
       'error.minModels': 'Select at least two models',
       'command.label': 'Council review',
@@ -825,16 +843,29 @@ window.__ModuleLoader__.load({
         done: t('stage.done'),
       }
       const stageName = run !== null && stageNames[run.stage] !== undefined ? stageNames[run.stage] : t('stage.answers')
+      const stageRank = { answers: 0, reviews: 1, chairman: 2, done: 3 }
+      const stageIndex = run !== null && stageRank[run.stage] !== undefined ? stageRank[run.stage] : 0
       /** Seat phase label for a running card (starting/running/closed). */
       function seatStatusText(seat) {
         if (seat === null || typeof seat !== 'object') return t('status.streaming')
         const seconds = typeof seat.elapsedMs === 'number' && seat.elapsedMs > 0
           ? Math.max(1, Math.round(seat.elapsedMs / 1000))
           : 0
-        if (seat.phase === 'starting') return t('status.seatStarting', { s: seconds })
-        if (seat.phase === 'running') return t('status.seatRunning', { s: seconds })
-        if (seat.phase === 'closed') return t('status.seatClosed')
-        return t('status.streaming')
+        const phase = seat.phase === 'starting'
+          ? t('status.seatStarting', { s: seconds })
+          : seat.phase === 'running'
+            ? t('status.seatRunning', { s: seconds })
+            : seat.phase === 'closed'
+              ? t('status.seatClosed')
+              : t('status.streaming')
+        const activity = typeof seat.activity === 'string' && seat.activity !== ''
+          ? t(`seat.activity.${seat.activity}`)
+          : ''
+        const waiting = typeof seat.activityMs === 'number' && seat.activityMs > 15000
+          ? ` · ${t('seat.activity.waiting')}`
+          : ''
+        if (activity === '' || activity === `seat.activity.${seat.activity}`) return `${phase}${waiting}`
+        return `${phase} · ${activity}${waiting}`
       }
       const participants = state.selected.length
       const estimatedCalls = participants * 2 + (state.useChairman !== false ? 1 : 0) + (state.feedbackMode !== 'off' ? 1 : 0)
@@ -1016,10 +1047,14 @@ window.__ModuleLoader__.load({
                       ),
                       answer.error !== ''
                         ? h('div', { className: 'dsc-error-box' }, answer.error)
-                        : h('div', { className: 'dsc-card-text' }, answer.text !== '' ? answer.text : '…'),
+                        : h('div', { className: 'dsc-card-text' }, answer.text !== ''
+                            ? answer.text
+                            : (run.seatMode === 'subagent' && answer.seat !== null && typeof answer.seat === 'object' && answer.seat.phase !== 'done'
+                                ? t('seat.subagentWaiting')
+                                : '…')),
                     )),
                   ),
-                  run.reviews.length > 0
+                  run.reviews.length > 0 && stageIndex >= 1
                     ? h('div', { className: 'dsc-section' },
                         h('div', { className: 'dsc-section-title' }, t('panel.reviews')),
                         h('div', { className: 'dsc-grid dsc-grid-small' },

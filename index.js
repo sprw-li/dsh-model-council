@@ -37,11 +37,11 @@ const CALL_TIMEOUT_MS = 300000
 /** A subagent seat must finish startup within this bound. */
 const SEAT_START_TIMEOUT_MS = 60000
 /** A subagent seat must return a result within this bound after startup. */
-const SEAT_RESULT_TIMEOUT_MS = 240000
+const SEAT_RESULT_TIMEOUT_MS = 120000
 /** Whole-run watchdog: a stuck stage can never hold the UI forever. */
 const RUN_TIMEOUT_MS = 30 * 60 * 1000
 /** Concurrent subagent seats; the delegation runtime has a shared capacity pool (default 8). */
-const SEAT_CONCURRENCY = 6
+const SEAT_CONCURRENCY = 3
 const RUN_TTL_MS = 30 * 60 * 1000
 const MAX_RUNS = 16
 const MODEL_CACHE_MS = 60000
@@ -71,6 +71,16 @@ const KEY_FILE = /(^|[\\/])(README[^\\/]*\.md|SKILL\.md|CLAUDE\.md|AGENTS\.md|CH
 
 /** Model ids that are not chat completions. */
 const EXCLUDED_MODEL = /(embedding|rerank|\btts\b|\basr\b|whisper|audio|speech|image|video|seedream|wan-|ocr|moderation)/i
+/** Child-session events surfaced as the live activity of a subagent seat. */
+const SEAT_ACTIVITY = {
+  'step/start': 'step',
+  'tool/call': 'tool',
+  'tool/result': 'result',
+  'assistant/message': 'reply',
+  'turn/start': 'start',
+  'turn/end': 'end',
+  'llm/retry': 'retry',
+}
 
 const ANSWER_SYSTEM = [
   '你是多模型理事会中的一名独立委员。',
@@ -342,6 +352,17 @@ export function apply(ctx, config) {
     : ATTACH_MAX_CHARS
   /** Live runs by id. */
   const runs = new Map()
+  /** Child session id -> seat object, for the per-seat activity label. */
+  const liveSeatByChild = new Map()
+  ctx.effect(() => ctx.on('session/event', (session, event) => {
+    if (session === null || typeof session !== 'object') return
+    const seat = liveSeatByChild.get(session.id)
+    if (seat === undefined || seat === null) return
+    const activity = event !== null && typeof event === 'object' ? SEAT_ACTIVITY[event.type] : undefined
+    if (activity === undefined) return
+    seat.activity = activity
+    seat.activityAt = Date.now()
+  }), 'council: seat activity')
   /** Cached catalog; agent/account changes refresh it after MODEL_CACHE_MS. */
   let catalogCache = { at: 0, value: undefined }
 
@@ -591,7 +612,7 @@ export function apply(ctx, config) {
 
   /** Compact per-seat diagnostics for the browser. */
   function summarizeSeat(seat) {
-    if (seat === undefined || seat === null) return { phase: 'idle', childId: '', elapsedMs: 0, fallback: false }
+    if (seat === undefined || seat === null) return { phase: 'idle', childId: '', elapsedMs: 0, fallback: false, activity: '', activityMs: 0 }
     const startedAt = typeof seat.startedAt === 'number' ? seat.startedAt : 0
     const finishedAt = typeof seat.finishedAt === 'number' ? seat.finishedAt : Date.now()
     return {
@@ -599,6 +620,8 @@ export function apply(ctx, config) {
       childId: typeof seat.childId === 'string' ? seat.childId : '',
       elapsedMs: startedAt === 0 ? 0 : Math.max(0, finishedAt - startedAt),
       fallback: seat.fallback === true,
+      activity: typeof seat.activity === 'string' ? seat.activity : '',
+      activityMs: typeof seat.activityAt === 'number' ? Math.max(0, Date.now() - seat.activityAt) : 0,
     }
   }
 
@@ -779,6 +802,8 @@ export function apply(ctx, config) {
     if (seat !== undefined && seat !== null) {
       seat.phase = 'starting'
       seat.startedAt = Date.now()
+      seat.activity = 'start'
+      seat.activityAt = Date.now()
     }
     let activation
     try {
@@ -798,6 +823,7 @@ export function apply(ctx, config) {
       if (seat !== undefined && seat !== null) {
         seat.phase = 'running'
         seat.childId = typeof activation.childId === 'string' ? activation.childId : ''
+        if (seat.childId !== '') liveSeatByChild.set(seat.childId, seat)
       }
       if (liveSeats !== undefined && liveSeats !== null) liveSeats.add(activation)
       const result = await withTimeout(
@@ -822,6 +848,7 @@ export function apply(ctx, config) {
       return text
     } finally {
       if (seat !== undefined && seat !== null && seat.phase !== 'done') seat.phase = 'closed'
+      if (seat !== undefined && seat !== null && seat.childId !== '') liveSeatByChild.delete(seat.childId)
       if (activation !== undefined) {
         if (liveSeats !== undefined && liveSeats !== null) liveSeats.delete(activation)
         try {
@@ -994,7 +1021,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v12', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v13', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -1003,7 +1030,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v12' })
+          sendJson(res, 200, { ok: true, build: 'v13' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
