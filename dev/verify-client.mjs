@@ -53,8 +53,8 @@ const MODEL3 = { provider: 'p2', model: 'm3', name: 'Model Three' }
 
 function answersFor(overrides) {
   return [
-    Object.assign({ key: 'p1|m1', provider: 'p1', model: 'm1', name: 'Model One', text: '答案一', done: true, error: '' }, overrides === undefined ? {} : overrides[0]),
-    Object.assign({ key: 'p1|m2', provider: 'p1', model: 'm2', name: 'Model Two', text: '答案二', done: true, error: '' }, overrides === undefined ? {} : overrides[1]),
+    Object.assign({ key: 'p1|m1', provider: 'p1', model: 'm1', name: 'Model One', text: '答案一', done: true, error: '', seat: { phase: 'done', elapsedMs: 4200, ttftMs: 900, fallback: false } }, overrides === undefined ? {} : overrides[0]),
+    Object.assign({ key: 'p1|m2', provider: 'p1', model: 'm2', name: 'Model Two', text: '答案二', done: true, error: '', seat: { phase: 'done', elapsedMs: 3100, fallback: true } }, overrides === undefined ? {} : overrides[1]),
   ]
 }
 
@@ -65,6 +65,7 @@ const SCENARIOS = [
     contextChars: 120, contextState: 'ok', useChairman: true,
     seatMode: 'subagent',
     filesState: 'ok', filesPaths: ['D:\\demo'], filesChars: 1200,
+    codeState: 'ok', codeFiles: 4, codeChars: 3000,
     answers: answersFor(),
     reviews: [
       { key: 'p1|m1', reviewer: 'Model One', text: '互评一', done: true, error: '' },
@@ -383,6 +384,8 @@ if (resumeCalls.length !== 1 || resumeCalls[0].mode !== 'wake') {
 const filesHtml = render(React.createElement(tabBody, { t }))
 if (!filesHtml.includes('已附带 1 个路径')) throw new Error('path-attachment note is missing after the run')
 if (!filesHtml.includes('本次使用只读 subagent 席位')) throw new Error('subagent-seat note is missing after the run')
+if (!filesHtml.includes('已附带源码 4 个文件')) throw new Error('source-pack note is missing after the run')
+if (!filesHtml.includes('首字 0.9s')) throw new Error('per-seat TTFT metric is missing after the run')
 
 /* Selection context menu: right-click a passage offers the council review item. */
 if (typeof command.icon !== 'function') throw new Error('command has no slash-menu icon')
