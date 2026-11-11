@@ -1,6 +1,6 @@
 {
   "name": "dsh-model-council",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": false,
   "repository": {
     "type": "git",
@@ -27,8 +27,9 @@
     "dsh": ">=0.2.2-rc.1 <0.3.0"
   },
   "scripts": {
-    "verify": "node dev/verify-client.mjs && node dev/verify-host.mjs",
+    "verify": "node dev/verify-client.mjs && node dev/verify-host.mjs && node dev/verify-runtime.mjs",
     "verify:host": "node dev/verify-host.mjs",
+    "verify:runtime": "node dev/verify-runtime.mjs",
     "syntax": "node --check index.js && node --check client.js"
   },
   "exports": {
