@@ -66,12 +66,19 @@ try {
   assert.ok(seatPack.text.includes('def main()') === false, 'no source text when seats have tools')
   assert.ok(seatPack.text.includes('main.py'), 'the directory tree still lists the files to grep')
 
-  /* Retry classification is word-bounded: token counts must not look like a 5xx. */
+  /* Retry classification is anchored: token counts, CJK text, and field names
+     never look like a 5xx; real transport failures do. */
   assert.equal(TRANSIENT_FAILURE.test('HTTP 429 too many requests'), true)
-  assert.equal(TRANSIENT_FAILURE.test('upstream 503'), true)
+  assert.equal(TRANSIENT_FAILURE.test('HTTP 503 Service Unavailable'), true)
+  assert.equal(TRANSIENT_FAILURE.test('upstream returned status: 502'), true)
   assert.equal(TRANSIENT_FAILURE.test('fetch failed'), true)
+  assert.equal(TRANSIENT_FAILURE.test('connect ETIMEDOUT 1.2.3.4:443'), true)
+  assert.equal(TRANSIENT_FAILURE.test('rate-limited by provider'), true)
   assert.equal(TRANSIENT_FAILURE.test('budget 5000 tokens exceeded'), false)
   assert.equal(TRANSIENT_FAILURE.test('model returned 2500 chars'), false)
+  assert.equal(TRANSIENT_FAILURE.test('输出 500 字后停止'), false)
+  assert.equal(TRANSIENT_FAILURE.test('timeoutMs is 300000'), false)
+  assert.equal(TRANSIENT_FAILURE.test('超过 500 毫秒'), false)
 
   /* A configured allowlist confines attachments to the workspace. */
   const confined = await collectPathContext('review D/dev/elsewhere', 2000, workspace, 0, false, [workspace])
@@ -89,7 +96,7 @@ try {
   assert.ok(watchdog !== null, 'README must state the watchdog window')
   assert.equal(Number(watchdog[1]), Math.round(RUN_TIMEOUT_MS / 60000), 'README watchdog drifted from RUN_TIMEOUT_MS')
   assert.ok(readme.includes(`${PROVIDER_CONCURRENCY} 并发`), 'README must state the provider concurrency')
-  assert.ok(readme.includes(`降级配额 ${MAX_FALLBACKS_PER_RUN}`), 'README must state the fallback quota')
+  assert.ok(readme.includes(`降级熔断 ${MAX_FALLBACKS_PER_RUN}`), 'README must state the fallback circuit-breaker quota')
 
   /* Behavioral contracts, not just numbers: the README must describe the
      shipped defaults and the actual delivery mechanism. */
