@@ -51,7 +51,8 @@ DeepSeek Harness 的多模型理事会插件：一个入口把问题交给多个
 | GET | `/council/models` | `{ providers, contextMaxChars, filesMaxChars }`，已过滤 embedding/rerank/图像/视频模型 |
 | GET | `/council/workspace?sessionId=` | 工作区识别：`{ cwd, source: session-header \| workspace-registry \| process, workspaceId, name }` |
 | POST | `/council/run` | `{ question, models, reviewers?, sessionId?, context?, attachFiles?, seatMode?: 'subagent' \| 'llm', useChairman?, chairman? }` → `{ runId }` |
-| GET | `/council/run/<id>` | 快照：阶段、`contextChars/contextState`、`filesState/filesPaths/filesChars`、`workspace`、`structure`、`seatMode`、`resumed`、各席位文本、互评、主席结论 |
+| GET | `/council/runs?sessionId=` | 最近 5 个运行快照（含仍在跑的），用于页面刷新/重开后接回运行 |
+| GET | `/council/run/<id>` | 快照：阶段、`contextChars/contextState`、`filesState/filesPaths/filesChars`、`workspace`、`structure`、`seatMode`、`resumed`、各席位文本与 `seat` 状态、互评、主席结论 |
 | POST | `/council/run/<id>/resume` | `{ mode: 'silent' \| 'wake' }`：静默注入（`agent.inject`）或直接唤醒（`agent.followup`）；每个结果只接受一次 |
 | POST | `/council/run/<id>/cancel` | 中止全部在途调用 |
 
@@ -94,6 +95,7 @@ council 不再只靠正则猜路径，而是按 Harness 自己的结构解析：
 - 左键选中的浮动条由内置 `quote` 交互独占（先注册先赢），理事会条目依赖 quick-quote 的渲染器；未装 quick-quote 时只留右键菜单。
 - 「结果回投」的**直接唤醒**会让主 Agent 立即回复（有意行为）；**静默注入**与 subagent 的投递边界一致：`send(msg, 'next-turn', false)` 只排队、不唤醒，结论在**下一轮用户消息**的 turn 边界进入上下文，不会打断当前 turn。
 - 上下文只取可见文本，不含工具调用与附件；路径附件只读文本类文件（1 MB 内），不读二进制、不跟随符号链接。
+- **运行中可停止**：运行中显示「停止」按钮；页面刷新/重新打开后会自动从 `GET /council/runs` 接回正在跑的 run（仍可点停止）。直接关闭浏览器窗口/标签页时，client 用 `navigator.sendBeacon` 通知 host 取消当前 run（`pagehide`），不会把后台运行留在无人看管状态。**关闭右侧栏 tab 不终止运行**（设计如此：重开 tab 可接回），要终止请点「停止」或关闭页面。
 - **subagent 席位只在作答阶段**：互评与主席走快速纯模型通道，避免 6 席 × 多阶段各开一整轮子代理导致假死；单席有启动 60s / 执行 240s 上限，超时或失败自动降级纯模型（卡片标「完成（降级）」），整轮另有 30 分钟 watchdog。卡片在运行中显示「启动中/运行中 Ns」。
 - **subagent 模式下路径附件默认关闭**：委员自己用只读工具读工作区，避免重复注入 20k 字；如需同时注入，走 API 显式传 `attachFiles: true`。
 - **subagent 席位较慢**：每席是一轮完整子代理（带工具），比纯模型调用慢数倍；子会话会出现在子代理侧栏。`council-readonly` preset 依赖 DSH 的 `dsh-persona`/`dsh-tool-fs`/`dsh-tool-fs-search`/`dsh-skill-filesystem`/`dsh-tool-skill` 模块名，升级 DSH 后若改名会注册失败并自动退回纯模型模式（UI 会提示）。
