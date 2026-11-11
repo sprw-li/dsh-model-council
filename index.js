@@ -1455,9 +1455,11 @@ export function apply(ctx, config) {
   async function callSeatSubagent(parent, route, system, userText, maxTokens, signal, cwd, seat, liveSeats, deadlineAt) {
     /** Seat budgets clamp to the run deadline so a seat can never outlive the run. */
     const remaining = () => (typeof deadlineAt === 'number' ? Math.max(0, deadlineAt - Date.now()) : Infinity)
-    const left = remaining()
-    if (left <= 0) throw new Error('整轮预算耗尽，不再启动席位')
-    const timeout = AbortSignal.timeout(Math.min(CALL_TIMEOUT_MS, left))
+    if (remaining() <= 0) throw new Error('整轮预算耗尽，不再启动席位')
+    /* All three seat windows call remaining() at the point of use, so no
+       window can be based on a stale snapshot (the first one used to reuse
+       a `left` value captured before the guard). */
+    const timeout = AbortSignal.timeout(Math.min(CALL_TIMEOUT_MS, remaining()))
     const combined = typeof AbortSignal.any === 'function' ? AbortSignal.any([signal, timeout]) : timeout
     if (seat !== undefined && seat !== null) {
       seat.phase = 'starting'
@@ -1973,7 +1975,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v39', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v40', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -1982,7 +1984,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v39' })
+          sendJson(res, 200, { ok: true, build: 'v40' })
           return
         }
         if (req.method === 'POST' && path === '/run') {

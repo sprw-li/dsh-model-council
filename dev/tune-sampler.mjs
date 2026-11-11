@@ -49,12 +49,37 @@ for (const [name, pattern] of Object.entries(wholeFor)) {
 const labelOk = labeled >= 3
 console.log(`${labelOk ? 'PASS' : 'MISS'}  wholeFunctionLabels(${labeled})`)
 let pass = wholePass + (labelOk ? 1 : 0)
+
+/* Region-scoped assertion: the three seat clamps must all sit INSIDE the
+   callSeatSubagent whole-function region. Checking the literals anywhere in
+   the pack let a truncated fragment pass while the body was cut. */
+function wholeRegion(headerRe) {
+  const match = headerRe.exec(block)
+  if (match === null) return undefined
+  const start = match.index
+  const next = block.indexOf('\n--- 关键区（', start + 10)
+  return block.slice(start, next === -1 ? block.length : next)
+}
+const seatRegion = wholeRegion(/关键区（第 \d+–\d+ 行，完整函数体） ---\n\s*(\/\*\*[\s\S]{0,400}?)?\s*async function callSeatSubagent/)
+const seatClampsInRegion = seatRegion === undefined ? {
+  seatZeroGuard: false, seatCombined: false, seatStart: false, seatResult: false,
+} : {
+  seatZeroGuard: seatRegion.includes('整轮预算耗尽，不再启动席位'),
+  seatCombined: seatRegion.includes('AbortSignal.timeout(Math.min(CALL_TIMEOUT_MS, remaining()))'),
+  seatStart: seatRegion.includes('Math.min(SEAT_START_TIMEOUT_MS, remaining())'),
+  seatResult: seatRegion.includes('Math.min(SEAT_RESULT_TIMEOUT_MS, remaining())'),
+}
+for (const [name, ok] of Object.entries(seatClampsInRegion)) {
+  if (ok) pass += 1
+  console.log(`${ok ? 'PASS' : 'MISS'}  inRegion(${name})`)
+}
+
 for (const [name, literal] of Object.entries(MUST)) {
   const ok = block.includes(literal)
   if (ok) pass += 1
   console.log(`${ok ? 'PASS' : 'MISS'}  ${name}`)
 }
-const total = Object.keys(MUST).length + Object.keys(wholeFor).length + 1
+const total = Object.keys(MUST).length + Object.keys(wholeFor).length + 1 + Object.keys(seatClampsInRegion).length
 console.log(`\n${pass}/${total} covered | chars=${code.chars}`)
 
 /* D-(iii): re-run the sampler with the REAL acceptance question's hint set —
