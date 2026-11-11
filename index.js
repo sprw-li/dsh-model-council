@@ -435,7 +435,9 @@ async function readCodeSegments(path, budget, hints = []) {
   if (whole.length <= budget) {
     return { text: whole, truncated: false, totalLines: lines.length }
   }
-  /* Locate hint hits; cluster windows around the densest run of hits. */
+  /* Locate hint hits; cluster them and sample the densest clusters. One
+     window could not cover an implementation spread across several functions
+     (deadline plumbing spans 5 clusters in this very file). */
   const lowerHints = hints.filter((hint) => typeof hint === 'string' && hint.length >= 4)
   const hits = []
   if (lowerHints.length > 0) {
@@ -444,32 +446,51 @@ async function readCodeSegments(path, budget, hints = []) {
       if (lowerHints.some((hint) => lower.includes(hint))) hits.push(index)
     }
   }
-  let anchorStart = Math.floor(lines.length / 2)
-  let bestCount = -1
+  const totalLines = lines.length
+  let regions = []
   if (hits.length > 0) {
-    const windowLines = Math.max(20, Math.floor((budget * 0.7) / 60))
-    for (const start of [0, ...hits]) {
-      const from = Math.max(0, start - Math.floor(windowLines / 4))
-      const count = hits.filter((line) => line >= from && line < from + windowLines).length
-      if (count > bestCount) {
-        bestCount = count
-        anchorStart = from
+    /* Group hits into clusters with a 40-line gap tolerance. */
+    const clusters = []
+    let run = [hits[0]]
+    for (let index = 1; index < hits.length; index += 1) {
+      if (hits[index] - hits[index - 1] <= 40) run.push(hits[index])
+      else {
+        clusters.push(run)
+        run = [hits[index]]
       }
     }
+    clusters.push(run)
+    clusters.sort((a, b) => b.length - a.length)
+    /* Budget the anchor share (75%) across up to 6 clusters by hit count. */
+    const anchorBudget = Math.floor(budget * 0.75)
+    const chosen = clusters.slice(0, 6)
+    const weightSum = chosen.reduce((sum, cluster) => sum + cluster.length, 0)
+    for (const cluster of chosen) {
+      const share = Math.max(600, Math.floor((anchorBudget * cluster.length) / Math.max(1, weightSum)))
+      const clusterLines = Math.max(20, Math.floor(share / 60))
+      const from = Math.max(0, cluster[0] - 5)
+      const to = Math.min(totalLines, cluster[cluster.length - 1] + 6 + clusterLines - (cluster[cluster.length - 1] - cluster[0]))
+      regions.push({ from: Math.max(0, Math.min(from, cluster[0])), to: Math.max(to, cluster[cluster.length - 1] + 1), share })
+    }
+  } else {
+    const mid = Math.floor(totalLines / 2)
+    const clusterLines = Math.max(20, Math.floor((budget * 0.7) / 60))
+    regions = [{ from: Math.max(0, mid - Math.floor(clusterLines / 2)), to: Math.min(totalLines, mid + Math.ceil(clusterLines / 2)), share: Math.floor(budget * 0.7) }]
   }
-  const anchorEnd = Math.min(lines.length, anchorStart + Math.max(20, Math.floor((budget * 0.7) / 60))
-    + Math.max(1, bestCount > 0 ? 0 : 0))
-  const anchor = lines.slice(anchorStart, anchorEnd).join('\n')
-  const headLines = Math.max(5, Math.floor((budget * 0.2) / 80))
+  const headLines = Math.max(5, Math.floor((budget * 0.1) / 80))
   const head = lines.slice(0, headLines).join('\n')
+  const regionTexts = []
+  for (const region of regions) {
+    const text = lines.slice(region.from, region.to).join('\n')
+    regionTexts.push(`--- 关键区（第 ${region.from + 1}–${region.to} 行） ---\n${text.length > region.share ? text.slice(0, region.share) + '\n…（区内截断）' : text}`)
+  }
   const text = [
-    `（文件共 ${lines.length} 行 / ${whole.length} 字，采样：头部 ${headLines} 行 + 关键区（第 ${anchorStart + 1}–${anchorEnd} 行${hits.length > 0 ? `，按问题关键词命中 ${hits.length} 处定位` : '，中段'}），其余省略）`,
+    `（文件共 ${totalLines} 行 / ${whole.length} 字，采样：头部 ${headLines} 行 + ${regions.length} 个关键区（按问题关键词命中 ${hits.length} 处定位），其余省略）`,
     '--- 头部 ---',
     head,
-    '--- 关键区（问题相关） ---',
-    anchor,
+    ...regionTexts,
   ].join('\n')
-  return { text: text.length > budget ? text.slice(0, budget) : text, truncated: true, totalLines: lines.length }
+  return { text: text.length > budget ? text.slice(0, budget) : text, truncated: true, totalLines }
 }
 
 /** Bounded source-code pack for review questions: real files the models can cite. */
@@ -1854,7 +1875,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v33', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v34', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -1863,7 +1884,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v33' })
+          sendJson(res, 200, { ok: true, build: 'v34' })
           return
         }
         if (req.method === 'POST' && path === '/run') {

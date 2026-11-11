@@ -65,6 +65,22 @@ try {
     assert.ok(pack.text.includes('implementation_marker'), 'anchored pack centers the hint-matching region')
     assert.ok(pack.text.includes('关键区'), 'anchored pack labels its sampling')
   }
+
+  /* Multi-cluster coverage: when key terms hit several distant regions, ALL
+     major clusters must appear — a single densest window missed three of the
+     four deadline mechanisms in a real acceptance run. */
+  {
+    const spread = join(workspace, 'pkg', 'spread.py')
+    const filler = Array.from({ length: 400 }, () => '# gap').join('\n')
+    const r1 = 'def cluster_one():\n    DEADLINE_A = 1'
+    const r2 = 'def cluster_two():\n    DEADLINE_B = 2'
+    const r3 = 'def cluster_three():\n    DEADLINE_C = 3'
+    await writeFile(spread, [r1, filler, r2, filler, r3].join('\n'))
+    const pack = await collectCodeContext([join(workspace, 'pkg')], 6000, ['deadline', 'cluster'])
+    assert.ok(pack.text.includes('cluster_one'), 'multi-cluster pack covers region 1')
+    assert.ok(pack.text.includes('cluster_two'), 'multi-cluster pack covers region 2')
+    assert.ok(pack.text.includes('cluster_three'), 'multi-cluster pack covers region 3')
+  }
   const reviewPack = await collectPathContext('评审这个项目', 6000, workspace, 5000)
   assert.equal(reviewPack.codeState, 'ok')
   assert.ok(reviewPack.codeFiles >= 2, `review code files: ${reviewPack.codeFiles}`)

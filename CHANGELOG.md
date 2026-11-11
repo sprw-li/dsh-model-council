@@ -1,3 +1,10 @@
+# 0.2.7
+
+self-loop 第 6 圈（终审附件采样回归修复）：
+
+- **多簇采样**：v0.2.6 的单窗口锚定在终审 run 里只把 deadlineWall 段（L1772–1865）放进附件，deadline 四项实现分布在 5 个簇（L1028/1088/1336/1446/1795），单窗口必然漏 3 项——验证 subagent 交叉确认「采样回归，非实现缺失」。现在 `readCodeSegments` 将命中按 40 行容差聚类，取 top-6 簇按命中权重分配 75% 预算，每簇独立标注行号区间。实测：`deadlineAt / attemptTimeout / callModel 函数体 / callSeatSubagent / deadlineWall / Seat budgets clamp 注释` 全部入包。
+- 回归断言新增多簇覆盖用例（三个相距 400 行的簇必须全部出现）。
+
 # 0.2.6
 
 self-loop 第 5 圈（源码包可视性根因修复）：
