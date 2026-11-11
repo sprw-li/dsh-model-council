@@ -55,6 +55,13 @@ try {
   assert.ok(reviewPack.text.includes('main.py'), 'review pack must include source text')
   assert.ok(typeof reviewPack.codeDiscovered === 'number', 'review pack reports discovered count')
 
+  /* Acceptance-style questions also get the source pack: 验收/复审 must not
+     silently disable it (a real run regressed this way once). */
+  const acceptancePack = await collectPathContext('验收：deadline 实现是否正确', 2000, workspace, 1200)
+  assert.equal(acceptancePack.codeState, 'ok', '验收 questions must attach the source pack')
+  const reAcceptancePack = await collectPathContext('复审：改判通过与否', 2000, workspace, 1200)
+  assert.equal(reAcceptancePack.codeState, 'ok', '复审 questions must attach the source pack')
+
   /* A named project directory inside the workspace wins over the whole workspace. */
   const projectPack = await collectPathContext('全项目审查 pkg', 4000, workspace, 2000)
   assert.ok(projectPack.paths[0].toLowerCase().endsWith('pkg'), `named dir: ${JSON.stringify(projectPack.paths)}`)
@@ -145,6 +152,13 @@ try {
   const clampSeat = (seatMs, deadlineAt, now) => Math.min(seatMs, Math.max(0, deadlineAt - now))
   assert.equal(clampSeat(60000, 1000, 0), 1000, 'seat start clamps to the remaining run budget')
   assert.equal(clampSeat(240000, 100, 500), 0, 'an expired run leaves no seat result budget')
+
+  /* Tool wait hard wall: the external wait ends AT the run deadline even when
+     the executor's cleanup grace (+30s) is longer than the remaining budget. */
+  const externalWait = (deadlineAt, now, graceMs) => Math.min(deadlineAt - now + graceMs, deadlineAt - now <= 0 ? 0 : deadlineAt - now)
+  assert.equal(externalWait(1000, 0, 30000), 1000, 'the visible wait stops at the deadline, not deadline+grace')
+  assert.equal(externalWait(500, 400, 30000), 100, 'remaining < grace still waits only the remaining budget')
+  assert.equal(externalWait(0, 0, 30000), 0, 'an expired deadline means zero external wait')
 
   /* runLimited never exceeds its window. */
   let active = 0
