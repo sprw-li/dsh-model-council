@@ -606,7 +606,7 @@ async function readCodeSegments(path, budget, hints = []) {
             const from = Math.max(0, index - 3)
             const to = Math.min(totalLines, index + 12)
             if (!regions.some((region) => from >= region.from && to <= region.to)) {
-              regions.push({ from, to, share: 1600 })
+              regions.push({ from, to, share: 1600, named: true })
             }
             break
           }
@@ -623,7 +623,7 @@ async function readCodeSegments(path, budget, hints = []) {
           const from = Math.max(0, index - 3)
           const to = Math.min(totalLines, index + 8)
           if (regions.some((region) => from >= region.from && to <= region.to)) continue
-          regions.push({ from, to, share: 1200 })
+          regions.push({ from, to, share: 1200, named: true })
           windows += 1
         }
       }
@@ -660,9 +660,15 @@ async function readCodeSegments(path, budget, hints = []) {
   }
   const headLines = Math.max(5, Math.floor((budget * 0.1) / 80))
   const head = lines.slice(0, headLines).join('\n')
-  /* Whole-function regions FIRST: they are the question's explicit asks and
-     must never be the part cut by the final clamp when cluster text overflows. */
-  const ordered = [...regions].sort((a, b) => (b.share === Number.MAX_SAFE_INTEGER ? 1 : 0) - (a.share === Number.MAX_SAFE_INTEGER ? 1 : 0))
+  /* Whole-function regions FIRST, then the windows around symbols the question
+     names, then broad keyword clusters: the final clamp cuts the tail, and a
+     precise line the reviewer was asked about must never be the casualty. */
+  const regionRank = (region) => {
+    if (region.share === Number.MAX_SAFE_INTEGER) return 0
+    if (region.named === true) return 1
+    return 2
+  }
+  const ordered = [...regions].sort((a, b) => regionRank(a) - regionRank(b))
   const regionTexts = []
   for (const region of ordered) {
     const text = lines.slice(region.from, region.to).join('\n')
@@ -2117,7 +2123,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v52', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v53', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -2126,7 +2132,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v52' })
+          sendJson(res, 200, { ok: true, build: 'v53' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
