@@ -15,6 +15,7 @@
 - 修复推理模型「断线」：作答 16384 tokens、单次调用超时 300s；流以 max-tokens 收尾且无正文时自动翻倍到 32768 重试一次。
 - 席位调度：subagent 只用于作答阶段，互评/主席走快速纯模型；席位启动 60s / 执行 240s 超时、失败自动降级纯模型；卡片显示「启动中/运行中 Ns」「完成（降级）」；整轮 30 分钟 watchdog；`GET /council/diag` 暴露运行与子代理诊断。
 - 停止与接回：运行中显示「停止」；`GET /council/runs?sessionId=` 让页面刷新/重开后自动接回在跑的 run；`pagehide` 时用 `sendBeacon` 取消当前 run（关闭窗口不再留下失控后台运行）。
+- 评审源码包：评审类问题自动附加真实源码（≤24 文件、单文件 4k、总预算 `codeMaxChars` 默认 40k，路径标注），提示词强制引用文件路径与【推断】标注；快照 `codeState/codeFiles/codeChars`，UI 显示「已附带源码 N 个文件」。
 - 稳定性硬化：终态写一次（`finishRun`）；watchdog/cancel 统一 dispose 席位；每 provider 全局 4 并发 + 瞬态失败退避重试；每 run 降级配额 3；同会话单 run（409）+ 前端自动接回；运行注册表持久化到 `~/.dsh/council-runs.json`（Host 重启显示「运行中断」）。
 - 安全硬化：`@mention` 拒绝工作区穿越；路径附件拒绝符号链接与密钥类文件（`.env`/`.pem`/`.key`/`.ssh`/`.aws`/`.kube` 等）；`npm run verify` 增加 host harness（路径/穿越/密钥/超时/并发窗口）。
 - Skill 接入：只读席位可加载 skill（`skill-filesystem` + `tool-skill`）；`skillDirs` 配置/自动探测 `D:\agent-library\catalog`，实测席位成功加载 `office-xlsx` 并复述 `# Excel workbooks`；席位只读，不执行 skill 脚本。

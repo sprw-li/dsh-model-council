@@ -362,7 +362,7 @@ if (fetchCalls.some((call) => call.url === '/council/run' && call.method === 'PO
 }
 
 const tabHtml = render(tabBody === undefined ? null : React.createElement(tabBody, { t }))
-for (const expected of ['多模型理事会', '开始评审', '主席模型', '接当前对话上下文', '自动附带问题里的本地路径', 'subagent 只读席位', '会话工作区：demo', '静默注入主聊天', '直接唤醒主聊天', '不做（只留在右侧栏）']) {
+for (const expected of ['多模型理事会', '开始评审', '主席模型', '接当前对话上下文', '自动附带问题里的本地路径', 'subagent 只读席位', '会话工作区：demo', '静默放进上下文', '直接唤醒主聊天', '不做（只留在右侧栏）']) {
   if (!tabHtml.includes(expected)) throw new Error(`tab body missing "${expected}": ${tabHtml.slice(0, 400)}`)
 }
 if (styleTags.length !== 1) throw new Error(`expected one injected style tag, got ${styleTags.length}`)
@@ -476,7 +476,7 @@ if (!failHtml.includes('所有模型作答失败')) throw new Error('all-fail er
 if (resumeCalls.length !== 2) throw new Error('a failed run must not be delivered to the chat')
 
 /* Silent delivery: inject the conclusion without waking the main Agent. */
-const silentRadio = findRadioByLabel(build(tabBody({ t })), '静默注入主聊天')
+const silentRadio = findRadioByLabel(build(tabBody({ t })), '静默放进上下文')
 if (silentRadio === undefined) throw new Error('silent feedback option is missing')
 silentRadio.props.onChange()
 const silentButton = findRunButton(build(tabBody({ t })))
@@ -488,7 +488,7 @@ if (silentResume === undefined || silentResume.mode !== 'silent') {
   throw new Error(`silent delivery missing: ${JSON.stringify(resumeCalls)}`)
 }
 const silentHtml = render(React.createElement(tabBody, { t }))
-if (!silentHtml.includes('已静默注入')) throw new Error('silent delivery note is missing')
+if (!silentHtml.includes('已静默放进上下文')) throw new Error('silent delivery note is missing')
 
 for (const cleanup of cleanups.reverse()) {
   try {
