@@ -1,3 +1,21 @@
+# 0.2.22
+
+**点名项目目录被 callerCwd 抢先**：在 workspace 根评审 `dsh-council` 时，
+`callerCwd` 兜底先触发，于是永远附上根目录（`ai-agent-book/`、`_work/` 等），
+被点名的项目反而一个字节都不进包。现在顺序是：**点名目录 → callerCwd → workspace**。
+
+- **关键文档头+尾采样**：README 的行为契约在 75% 处，8000 字头部读取会把整段契约截掉；
+  超预算的关键文件改取头 55% + 尾 45%，契约段因此可见。
+- **点名符号窗口**：问题里出现的标识符（`draftBridge`、`stopEventStream`…）各取 1–2 个小窗口，
+  即使不在任何关键词簇里也能被核验。
+- 结果：`dsh-council` 评审现在同时附带 `client.js` 机制代码与 README 契约原文。
+
+# 0.2.21
+
+- **轮询调度器自带 leader 门禁**：`schedulePoll` / `schedulePollRetry` 现在自己拒绝为非 leader
+  装载定时器，于是「所有转轮询路径都受 `isPollLeader` 门禁」成为**局部可验证的不变量**，
+  不再依赖调用点逐个检查（复审正是卡在这条全称命题上）。`dev/verify-client.mjs` 加断言。
+
 # 0.2.20
 
 **附件选错项目**（顶层调用时评审收到别的项目的文件）：
