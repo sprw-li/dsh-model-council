@@ -1,3 +1,40 @@
+# 0.2.12
+
+自我循环第 11 圈：**客户端半首次被评审**，并修掉采样器的假定义缺陷。
+
+## 客户端半（client.js）
+
+- **多标签双投递 + 409 当错误**（P0）：事件流不受 leader 约束，每个标签挂载都会接回 run，
+  done 时各自 POST `/resume`；输的那个把宿主 409「该结果已回投过」渲染成红色错误。
+  现在 `resumeRun` 先过 `isPollLeader()`，并把 409 视为**成功**（宿主本来就 once-only）。
+- **leader 选举实际失效**（P0）：`leaderSeenAt` 同时被对端消息和自己的 `postMessage` 刷新，
+  `isPollLeader()` 退化成「最近 2.5s 内有动静」，两个标签大部分时间都自认 leader ⇒ 双份轮询。
+  改为 `myClaimAt` 与自己比较：持有租约者每 800ms 续租、跟随者沉默满 2500ms 才接管，
+  并加确定性 tie-break（tabId 字典序），旧 channel 用 `closeLeaderChannel()` 关闭。
+- **一次网络抖动丢掉仍在跑的 run**（P0）：`pollRun` 的 catch 原来直接 `running:false, run:null`，
+  run 在宿主继续跑、UI 却回到可再次发起。现在保留 runId/running，指数退避重试，连续 8 次才放弃；
+  仅 404（宿主确实忘了该 run）立即终结。
+- **SSE 半开永久卡 running**（P0）：流建立后不发消息也不断连时，onmessage/onerror 都不触发。
+  新增 `STREAM_STALL_MS=8000` 看门狗：每帧重挂，超时即关闭并切到轮询。
+- **切会话不停旧连接**（P1）：`switchSession` 先 `stopPolling()`+`stopEventStream()` 再切。
+- **条件式 Hook 调用**（P0）：`props.useInput` 是否存在原先决定是否调用 Hook。
+  改为按 **组件类型** 分支（`CouncilBridgeWithInput` / `CouncilBridgeStatic`），
+  bridge 写入移进 `useEffect`，渲染期不再写模块单例。
+
+## 采样器
+
+- **假函数定义吞掉整簇**（P0）：`const runId = store.state.runId`、`const React = require('react')`
+  被当成函数定义，def 窗口把 340 行关键词簇整块替换掉——正好是评审要看的 SSE/选举代码。
+  现在 def 判定必须带形参表或为函数/箭头表达式，且 def 区**独立保留**、不替换簇区。
+- `CODE_MAX_CHARS` 40000 → 60000：整函数区与簇区并存后需要更多预算。
+- 验收门升级：19 项 + 真实 deadline 问题 4/4 + **客户端问题 4/4**（新增假定义回归用例）。
+
+## 测试
+
+- `dev/verify-client.mjs`：fake React 现在有真正的 effect 调度器（`flushEffects`），
+  旧实现 `useEffect(){}` 让「只在渲染期写状态」的组件也能蒙混过关。
+  新增故障注入：`/resume` 返回 409 不得显示为错误；单次轮询失败不得丢弃运行中的 run。
+
 # 0.2.11
 
 **修复终审标【推断】的一条真实资源泄漏**（自我循环第 10 圈自检发现）：
