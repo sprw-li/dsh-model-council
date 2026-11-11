@@ -561,11 +561,15 @@ async function readCodeSegments(path, budget, hints = []) {
   }
   const headLines = Math.max(5, Math.floor((budget * 0.1) / 80))
   const head = lines.slice(0, headLines).join('\n')
+  /* Whole-function regions FIRST: they are the question's explicit asks and
+     must never be the part cut by the final clamp when cluster text overflows. */
+  const ordered = [...regions].sort((a, b) => (b.share === Number.MAX_SAFE_INTEGER ? 1 : 0) - (a.share === Number.MAX_SAFE_INTEGER ? 1 : 0))
   const regionTexts = []
-  for (const region of regions) {
+  for (const region of ordered) {
     const text = lines.slice(region.from, region.to).join('\n')
-    regionTexts.push(`--- 关键区（第 ${region.from + 1}–${region.to} 行） ---\n${text.length > region.share ? text.slice(0, region.share) + '\n…（区内截断，本区共 ' + (region.to - region.from) + ' 行）' : text}`)
-  }  /* Function-definition regions are exempt from every clamp: they were
+    regionTexts.push(`--- 关键区（第 ${region.from + 1}–${region.to} 行${region.share === Number.MAX_SAFE_INTEGER ? '，完整函数体' : ''}） ---\n${text.length > region.share ? text.slice(0, region.share) + '\n…（区内截断，本区共 ' + (region.to - region.from) + ' 行）' : text}`)
+  }
+  /* Function-definition regions are exempt from every clamp: they were
      hand-picked by the question and a cut body was the recurring failure. */
   const defRegions = regions.filter((region) => region.share === Number.MAX_SAFE_INTEGER)
   const defAllowance = defRegions.reduce((sum, region) => {
@@ -573,7 +577,7 @@ async function readCodeSegments(path, budget, hints = []) {
     return sum + body.length + 80
   }, 0)
   const text = [
-    `（文件共 ${totalLines} 行 / ${whole.length} 字，采样：头部 ${headLines} 行 + ${regions.length} 个关键区（按问题关键词命中 ${hits.length} 处定位），其余省略）`,
+    `（文件共 ${totalLines} 行 / ${whole.length} 字，采样：头部 ${headLines} 行 + ${regions.length} 个关键区（其中 ${defRegions.length} 个为问题点名函数的完整函数体），其余省略）`,
     '--- 头部 ---',
     head,
     ...regionTexts,
@@ -1967,7 +1971,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v36', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v37', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -1976,7 +1980,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v36' })
+          sendJson(res, 200, { ok: true, build: 'v37' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
