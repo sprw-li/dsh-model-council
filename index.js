@@ -415,21 +415,29 @@ async function collectSourceFiles(root, hints = []) {
 /** Bounded source-code pack for review questions: real files the models can cite. */
 async function collectCodeContext(roots, maxChars, hints = []) {
   const files = []
+  let discovered = 0
   for (const root of roots) {
-    if (files.length >= CODE_MAX_FILES) break
-    for (const file of await collectSourceFiles(root, hints)) {
+    const found = await collectSourceFiles(root, hints)
+    discovered += found.length
+    if (files.length >= CODE_MAX_FILES) continue
+    for (const file of found) {
       if (files.length >= CODE_MAX_FILES) break
       files.push(file)
     }
   }
-  const parts = [`【工作区源码附件】选取 ${files.length} 个源码文件（单文件 ≤${CODE_FILE_CHARS} 字，总预算 ${maxChars} 字）`]
+  const parts = [
+    `【工作区源码附件】发现 ${discovered} 个源码文件，选取 ${files.length} 个（单文件 ≤${CODE_FILE_CHARS} 字，总预算 ${maxChars} 字）。`,
+    `覆盖率声明：以下为抽样初审而非全项目审查；未附文件约 ${Math.max(0, discovered - files.length)} 个，结论未覆盖处须标【推断】。`,
+  ]
   let used = 0
   let included = 0
+  let truncated = 0
   for (const file of files) {
     const budget = Math.min(CODE_FILE_CHARS, maxChars - used)
     if (budget < 200) break
     const content = await readTextFile(file.path, budget)
     if (content === '') continue
+    if (content.includes('…（已截断）')) truncated += 1
     parts.push(`--- ${file.path} ---`, content)
     used += content.length
     included += 1
@@ -438,6 +446,8 @@ async function collectCodeContext(roots, maxChars, hints = []) {
     text: included === 0 ? '' : parts.join('\n'),
     chars: used,
     files: included,
+    discovered,
+    truncated,
     state: included === 0 ? 'none' : 'ok',
   }
 }
@@ -502,6 +512,8 @@ async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars
   let codeState = 'off'
   let codeChars = 0
   let codeFiles = 0
+  let codeDiscovered = 0
+  let codeTruncated = 0
   const wantsCode = allowCode && typeof codeMaxChars === 'number' && codeMaxChars > 0
     && REVIEW_INTENT.test(String(question || '')) && dirs.length > 0
   if (wantsCode) {
@@ -509,6 +521,8 @@ async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars
     codeState = code.state
     codeChars = code.chars
     codeFiles = code.files
+    codeDiscovered = code.discovered === undefined ? 0 : code.discovered
+    codeTruncated = code.truncated === undefined ? 0 : code.truncated
     if (code.text !== '') sections.push(code.text)
   }
   const text = sections.join('\n\n')
@@ -520,6 +534,8 @@ async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars
     codeState,
     codeChars,
     codeFiles,
+    codeDiscovered,
+    codeTruncated,
   }
 }
 
@@ -1027,6 +1043,9 @@ export function apply(ctx, config) {
       codeState: run.codeState === undefined ? 'off' : run.codeState,
       codeFiles: run.codeFiles === undefined ? 0 : run.codeFiles,
       codeChars: run.codeChars === undefined ? 0 : run.codeChars,
+      /* Coverage: what the source pack did and did not reach. */
+      codeDiscovered: run.codeDiscovered === undefined ? 0 : run.codeDiscovered,
+      codeTruncated: run.codeTruncated === undefined ? 0 : run.codeTruncated,
       workspace: run.workspace === undefined ? { cwd: '', source: 'none', workspaceId: '', name: '' } : run.workspace,
       structure: run.structure === undefined ? { roles: {}, stages: [] } : run.structure,
       seatMode: run.seatMode === undefined ? 'llm' : run.seatMode,
@@ -1539,6 +1558,8 @@ export function apply(ctx, config) {
       let codeState = 'off'
       let codeFiles = 0
       let codeChars = 0
+      let codeDiscovered = 0
+      let codeTruncated = 0
       if (input.attachFiles !== false) {
         const files = await collectPathContext(
           question, filesMaxChars, workspace.cwd, codeMaxChars, true, attachRoots,
@@ -1549,6 +1570,8 @@ export function apply(ctx, config) {
         codeState = files.codeState
         codeFiles = files.codeFiles
         codeChars = files.codeChars
+        codeDiscovered = files.codeDiscovered === undefined ? 0 : files.codeDiscovered
+        codeTruncated = files.codeTruncated === undefined ? 0 : files.codeTruncated
         if (files.text !== '') contextParts.push(files.text)
       }
       const routes = {}
@@ -1568,6 +1591,8 @@ export function apply(ctx, config) {
         codeState,
         codeFiles,
         codeChars,
+        codeDiscovered,
+        codeTruncated,
         workspace,
         structure: {
           roles: {
@@ -1673,7 +1698,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v25', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v26', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -1682,7 +1707,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v25' })
+          sendJson(res, 200, { ok: true, build: 'v26' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
@@ -1792,6 +1817,8 @@ export function apply(ctx, config) {
              seat keeps the bounded source pack attached. */
           const allowCode = seatMode !== 'subagent'
             || (typeof requestedSeats === 'number' && requestedSeats < selected.length)
+          let codeDiscovered = 0
+          let codeTruncated = 0
           if (body.attachFiles !== false) {
             const files = await collectPathContext(
               question, filesMaxChars, workspace.cwd, codeMaxChars, allowCode, attachRoots,
@@ -1802,6 +1829,8 @@ export function apply(ctx, config) {
             codeState = files.codeState
             codeFiles = files.codeFiles
             codeChars = files.codeChars
+            codeDiscovered = files.codeDiscovered === undefined ? 0 : files.codeDiscovered
+            codeTruncated = files.codeTruncated === undefined ? 0 : files.codeTruncated
             if (files.text !== '') contextParts.push(files.text)
           }
           const structure = {
@@ -1835,6 +1864,8 @@ export function apply(ctx, config) {
             codeState,
             codeFiles,
             codeChars,
+            codeDiscovered,
+            codeTruncated,
             workspace,
             structure,
             contextBlock: contextParts.join('\n\n'),

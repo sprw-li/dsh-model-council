@@ -47,10 +47,13 @@ try {
   assert.ok(code.files >= 2, `code files: ${code.files}`)
   assert.ok(code.text.includes('main.py'), 'code pack must include real file paths')
   assert.ok(code.chars <= 1200, `code budget: ${code.chars}`)
+  assert.ok(typeof code.discovered === 'number' && code.discovered >= code.files, `coverage discovered: ${JSON.stringify(code)}`)
+  assert.ok(code.text.includes('覆盖率声明'), 'code pack must carry the coverage disclaimer')
   const reviewPack = await collectPathContext('评审这个项目', 2000, workspace, 1200)
   assert.equal(reviewPack.codeState, 'ok')
   assert.ok(reviewPack.codeFiles >= 2, `review code files: ${reviewPack.codeFiles}`)
   assert.ok(reviewPack.text.includes('main.py'), 'review pack must include source text')
+  assert.ok(typeof reviewPack.codeDiscovered === 'number', 'review pack reports discovered count')
 
   /* A named project directory inside the workspace wins over the whole workspace. */
   const projectPack = await collectPathContext('全项目审查 pkg', 4000, workspace, 2000)
@@ -87,6 +90,19 @@ try {
   assert.equal(Number(watchdog[1]), Math.round(RUN_TIMEOUT_MS / 60000), 'README watchdog drifted from RUN_TIMEOUT_MS')
   assert.ok(readme.includes(`${PROVIDER_CONCURRENCY} 并发`), 'README must state the provider concurrency')
   assert.ok(readme.includes(`降级配额 ${MAX_FALLBACKS_PER_RUN}`), 'README must state the fallback quota')
+
+  /* Behavioral contracts, not just numbers: the README must describe the
+     shipped defaults and the actual delivery mechanism. */
+  assert.ok(readme.includes('agent.inject()'), 'README must describe silent delivery as agent.inject()')
+  assert.ok(!readme.includes("send(msg, 'next-turn', false)"), 'README must not claim the retired next-turn queue semantics')
+  const feedbackRow = /\| \*\*结果回投\*\*（三元） \| (不做|静默放进上下文|直接唤醒) \|/.exec(readme)
+  assert.ok(feedbackRow !== null, 'README must state the feedback default')
+  assert.equal(feedbackRow[1], '不做', 'feedback must ship disabled (sidebar-only) by default')
+  const seatRow = /\| \*\*subagent 只读席位（混合）\*\* \| (开|关) \|/.exec(readme)
+  assert.ok(seatRow !== null, 'README must state the subagent-seat default')
+  assert.equal(seatRow[1], '关', 'subagent seats must ship disabled by default')
+  const npmClaim = /0\.1\.0/.test(readme) && readme.includes('0.2.0 未发布')
+  assert.ok(npmClaim, 'README must distinguish the published npm version (0.1.0) from the unreleased 0.2.0')
 
   /* The tool's auto-pick must be heterogeneous: one provider, one model name each. */
   const catalog = {

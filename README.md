@@ -22,7 +22,7 @@ DeepSeek Harness 的多模型理事会插件：一个入口把问题交给多个
 | --- | --- | --- |
 | **接当前对话上下文** | 开 | 把当前会话最近约 6000 字可见文本附在问题前；失败自动降级为只发问题并提示。 |
 | **自动附带问题里的本地路径** | 开 | 问题中出现的本地绝对路径（如 `D:\dev\项目`，也兼容 `D/dev/项目` 写法）会自动读取：目录树（深度 2）+ 关键文件（README/SKILL/CLAUDE/AGENTS/CHECKPOINT/pyproject/package.json/ARCHITECTURE/STATUS/DEFAULTS/RELEASE/DECISIONS 等，最多 6 个、单文件 8k 字、总 20k 字），跳过 `.git`/`node_modules`/`runs`/密钥类文件。**没写路径但问题提到「工作区/项目/仓库」时，自动改用当前会话工作区**（`SessionHeader.cwd` → workspace registry → Host cwd 兜底）；也支持 `@相对路径`。 |
-| **结果回投**（三元） | 不做 | 运行结束后如何处置结论：<br>**不做** = 只留在右侧栏；<br>**静默注入** = 按 subagent 的 turn 边界语义 `send(msg, 'next-turn', false)`：结论排到**下一轮**，不唤醒主 Agent，也不会在当前 turn 中途插话；<br>**直接唤醒** = `followup()`（即 subagent parent 投递）：排一个普通后续 turn，立即让主 Agent 回复。 |
+| **结果回投**（三元） | 不做 | 运行结束后如何处置结论：<br>**不做** = 只留在右侧栏；<br>**静默放进上下文** = `agent.inject()`：结论作为上下文在下一次模型请求前注入，不占用 inbox 队列、不唤醒主 Agent、不会在当前 turn 中途插话；<br>**直接唤醒** = `followup()`（即 subagent parent 投递）：排一个普通后续 turn，立即让主 Agent 回复。 |
 | **subagent 只读席位（混合）** | 关 | 开启后**前 N 个**委员是只读子代理（`spawn` + `council-readonly` Agent Preset：只读文件、搜索、加载 skill），其余走快速纯模型流式通道；`subagentSeats` 滑杆选 N（1–5，默认 2）。全关 = 全部纯模型。subagent 席位整轮结束才出正文，快速席位逐字流式。 |
 | **主席汇总（关闭=无主）** | 开 | 关掉则只出各模型答案与匿名互评，不做主席结论。 |
 
@@ -66,7 +66,7 @@ council 不再只靠正则猜路径，而是按 Harness 自己的结构解析：
 | 概念 | council 里的映射 |
 | --- | --- |
 | **工作区识别** | `SessionHeader.cwd`（权威）→ `ctx.workspaceRegistry.list()` 的 Workspace 实体（id/name/path/sessionIds）→ `process.cwd()` 兜底；`GET /council/workspace` 暴露给 UI，tab 里显示「当前会话工作区」。 |
-| **subagent 参与者** | 每个席位 `{ provider, model }`（等价 subagent 的 `agentOptions`）；默认以只读 Agent Preset 从 spawn 后端起一个真正的子代理（带工作区 cwd），结果回投沿用 subagent 的 `next-turn`/`wake` 投递语义，而不是另造一套。 |
+| **subagent 参与者** | 每个席位 `{ provider, model }`（等价 subagent 的 `agentOptions`）；开启席位时前 N 个从 spawn 后端起只读子代理（带工作区 cwd），结果回投用 `agent.inject()`（静默）与 `followup()`（唤醒）的组合，而不是另造一套。 |
 | **group 角色组** | `structure.roles = { answerers, reviewers, arbiter }`；`POST /council/run` 可传 `reviewers` 子集（缺省=全部作答模型），arbiter 即主席。 |
 | **workflow 阶段** | `structure.stages = ['answers','reviews','synthesize']`（无主席时省略末段），每个阶段对一组角色执行，快照 `structure` 即节点图。 |
 
@@ -154,7 +154,7 @@ council_review({
 - **降级配额 6**：每个 run 最多降级 6 席（超时/失败 → 纯模型，即每席位最多一次），超过直接报错，避免 provider 故障时降级风暴；`seat.fallback/fallbackFrom` 与 `run.fallbacks/fallbackLimit` 可在快照里审计。
 - **单会话单 run**：同一 `sessionId` 已有运行中的评审时，`POST /council/run` 返回 409 + 现有 runId，前端改为接回而不是再开一份。
 - **运行注册表持久化**：写入 `${DSH_HOME:-~/.dsh}/council-runs.json`（最多 20 条，500ms 防抖）；Host 重启后仍能查到历史运行，重启前仍在跑的被标注为「Host 重启，运行中断」。
-- **源码包（评审必读）**：问题含 `评审/审查/review/audit` 等意图时，除目录树与关键文档外，还会自动打包**真实源码**：最多 24 个源码文件、单文件 4k 字、总预算 `codeMaxChars`（默认 40k），路径全部标注；提示词要求结论必须引用具体文件、附件未覆盖的内容标注【推断】。快照新增 `codeState/codeFiles/codeChars`，UI 显示「已附带源码 N 个文件（X 字）」。这就是「评审要看工作区就真读工作区」，而不是只读 README 猜。
+- **源码包（评审必读）**：问题含 `评审/审查/review/audit` 等意图时，除目录树与关键文档外，还会自动打包**真实源码**：最多 24 个源码文件、单文件 4k 字、总预算 `codeMaxChars`（默认 40k），路径全部标注；提示词要求结论必须引用具体文件、附件未覆盖的内容标注【推断】。快照新增 `codeState/codeFiles/codeChars` 与**覆盖率** `codeDiscovered/codeTruncated`（发现数 vs 附带数、截断数），UI 显示「已附带源码 N 个文件（X 字）」——**这是抽样初审，不是全项目审查**；附件头部自带覆盖率声明。
 - **附件安全**：`@mention` 只解析到工作区内（拒绝 `..` 穿越）；路径附件拒绝符号链接、密钥类文件（`.env`/`.pem`/`.key`/`.ssh`/`.aws`/`.kube`/`id_rsa` 等）、二进制与 >1MB 文件；skill 只读加载、脚本不执行。
 - **自动化回归**：`npm run verify` 现在同时跑 host 与 client harness（路径修复/穿越拒绝/密钥跳过/超时语义/并发窗口）。
 
@@ -162,7 +162,7 @@ council_review({
 
 - `ctx.agents.get(sessionId).session.snapshotEvents()` 是 DSH 内部接口，已用 try/catch 降级为“只发问题”，UI 会标注「上下文读取失败」；升级 DSH 后请重新验证。
 - 左键选中的浮动条由内置 `quote` 交互独占（先注册先赢），理事会条目依赖 quick-quote 的渲染器；未装 quick-quote 时只留右键菜单。
-- 「结果回投」的**直接唤醒**会让主 Agent 立即回复（有意行为）；**静默注入**与 subagent 的投递边界一致：`send(msg, 'next-turn', false)` 只排队、不唤醒，结论在**下一轮用户消息**的 turn 边界进入上下文，不会打断当前 turn。
+- 「结果回投」的**直接唤醒**会让主 Agent 立即回复（有意行为）；**静默放进上下文**用 `agent.inject()`：结论不排队、不唤醒，在下一次模型请求的 pre-step 进入上下文，不会打断当前 turn。
 - 上下文只取可见文本，不含工具调用与附件；路径附件只读文本类文件（1 MB 内），不读二进制、不跟随符号链接。
 - **运行中可停止**：运行中显示「停止」按钮；页面刷新/重新打开后会自动从 `GET /council/runs` 接回正在跑的 run（仍可点停止）。直接关闭浏览器窗口/标签页时，client 用 `navigator.sendBeacon` 通知 host 取消当前 run（`pagehide`），不会把后台运行留在无人看管状态。**关闭右侧栏 tab 不终止运行**（设计如此：重开 tab 可接回），要终止请点「停止」或关闭页面。
 - **多标签页**：同会话多标签用 `BroadcastChannel` 选主，只有一个标签轮询/回投/在关页时取消；leader 失联 2.5s 内其他标签接管。无 BroadcastChannel 的环境退化为各自轮询。
@@ -175,7 +175,7 @@ council_review({
 
 ## 安装
 
-已发布到 npm：<https://www.npmjs.com/package/dsh-model-council>（dist-tags `latest` / `alpha` = `0.1.0`）。
+npm 上的发布版本为 **0.1.0**（dist-tags `latest` / `alpha`）；本仓库源码版本 **0.2.0** 尚未发布到 npm——发布 0.2.x 需要新的 granular token（旧的已吊销）。
 
 ```sh
 # 从 npm
@@ -213,6 +213,6 @@ node <workspace>\tmp\push-council.mjs <本目录> sprw-li/dsh-model-council main
 ## 发布记录与后续
 
 - GitHub：<https://github.com/sprw-li/dsh-model-council>，首个 release `v0.1.0-alpha`（pre-release，含可安装 tarball）。
-- npm：<https://www.npmjs.com/package/dsh-model-council>（`latest` / `alpha` = `0.1.0`；`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
+- npm：<https://www.npmjs.com/package/dsh-model-council>（已发布 `0.1.0`；**0.2.0 未发布**——`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
 
 发新版本：更新 `CHANGELOG.md` 与 `package.json` 版本 → `npm run verify` → commit/tag → `npm publish --tag alpha`（npm 新包首次发布会进入 staged 审核，通常几分钟内变为可安装）→ `npm pack` + `gh release create vX.Y.Z --prerelease --notes-file CHANGELOG.md <tarball>`。
