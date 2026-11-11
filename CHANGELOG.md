@@ -1,3 +1,27 @@
+# 0.2.25
+
+**验收门反复卡在"证据不足"的根因：包太小，六项机制无法同时可见。**
+
+连续 6 轮签发复审的结论都是「无 P0/P1，但某一子项【附件未覆盖】」——每轮漏掉的那一项都不同，
+说明问题不在代码，而在采样面：`client.js` 有 1700+ 行，60000 字预算下主文件只分到 ~33000 字，
+六项机制必然有 1–2 项落在采样区外。
+
+- `CODE_MAX_CHARS` 60000 → **120000**；主文件份额 0.55 → **0.8**；`CODE_FILE_CHARS` 10000 → 12000。
+- 效果：`schedulePoll`/`schedulePollRetry`/`pollRun`/`watchRun`/`claim`/`openCouncilTab`/`resumeRun`/
+  `CouncilBridge`/`draftBridge` 三个写入点/`track`/`releaseOnPageHide` **同时**出现在一个包里。
+- 成本换正确性：单次评审源码附件从 ~60k 字升到 ~120k 字；可用 profile 配置 `codeMaxChars` 调小。
+
+# 0.2.24
+
+- **点名符号窗口不再被更长的标识符抢占**：`schedulePollRetry` 里也有 `schedulePoll` 子串，
+  导致 `function schedulePoll` 的函数头始终采不到（复审正是卡在这一条）。现在匹配某个 hint 的行
+  若同时命中更长的 hint，就跳过，各符号各得窗口。
+
+# 0.2.23
+
+- **精确证据优先于宽泛簇**：区域排序改为 整函数体 → 点名符号窗口 → 关键词簇。
+  最终按预算裁剪会切掉尾部，此前的宽簇会把「问题点名的那一行」挤到被切掉的一端。
+
 # 0.2.22
 
 **点名项目目录被 callerCwd 抢先**：在 workspace 根评审 `dsh-council` 时，
