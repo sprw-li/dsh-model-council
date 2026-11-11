@@ -51,10 +51,13 @@ const RUN_TIMEOUT_MS = 30 * 60 * 1000
 const SEAT_CONCURRENCY = 3
 /** Global per-provider concurrency, enforced in the Host so tabs/chats cannot multiply it. */
 const PROVIDER_CONCURRENCY = 4
-/** One run may degrade at most one seat per participant. */
-const MAX_FALLBACKS_PER_RUN = 6
-/** Transport/provider failures worth one retry with backoff (word-bounded so "5000 tokens" never matches). */
-const TRANSIENT_FAILURE = /(\b429\b|\b5\d\d\b|ECONN|ETIMEDOUT|EAI_AGAIN|timeout|rate.?limit|overload|temporarily unavailable|fetch failed)/i
+/** Fallback quota per run; strictly below MAX_MODELS so the guard has real
+ *  margin (a full 6-seat roster can never consume it all — circuit-breaker
+ *  style, not one-per-seat). */
+const MAX_FALLBACKS_PER_RUN = 3
+/** Transport/provider failures worth one retry with backoff. Anchored to
+ *  HTTP/status context so "500 字" / "5000 tokens" / "timeoutMs" never match. */
+const TRANSIENT_FAILURE = /(\bHTTP[ _-]?429\b|\bHTTP[ _-]?5\d\d\b|\bstatus[ _:= ]*429\b|\bstatus[ _:= ]*5\d\d\b|\b429 too many\b|\b5\d\d (?:internal |bad |service |gateway |upstream )?[a-z ]*error|\bECONNRESET\b|\bECONNREFUSED\b|\bETIMEDOUT\b|\bEAI_AGAIN\b|\bEPIPE\b|\bsocket hang up\b|\brate[ -]?limit(?:ed)?\b|\boverloaded\b|\btemporarily unavailable\b|\bnetwork error\b|\bfetch failed\b|\bread tcp .*: connection reset\b)/i
 const RUN_TTL_MS = 30 * 60 * 1000
 const MAX_RUNS = 16
 const MODEL_CACHE_MS = 60000
@@ -453,13 +456,19 @@ async function collectCodeContext(roots, maxChars, hints = []) {
 }
 
 /** Directory tree plus key-file text for every path the question mentions, or the session workspace. */
-async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars, allowCode = true, attachRoots = []) {
+async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars, allowCode = true, attachRoots = [], callerCwd) {
   const hints = questionHints(question)
-  const allowedRoots = [workspaceCwd, ...attachRoots].filter((root) => typeof root === 'string' && root !== '')
+  const allowedRoots = [workspaceCwd, callerCwd, ...attachRoots].filter((root) => typeof root === 'string' && root !== '')
   /** With no configured allowlist, an explicitly typed path stays readable (local use). */
   const permitted = (candidate) => attachRoots.length === 0
     || allowedRoots.some((root) => candidate === root || isPathInside(candidate, root))
   const candidates = candidatePaths(question, workspaceCwd).filter(permitted)
+  /* The caller's own directory is the primary anchor: a subagent spawned in
+     the plugin directory reviews THAT directory, not the workspace root. */
+  if (candidates.length === 0 && typeof callerCwd === 'string' && callerCwd !== ''
+    && (WORKSPACE_INTENT.test(String(question || '')) || REVIEW_INTENT.test(String(question || '')))) {
+    candidates.push(callerCwd)
+  }
   /* A named project directory wins over the whole workspace: "评审 dsh-council". */
   if (candidates.length === 0 && typeof workspaceCwd === 'string' && workspaceCwd !== '') {
     let matched
@@ -684,11 +693,14 @@ export function apply(ctx, config) {
   loadPersistedRuns()
 
   /** Write-once terminal state: late stage/seat results must not overwrite a stop. */
-  function finishRun(run, status, error) {
+  function finishRun(run, status, error, stopReason) {
     if (run.finished === true) return false
     run.finished = true
     run.status = status
     run.error = typeof error === 'string' ? error : ''
+    /* 'completed' | 'watchdog' | 'cancelled' | 'stage-error': why a run settled. */
+    run.stopReason = typeof stopReason === 'string' && stopReason !== '' ? stopReason
+      : status === 'done' ? 'completed' : 'stage-error'
     if (run.watchdog !== undefined) {
       clearTimeout(run.watchdog)
       run.watchdog = undefined
@@ -714,6 +726,33 @@ export function apply(ctx, config) {
   let catalogCache = { at: 0, value: undefined }
 
   /**
+   * The caller agent's EFFECTIVE working directory: the live working-directory
+   * projection first (a subagent that cd'd into the plugin directory), then the
+   * session header cwd, then the registry, then the Host process. Attachment
+   * selection is anchored here, so a subagent reviewing its own plugin gets
+   * that directory — not the conversation workspace root.
+   */
+  function resolveCallerCwd(agent) {
+    if (agent !== undefined && agent !== null && agent.session !== undefined) {
+      let workingDirectory
+      try {
+        workingDirectory = ctx.get('workingDirectory')
+      } catch {
+        workingDirectory = undefined
+      }
+      if (workingDirectory !== undefined && workingDirectory !== null && typeof workingDirectory.get === 'function') {
+        try {
+          const current = workingDirectory.get(agent.session)
+          if (typeof current === 'string' && current !== '') return { cwd: current, source: 'working-directory' }
+        } catch {
+          /* fall through to the header */
+        }
+      }
+    }
+    return undefined
+  }
+
+  /**
    * Identify the session's workspace the same way the rest of the harness does:
    * the session header's canonical cwd first, then the workspace registry entity.
    */
@@ -727,10 +766,15 @@ export function apply(ctx, config) {
         agent = undefined
       }
     }
+    const caller = resolveCallerCwd(agent)
+    if (caller !== undefined) {
+      info.cwd = caller.cwd
+      info.source = caller.source
+    }
     if (agent !== undefined && agent !== null) {
       try {
         const cwd = agent.session.header.cwd
-        if (typeof cwd === 'string' && cwd !== '') {
+        if (typeof cwd === 'string' && cwd !== '' && info.cwd === '') {
           info.cwd = cwd
           info.source = 'session-header'
         }
@@ -1049,6 +1093,7 @@ export function apply(ctx, config) {
       workspace: run.workspace === undefined ? { cwd: '', source: 'none', workspaceId: '', name: '' } : run.workspace,
       structure: run.structure === undefined ? { roles: {}, stages: [] } : run.structure,
       seatMode: run.seatMode === undefined ? 'llm' : run.seatMode,
+      stopReason: run.stopReason === undefined ? '' : run.stopReason,
       subagentSeats: run.subagentSeats === undefined ? 0 : run.subagentSeats,
       fallbacks: run.fallbacks === undefined ? 0 : run.fallbacks,
       fallbackLimit: MAX_FALLBACKS_PER_RUN,
@@ -1317,7 +1362,7 @@ export function apply(ctx, config) {
       } catch (error) {
         if (signal.aborted) throw new Error('已取消')
         if (run.fallbacks >= MAX_FALLBACKS_PER_RUN) {
-          throw new Error(`${errorText(error)}（降级配额已用尽：本 run 最多降级 ${MAX_FALLBACKS_PER_RUN} 席）`)
+          throw new Error(`${errorText(error)}（降级熔断：本 run 已降级 ${run.fallbacks} 席，上限 ${MAX_FALLBACKS_PER_RUN}——疑似 provider 故障而非单席偶发）`)
         }
         run.fallbacks += 1
         if (seat !== undefined && seat !== null) {
@@ -1449,7 +1494,10 @@ export function apply(ctx, config) {
     const modelsLine = `（参与模型：${run.answers.map((answer) => answer.name).join('、')}；runId: ${run.id}）`
     if (run.status === 'error') {
       const kept = usable.map((answer) => `### ${answer.name}\n${answer.text}`).join('\n\n')
-      return `理事会运行失败：${run.error}${kept === '' ? '' : `\n\n已完成的答案：\n${kept}`}\n\n${modelsLine}`
+      const reason = run.stopReason === 'watchdog' ? '（原因：整轮超时）'
+        : run.stopReason === 'cancelled' ? '（原因：调用方取消）'
+        : run.stopReason === 'stage-error' ? `（原因：${kept === '' ? '阶段失败' : '部分席位失败后中止'}）` : ''
+      return `理事会运行失败：${run.error}${reason}${kept === '' ? '' : `\n\n已完成的答案：\n${kept}`}\n\n${modelsLine}`
     }
     if (run.chairman.text !== '') return `${run.chairman.text}\n\n${modelsLine}`
     const parts = ['（无主席汇总：各模型答案如下）', '']
@@ -1562,7 +1610,7 @@ export function apply(ctx, config) {
       let codeTruncated = 0
       if (input.attachFiles !== false) {
         const files = await collectPathContext(
-          question, filesMaxChars, workspace.cwd, codeMaxChars, true, attachRoots,
+          question, filesMaxChars, workspace.cwd, codeMaxChars, true, attachRoots, workspace.cwd,
         )
         filesState = files.state
         filesPaths = files.paths
@@ -1627,11 +1675,14 @@ export function apply(ctx, config) {
       }
       run.watchdog = setTimeout(() => {
         if (run.status !== 'running') return
-        finishRun(run, 'error', '运行超时（30 分钟），已中止')
+        finishRun(run, 'error', '运行超时（30 分钟），已中止', 'watchdog')
         try {
           run.controller.abort()
         } catch {
           /* best effort */
+        }
+        for (const activation of run.liveSeats) {
+          void activation.dispose().catch(() => {})
         }
       }, RUN_TIMEOUT_MS)
       if (typeof run.watchdog.unref === 'function') run.watchdog.unref()
@@ -1698,7 +1749,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v26', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v28', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -1707,7 +1758,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v26' })
+          sendJson(res, 200, { ok: true, build: 'v28' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
@@ -1821,7 +1872,7 @@ export function apply(ctx, config) {
           let codeTruncated = 0
           if (body.attachFiles !== false) {
             const files = await collectPathContext(
-              question, filesMaxChars, workspace.cwd, codeMaxChars, allowCode, attachRoots,
+              question, filesMaxChars, workspace.cwd, codeMaxChars, allowCode, attachRoots, workspace.cwd,
             )
             filesState = files.state
             filesPaths = files.paths
@@ -1909,7 +1960,7 @@ export function apply(ctx, config) {
           for (const route of selected) routes[route.key] = route
           run.watchdog = setTimeout(() => {
             if (run.status !== 'running') return
-            finishRun(run, 'error', '运行超时（30 分钟），已中止')
+            finishRun(run, 'error', '运行超时（30 分钟），已中止', 'watchdog')
             try {
               run.controller.abort()
             } catch {
@@ -2015,7 +2066,7 @@ export function apply(ctx, config) {
             sendJson(res, 404, { error: 'run not found' })
             return
           }
-          finishRun(run, 'error', '已取消')
+          finishRun(run, 'error', '已取消', 'cancelled')
           try {
             run.controller.abort()
           } catch {

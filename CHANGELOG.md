@@ -1,3 +1,12 @@
+# 0.2.2
+
+理事会自评审（self-loop）整改——本轮缺陷全部由「cwd 在插件目录的 subagent 调 `council_review`」的评审发现：
+
+- **附件锚定修复（P0 级）**：工具的 `attachFiles` 此前以会话工作区根为基准——subagent 在 `dsh-council/` 里评审自己时，附件却是工作区杂项（24 个文件无一来自插件，目录树还在 120 项处截断把插件目录挤掉）。现在附件锚定**调用方的实际工作目录**（`workingDirectory` 投影 → session header → registry 兜底），复测：`paths=dsh-council`、`codeFiles=4/4`、主席结论全部引用真实常量与文件路径。
+- **`TRANSIENT_FAILURE` 收紧**：原正则的裸 `\b5\d\d\b` 与无边界 `timeout` 会把「500 字」「timeoutMs」误判为瞬态失败（理事会指出的真缺陷）；改为锚定 HTTP/status 上下文 + 显式 errno/网络词，回归断言补 6 个负例（`500 字`/`5000 tokens`/`timeoutMs`/`500 毫秒`/`2500 chars` 等）。
+- **降级配额改为熔断语义**：`MAX_FALLBACKS_PER_RUN` 6 → 3，刻意低于 `MAX_MODELS = 6`（原值=席位数使保护分支在满员时永不触发）；触发时报错注明「疑似 provider 故障」。
+- **终止原因可观测**：快照新增 `stopReason`（completed/watchdog/cancelled/stage-error），工具结论文本带「（原因：…）」，不再让「已取消」吞掉超时/手动/阶段失败的区分。
+
 # 0.2.1
 
 外部审查报告（2026-11-11）整改：

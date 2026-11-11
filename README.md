@@ -151,7 +151,7 @@ council_review({
 
 - **终态只写一次**：`finishRun()` 是唯一终态入口；取消/超时/正常完成竞态下，迟到的阶段结果不会覆盖「已取消/已超时」；watchdog 与 cancel 都会 dispose 活跃席位。
 - **并发上收到 Host**：每 provider 全局 4 并发槽（多聊天/多标签页不会放大）；429/5xx/超时/ECONN 等瞬态失败退避重试（最多 3 次）；`max-tokens` 无正文自动翻倍重试。
-- **降级配额 6**：每个 run 最多降级 6 席（超时/失败 → 纯模型，即每席位最多一次），超过直接报错，避免 provider 故障时降级风暴；`seat.fallback/fallbackFrom` 与 `run.fallbacks/fallbackLimit` 可在快照里审计。
+- **降级熔断 3**：每个 run 最多降级 3 席（超时/失败 → 纯模型）——刻意低于 `MAX_MODELS = 6`，因为连续多席失败通常意味着 provider 故障而非单席偶发，继续降级只会放大负载；触发熔断时整轮报错并注明原因。`seat.fallback/fallbackFrom` 与 `run.fallbacks/fallbackLimit` 可在快照里审计。
 - **单会话单 run**：同一 `sessionId` 已有运行中的评审时，`POST /council/run` 返回 409 + 现有 runId，前端改为接回而不是再开一份。
 - **运行注册表持久化**：写入 `${DSH_HOME:-~/.dsh}/council-runs.json`（最多 20 条，500ms 防抖）；Host 重启后仍能查到历史运行，重启前仍在跑的被标注为「Host 重启，运行中断」。
 - **源码包（评审必读）**：问题含 `评审/审查/review/audit` 等意图时，除目录树与关键文档外，还会自动打包**真实源码**：最多 24 个源码文件、单文件 4k 字、总预算 `codeMaxChars`（默认 40k），路径全部标注；提示词要求结论必须引用具体文件、附件未覆盖的内容标注【推断】。快照新增 `codeState/codeFiles/codeChars` 与**覆盖率** `codeDiscovered/codeTruncated`（发现数 vs 附带数、截断数），UI 显示「已附带源码 N 个文件（X 字）」——**这是抽样初审，不是全项目审查**；附件头部自带覆盖率声明。
