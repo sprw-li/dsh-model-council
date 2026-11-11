@@ -86,7 +86,21 @@ const SECRET_NAME = /(^|[\\/])(\.env[^\\/]*|id_(rsa|ed25519|ecdsa)[^\\/]*|creden
 /** A question that means the session workspace even without an explicit path. */
 const WORKSPACE_INTENT = /(工作区|项目|仓库|代码库|目录|本仓库|本项目|workspace|repository|repo\b|project|codebase)/i
 /** A question that asks for a review, so the source pack is worth attaching. */
-const REVIEW_INTENT = /(评审|审查|审计|验收|复审|检查|review|audit|acceptance|全项目|代码质量|安全审查)/i
+const REVIEW_INTENT = /(评审|审查|审计|验收|复审|复核|审核|终审|核验|检查|判定|review|audit|acceptance|全项目|代码质量|安全审查)/i
+/**
+ * A question that names source code, whatever verb it uses. Intent vocabularies
+ * always miss one more synonym ("终审" was not a review word), and a miss
+ * silently turns the whole source pack off — which reads to the reviewer as
+ * "no code provided". Naming a file, an extension, or asking about 函数/实现 is
+ * unambiguous evidence that the code matters.
+ */
+const CODE_MENTION = /[A-Za-z0-9_\-.]+\.(?:js|mjs|cjs|jsx|ts|tsx|py|pyi|go|rs|java|kt|cs|rb|php|c|h|cpp|hpp|lua|swift|scala|sh|ps1|sql|vue|svelte|json|md)\b|源码|源代码|代码|函数|实现|行号|调用链/
+
+/** True when the question is about source code (review words OR code mentions). */
+function wantsSourcePack(question) {
+  const text = String(question || '')
+  return REVIEW_INTENT.test(text) || CODE_MENTION.test(text)
+}
 /** Bounded source pack so llm-mode seats can cite real files instead of guessing. */
 const CODE_MAX_CHARS = 60000
 const CODE_MAX_FILES = 24
@@ -684,7 +698,7 @@ async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars
   /* The caller's own directory is the primary anchor: a subagent spawned in
      the plugin directory reviews THAT directory, not the workspace root. */
   if (candidates.length === 0 && !namedButRefused && typeof callerCwd === 'string' && callerCwd !== ''
-    && (WORKSPACE_INTENT.test(String(question || '')) || REVIEW_INTENT.test(String(question || '')))) {
+    && (WORKSPACE_INTENT.test(String(question || '')) || wantsSourcePack(question))) {
     candidates.push(callerCwd)
   }
   /* A named project directory wins over the whole workspace: "评审 dsh-council". */
@@ -703,7 +717,7 @@ async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars
       matched = undefined
     }
     if (matched !== undefined && permitted(matched)) candidates.push(matched)
-    else if ((WORKSPACE_INTENT.test(String(question || '')) || REVIEW_INTENT.test(String(question || '')))
+    else if ((WORKSPACE_INTENT.test(String(question || '')) || wantsSourcePack(question))
       && permitted(workspaceCwd)) {
       candidates.push(workspaceCwd)
     }  }
@@ -744,7 +758,7 @@ async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars
   let codeDiscovered = 0
   let codeTruncated = 0
   const wantsCode = allowCode && typeof codeMaxChars === 'number' && codeMaxChars > 0
-    && REVIEW_INTENT.test(String(question || '')) && dirs.length > 0
+    && wantsSourcePack(question) && dirs.length > 0
   if (wantsCode) {
     const code = await collectCodeContext(dirs, codeMaxChars, hints)
     codeState = code.state
@@ -2025,7 +2039,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v43', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v44', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -2034,7 +2048,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v43' })
+          sendJson(res, 200, { ok: true, build: 'v44' })
           return
         }
         if (req.method === 'POST' && path === '/run') {

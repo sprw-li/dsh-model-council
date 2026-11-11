@@ -94,6 +94,22 @@ try {
   const reAcceptancePack = await collectPathContext('复审：改判通过与否', 6000, workspace, 5000)
   assert.equal(reAcceptancePack.codeState, 'ok', '复审 questions must attach the source pack')
 
+  /* Vocabulary robustness: an unfamiliar review verb ("终审") or a bare file
+     name must still attach the pack. Relying on an intent word list turned the
+     whole pack off three separate times. */
+  for (const question of [
+    '终审：client.js 六项是否成立',
+    '核验 index.js 的实现',
+    '请判定 main.py 的裁剪逻辑',
+    'look at main.py',
+  ]) {
+    const pack = await collectPathContext(question, 6000, workspace, 5000)
+    assert.equal(pack.codeState, 'ok', `source pack must attach for: ${question}`)
+  }
+  /* A pure chat question MUST NOT drag the code base into the prompt. */
+  const chatPack = await collectPathContext('今天天气怎么样', 6000, workspace, 5000)
+  assert.equal(chatPack.codeState, 'off', 'plain chat must not attach source code')
+
   /* A named project directory inside the workspace wins over the whole workspace. */
   const projectPack = await collectPathContext('全项目审查 pkg', 4000, workspace, 2000)
   assert.ok(projectPack.paths[0].toLowerCase().endsWith('pkg'), `named dir: ${JSON.stringify(projectPack.paths)}`)
