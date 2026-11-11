@@ -172,6 +172,19 @@ npm run syntax    # node --check 两个入口
 
 CI：`.github/workflows/verify.yml`（文件已随目录保留；当前仓库 token 无 `workflow` scope 时 GitHub 会拒绝推送该文件，执行 `gh auth refresh -s workflow` 后 `git add .github/workflows/verify.yml && git push` 即可补上。本地等价的检查是 `npm run verify`）。
 
+## 推送到 GitHub（本机沙箱的可用路径）
+
+本机 `git.exe` 连不上 github.com（连接被重置），但 REST API 可用，所以用「API 增量推送」而不是 `git push`：
+
+```powershell
+$env:GITHUB_TOKEN = gh auth token
+node <workspace>\tmp\push-council.mjs <本目录> sprw-li/dsh-model-council main
+```
+
+这个脚本只推送远端还没有的本地 commit，并且**用原始的 tree / parent / 作者与时间重建提交**，因此远端 SHA 与本地 SHA 完全相同——不会出现两条分叉历史。首次对齐用 `tmp\align-history.mjs`（重放整条链，SHA 不等就拒绝移动 ref）。
+
+网络恢复后可直接改用原生 git：`git fetch origin && git reset --hard origin/main`（现在两端 commit 已一致，无需 reset）。
+
 ## 发布记录与后续
 
 - GitHub：<https://github.com/sprw-li/dsh-model-council>，首个 release `v0.1.0-alpha`（pre-release，含可安装 tarball）。
