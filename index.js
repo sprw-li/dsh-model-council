@@ -16,6 +16,7 @@
  *   POST /council/run/<id>/cancel   abort every in-flight call
  */
 
+import { existsSync } from 'node:fs'
 import { readdir, readFile, stat } from 'node:fs/promises'
 import { extname, isAbsolute, join } from 'node:path'
 
@@ -350,6 +351,18 @@ export function apply(ctx, config) {
     && Number.isSafeInteger(config.filesMaxChars) && config.filesMaxChars >= 2000
     ? Math.min(config.filesMaxChars, 80000)
     : ATTACH_MAX_CHARS
+  /**
+   * Extra read-only skill roots for subagent seats. Configured `skillDirs` wins;
+   * otherwise auto-detect the shared agent-library store (~/.dsh/skills already
+   * covers the installed subset, this adds the full catalog).
+   */
+  const configuredSkillDirs = config !== null && typeof config === 'object' && Array.isArray(config.skillDirs)
+    ? config.skillDirs.filter((dir) => typeof dir === 'string' && dir !== '')
+    : []
+  const defaultAgentsHome = process.env.DSH_AGENTS_HOME || join(process.env.USERPROFILE || '', '.agents')
+  const defaultSkillStore = process.env.AGLIB_STORE || 'D:\\agent-library'
+  const autoSkillDirs = [join(defaultSkillStore, 'catalog')].filter((dir) => existsSync(dir))
+  const skillDirs = configuredSkillDirs.length > 0 ? configuredSkillDirs : autoSkillDirs
   /** Live runs by id. */
   const runs = new Map()
   /** Child session id -> seat object, for the per-seat activity label. */
@@ -458,7 +471,11 @@ export function apply(ctx, config) {
         },
         { id: 'tool-fs', name: '@deepseek-ai/dsh-tool-fs', config: { read: true, readImage: false, write: false, edit: false } },
         { id: 'tool-fs-search', name: '@deepseek-ai/dsh-tool-fs-search', config: { sampleOverCapGlobResults: false } },
-        { id: 'skill-filesystem', name: '@deepseek-ai/dsh-skill-filesystem' },
+        {
+          id: 'skill-filesystem',
+          name: '@deepseek-ai/dsh-skill-filesystem',
+          config: skillDirs.length > 0 ? { customSkillDirs: skillDirs } : {},
+        },
         { id: 'tool-skill', name: '@deepseek-ai/dsh-tool-skill' },
         { id: 'time-context', name: '@deepseek-ai/dsh-time-context' },
       ],
@@ -1021,7 +1038,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v13', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v14', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -1030,7 +1047,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v13' })
+          sendJson(res, 200, { ok: true, build: 'v14' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
