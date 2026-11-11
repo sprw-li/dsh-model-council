@@ -11,6 +11,8 @@
 - 三个选项：接当前对话上下文、自动附带问题里的本地路径、结果回投（不做 / 静默注入 / 直接唤醒 三元）、主席汇总。
 - 路径附件：问题中出现的本地绝对路径（兼容 `D/dev/...` 写法）会读取目录树 + 关键文件（README/SKILL/pyproject/ARCHITECTURE 等，最多 6 个、单文件 8k 字、总 20k 字，可配置 `filesMaxChars`），跳过 `.git`/`node_modules`/`runs`/密钥文件，让模型可以评审真实代码与文档。
 - 工作区识别与结构化：按 Harness 结构解析会话工作区（`SessionHeader.cwd` → `workspaceRegistry` → Host cwd），`GET /council/workspace` 暴露给 UI；未写路径但提到工作区/项目时自动附带当前工作区；支持 `@相对路径`；快照新增 `workspace` 与 `structure`（`roles: answerers/reviewers/arbiter`，`stages: answers/reviews/synthesize`），与 subagent 的 `agentOptions`/投递语义、group 的角色组、workflow 的阶段图对齐。
+- 只读 subagent 席位（默认开）：注册 `council-readonly` Agent Preset（persona + 只读 fs + fs-search + skill + time-context），每个席位从 spawn 后端起一个真正的子代理并继承会话 cwd，可自行读文件/搜索/加载 skill；无写、编辑、执行工具。快照新增 `seatMode`，preset 注册失败时自动退回纯模型模式并在 UI 提示。
+- 修复推理模型「断线」：作答 16384 tokens、单次调用超时 300s；流以 max-tokens 收尾且无正文时自动翻倍到 32768 重试一次。
 - 三元回投对齐 subagent 的 turn 边界：`silent` 走 `agent.send(msg, 'next-turn', false)`（不唤醒，下一轮用户消息的 turn 才进入上下文），`wake` 走 `agent.followup()`（立即触发主 Agent 回复）；每个结果只回投一次，重复回投返回 409。
 - 主席模型可选；参与模型 2–6 个；选择与选项持久化在浏览器 localStorage。
 - 隐私/费用提示：上下文约 6000 字发送至所选模型提供商；开始前显示预计调用数。

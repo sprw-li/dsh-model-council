@@ -63,6 +63,7 @@ const SCENARIOS = [
   {
     id: 'run-1', status: 'done', stage: 'done', question: '测试问题', error: '',
     contextChars: 120, contextState: 'ok', useChairman: true,
+    seatMode: 'subagent',
     filesState: 'ok', filesPaths: ['D:\\demo'], filesChars: 1200,
     answers: answersFor(),
     reviews: [
@@ -361,7 +362,7 @@ if (fetchCalls.some((call) => call.url === '/council/run' && call.method === 'PO
 }
 
 const tabHtml = render(tabBody === undefined ? null : React.createElement(tabBody, { t }))
-for (const expected of ['多模型理事会', '开始评审', '主席模型', '接当前对话上下文', '自动附带问题里的本地路径', '会话工作区：demo', '静默注入主聊天', '直接唤醒主聊天', '不做（只留在右侧栏）']) {
+for (const expected of ['多模型理事会', '开始评审', '主席模型', '接当前对话上下文', '自动附带问题里的本地路径', 'subagent 只读席位', '会话工作区：demo', '静默注入主聊天', '直接唤醒主聊天', '不做（只留在右侧栏）']) {
   if (!tabHtml.includes(expected)) throw new Error(`tab body missing "${expected}": ${tabHtml.slice(0, 400)}`)
 }
 if (styleTags.length !== 1) throw new Error(`expected one injected style tag, got ${styleTags.length}`)
@@ -381,6 +382,7 @@ if (resumeCalls.length !== 1 || resumeCalls[0].mode !== 'wake') {
 }
 const filesHtml = render(React.createElement(tabBody, { t }))
 if (!filesHtml.includes('已附带 1 个路径')) throw new Error('path-attachment note is missing after the run')
+if (!filesHtml.includes('本次使用只读 subagent 席位')) throw new Error('subagent-seat note is missing after the run')
 
 /* Selection context menu: right-click a passage offers the council review item. */
 if (typeof command.icon !== 'function') throw new Error('command has no slash-menu icon')

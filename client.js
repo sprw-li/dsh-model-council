@@ -35,6 +35,10 @@ window.__ModuleLoader__.load({
       'panel.options': '选项',
       'panel.optContext': '接当前对话上下文',
       'panel.optFiles': '自动附带问题里的本地路径',
+      'panel.optSeats': 'subagent 只读席位（可读文件/skill）',
+      'panel.seatsHint': '开启后每个委员是一个只读子代理：可读文件、搜索、加载 skill，不能写；更慢但能自行查证。关闭则用纯模型调用。',
+      'panel.seatModeSub': '本次使用只读 subagent 席位',
+      'panel.seatModeFallback': 'subagent 席位不可用，本次退回纯模型调用',
       'panel.filesHint': '问题中出现的本地路径（如 D:\\dev\\项目）会自动读取目录树和关键文件，最多 {chars} 字；没写路径但提到工作区/项目时用当前会话工作区；跳过 .git/node_modules/密钥文件。',
       'panel.workspace': '当前会话工作区：{path}',
       'panel.filesAttached': '已附带 {count} 个路径的文件内容（{chars} 字）',
@@ -99,6 +103,10 @@ window.__ModuleLoader__.load({
       'panel.options': 'Options',
       'panel.optContext': 'Attach current chat context',
       'panel.optFiles': 'Attach local paths named in the question',
+      'panel.optSeats': 'Read-only subagent seats (files + skills)',
+      'panel.seatsHint': 'Each seat becomes a read-only subagent: it can read files, search, and load skills, but cannot write. Slower, but it can verify things itself. Off = raw model calls.',
+      'panel.seatModeSub': 'Used read-only subagent seats',
+      'panel.seatModeFallback': 'Subagent seats unavailable; fell back to raw model calls',
       'panel.filesHint': 'Local paths in the question (e.g. D:\\dev\\project) attach their directory tree and key files, up to {chars} characters; a workspace/project question without a path uses the session workspace; .git/node_modules/secret files are skipped.',
       'panel.workspace': 'Session workspace: {path}',
       'panel.filesAttached': 'Attached {count} path(s), {chars} characters',
@@ -244,6 +252,7 @@ window.__ModuleLoader__.load({
         chairmanKey: typeof persisted.chairmanKey === 'string' ? persisted.chairmanKey : '',
         useContext: persisted.useContext !== false,
         attachFiles: persisted.attachFiles !== false,
+        useSubagentSeats: persisted.useSubagentSeats !== false,
         feedbackMode: persisted.feedbackMode === 'silent' || persisted.feedbackMode === 'wake'
           ? persisted.feedbackMode
           : persisted.useFeedback === true ? 'wake' : 'off',
@@ -284,6 +293,7 @@ window.__ModuleLoader__.load({
           chairmanKey: store.state.chairmanKey,
           useContext: store.state.useContext,
           attachFiles: store.state.attachFiles,
+          useSubagentSeats: store.state.useSubagentSeats,
           feedbackMode: store.state.feedbackMode,
           useChairman: store.state.useChairman,
         }))
@@ -499,6 +509,7 @@ window.__ModuleLoader__.load({
         chairman,
         context: store.state.useContext === true,
         attachFiles: store.state.attachFiles !== false,
+        seatMode: store.state.useSubagentSeats !== false ? 'subagent' : 'llm',
         useChairman,
         sessionId,
       }
@@ -828,6 +839,7 @@ window.__ModuleLoader__.load({
               h('div', { className: 'dsc-toggles' },
                 optionToggle('useContext', 'panel.optContext'),
                 optionToggle('attachFiles', 'panel.optFiles'),
+                optionToggle('useSubagentSeats', 'panel.optSeats'),
                 optionToggle('useChairman', 'panel.optChairman'),
               ),
               h('div', { className: 'dsc-hint' }, t('panel.workspace', {
@@ -839,6 +851,7 @@ window.__ModuleLoader__.load({
               })),
               h('div', { className: 'dsc-hint' }, t('panel.privacy', { chars: state.contextMaxChars })),
               h('div', { className: 'dsc-hint' }, t('panel.filesHint', { chars: state.filesMaxChars })),
+              h('div', { className: 'dsc-hint' }, t('panel.seatsHint')),
             ),
             h('div', { className: 'dsc-field' },
               h('span', { className: 'dsc-field-label' }, t('panel.feedbackMode')),
@@ -923,6 +936,11 @@ window.__ModuleLoader__.load({
                           chars: run.filesChars,
                         }))
                       : null,
+                    run.seatMode === 'subagent'
+                      ? h('span', { className: 'dsc-note' }, t('panel.seatModeSub'))
+                      : state.useSubagentSeats !== false
+                        ? h('span', { className: 'dsc-warn' }, t('panel.seatModeFallback'))
+                        : null,
                     run.status === 'done' && resumedMode !== ''
                       ? h('span', { className: 'dsc-note' },
                           resumedMode === 'silent' ? t('panel.feedbackSilentSent') : t('panel.feedbackWakeSent'))
