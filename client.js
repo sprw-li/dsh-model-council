@@ -36,7 +36,7 @@ window.__ModuleLoader__.load({
       'panel.optContext': '接当前对话上下文',
       'panel.optFiles': '自动附带问题里的本地路径',
       'panel.optSeats': 'subagent 只读席位（可读文件/skill）',
-      'panel.seatsHint': '开启后每个委员是一个只读子代理：可读文件、搜索、加载 skill，不能写；更慢但能自行查证。关闭则用纯模型调用。',
+      'panel.seatsHint': '开启后每个委员是一个只读子代理：可读文件、搜索、加载 skill，不能写；更慢但能自行查证。关闭则用纯模型调用。开启时路径附件默认关闭（委员自己读文件）。',
       'panel.seatModeSub': '本次使用只读 subagent 席位',
       'panel.seatModeFallback': 'subagent 席位不可用，本次退回纯模型调用',
       'panel.filesHint': '问题中出现的本地路径（如 D:\\dev\\项目）会自动读取目录树和关键文件，最多 {chars} 字；没写路径但提到工作区/项目时用当前会话工作区；跳过 .git/node_modules/密钥文件。',
@@ -68,6 +68,10 @@ window.__ModuleLoader__.load({
       'status.streaming': '进行中',
       'status.done': '完成',
       'status.error': '失败',
+      'status.seatStarting': '启动中 {s}s',
+      'status.seatRunning': '运行中 {s}s',
+      'status.seatClosed': '已关闭',
+      'status.fallback': '完成（降级）',
       'error.empty': '问题不能为空',
       'error.minModels': '至少选择两个模型',
       'command.label': '理事会评审',
@@ -104,7 +108,7 @@ window.__ModuleLoader__.load({
       'panel.optContext': 'Attach current chat context',
       'panel.optFiles': 'Attach local paths named in the question',
       'panel.optSeats': 'Read-only subagent seats (files + skills)',
-      'panel.seatsHint': 'Each seat becomes a read-only subagent: it can read files, search, and load skills, but cannot write. Slower, but it can verify things itself. Off = raw model calls.',
+      'panel.seatsHint': 'Each seat becomes a read-only subagent: it can read files, search, and load skills, but cannot write. Slower, but it can verify things itself. Off = raw model calls. With seats on, path attachments default off (the seats read files themselves).',
       'panel.seatModeSub': 'Used read-only subagent seats',
       'panel.seatModeFallback': 'Subagent seats unavailable; fell back to raw model calls',
       'panel.filesHint': 'Local paths in the question (e.g. D:\\dev\\project) attach their directory tree and key files, up to {chars} characters; a workspace/project question without a path uses the session workspace; .git/node_modules/secret files are skipped.',
@@ -136,6 +140,10 @@ window.__ModuleLoader__.load({
       'status.streaming': 'Streaming',
       'status.done': 'Done',
       'status.error': 'Failed',
+      'status.seatStarting': 'Starting {s}s',
+      'status.seatRunning': 'Running {s}s',
+      'status.seatClosed': 'Closed',
+      'status.fallback': 'Done (fallback)',
       'error.empty': 'The question is empty',
       'error.minModels': 'Select at least two models',
       'command.label': 'Council review',
@@ -508,7 +516,7 @@ window.__ModuleLoader__.load({
         models,
         chairman,
         context: store.state.useContext === true,
-        attachFiles: store.state.attachFiles !== false,
+        attachFiles: store.state.useSubagentSeats !== false ? false : store.state.attachFiles !== false,
         seatMode: store.state.useSubagentSeats !== false ? 'subagent' : 'llm',
         useChairman,
         sessionId,
@@ -779,6 +787,17 @@ window.__ModuleLoader__.load({
         done: t('stage.done'),
       }
       const stageName = run !== null && stageNames[run.stage] !== undefined ? stageNames[run.stage] : t('stage.answers')
+      /** Seat phase label for a running card (starting/running/closed). */
+      function seatStatusText(seat) {
+        if (seat === null || typeof seat !== 'object') return t('status.streaming')
+        const seconds = typeof seat.elapsedMs === 'number' && seat.elapsedMs > 0
+          ? Math.max(1, Math.round(seat.elapsedMs / 1000))
+          : 0
+        if (seat.phase === 'starting') return t('status.seatStarting', { s: seconds })
+        if (seat.phase === 'running') return t('status.seatRunning', { s: seconds })
+        if (seat.phase === 'closed') return t('status.seatClosed')
+        return t('status.streaming')
+      }
       const participants = state.selected.length
       const estimatedCalls = participants * 2 + (state.useChairman !== false ? 1 : 0) + (state.feedbackMode !== 'off' ? 1 : 0)
       const failedAnswers = run !== null ? run.answers.filter((answer) => answer.error !== '').length : 0
@@ -951,7 +970,11 @@ window.__ModuleLoader__.load({
                       h('div', { className: 'dsc-card-head' },
                         h('span', { className: 'dsc-card-title', title: answer.model }, answer.name),
                         h('span', { className: 'dsc-badge' },
-                          answer.error !== '' ? t('status.error') : answer.done ? t('status.done') : t('status.streaming')),
+                          answer.error !== '' ? t('status.error') : answer.done
+                            ? (answer.seat !== null && typeof answer.seat === 'object' && answer.seat.fallback === true
+                                ? t('status.fallback')
+                                : t('status.done'))
+                            : seatStatusText(answer.seat)),
                       ),
                       answer.error !== ''
                         ? h('div', { className: 'dsc-error-box' }, answer.error)
@@ -966,7 +989,7 @@ window.__ModuleLoader__.load({
                             h('div', { className: 'dsc-card-head' },
                               h('span', { className: 'dsc-card-title' }, review.reviewer),
                               h('span', { className: 'dsc-badge' },
-                                review.error !== '' ? t('status.error') : review.done ? t('status.done') : t('status.streaming')),
+                                review.error !== '' ? t('status.error') : review.done ? t('status.done') : seatStatusText(review.seat)),
                             ),
                             review.error !== ''
                               ? h('div', { className: 'dsc-error-box' }, review.error)
