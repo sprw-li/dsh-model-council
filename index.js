@@ -531,9 +531,10 @@ async function readCodeSegments(path, budget, hints = []) {
         }
       }
       /* Skip a variable-form hit that a function-definition line already
-         covers: replacing the enclosing function with the inner const
-         definition once cut callModel's body out of the pack. */
-      if (found !== -1 && !defLines.some((line) => found > line && found < line + 400)) defLines.push(found)
+         covers — BUT only when that def line is genuinely the same function:
+         a 400-line proximity window once swallowed callSeatSubagent's def
+         (303 lines after callModel's) and left it cluster-truncated. */
+      if (found !== -1 && !defLines.some((line) => Math.abs(found - line) < 40)) defLines.push(found)
     }
     for (const index of defLines) {
       const text = lines[index] || ''
@@ -547,9 +548,10 @@ async function readCodeSegments(path, budget, hints = []) {
           break
         }
       }
-      /* A line already inside another def window adds nothing; and a def
-         window never REPLACES a wider one (the inner-const bug). */
-      if (regions.some((region) => index >= region.from && index < region.to)) continue
+      /* A def window REPLACES any keyword-cluster region that only partially
+         covered the function: the whole body wins over a dense fragment.
+         (The old `continue`-on-overlap let a truncated cluster swallow
+         callModel's definition line, hiding its tail from reviewers.) */
       const partial = regions.findIndex((region) => index >= region.from && index < region.to)
       if (partial !== -1) regions.splice(partial, 1)
       regions.push({ from: index, to, share: Number.MAX_SAFE_INTEGER })
@@ -1971,7 +1973,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v37', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v39', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -1980,7 +1982,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v37' })
+          sendJson(res, 200, { ok: true, build: 'v39' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
