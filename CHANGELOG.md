@@ -1,3 +1,11 @@
+# 0.2.4
+
+self-loop 第 3 圈：真实代码路径回归（验收门 a 条件闭环）：
+
+- **`dev/verify-runtime.mjs`**：用 fake Cordis context 直接驱动 `apply()`，从注册的 `council_review` 工具走**真实 `callModel`**——健康往返、瞬态 503 恰好一次重试后恢复（answer 重试 + review 各计一次）、非瞬态失败零重试快速失败。不再只是算术模拟。
+- **`npm run verify`** 串联三个 harness（client / host / runtime）。
+- **CI**：`.github/workflows/verify.yml` 从只跑 client 扩为三个全跑（推送需要 `workflow` scope，见 README）。
+
 # 0.2.3
 
 理事会验收（self-loop 第 2 圈）整改——本轮「不通过」判定点出的真实盲点全部修复：
