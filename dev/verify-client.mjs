@@ -63,6 +63,7 @@ const SCENARIOS = [
   {
     id: 'run-1', status: 'done', stage: 'done', question: '测试问题', error: '',
     contextChars: 120, contextState: 'ok', useChairman: true,
+    filesState: 'ok', filesPaths: ['D:\\demo'], filesChars: 1200,
     answers: answersFor(),
     reviews: [
       { key: 'p1|m1', reviewer: 'Model One', text: '互评一', done: true, error: '' },
@@ -114,12 +115,16 @@ const fakeWindow = {
         ok: true,
         json: async () => ({
           contextMaxChars: 6000,
+          filesMaxChars: 20000,
           providers: [
             { id: 'p1', name: 'Provider One', models: [{ id: 'm1', name: 'Model One' }, { id: 'm2', name: 'Model Two' }] },
             { id: 'p2', name: 'Provider Two', models: [{ id: 'm3', name: 'Model Three' }] },
           ],
         }),
       }
+    }
+    if (String(url).indexOf('/council/workspace') === 0) {
+      return { ok: true, json: async () => ({ cwd: 'D:\\demo', source: 'session-header', workspaceId: 'ws1', name: 'demo' }) }
     }
     if (url === '/council/run') {
       postCount += 1
@@ -356,7 +361,7 @@ if (fetchCalls.some((call) => call.url === '/council/run' && call.method === 'PO
 }
 
 const tabHtml = render(tabBody === undefined ? null : React.createElement(tabBody, { t }))
-for (const expected of ['多模型理事会', '开始评审', '主席模型', '接当前对话上下文', '静默注入主聊天', '直接唤醒主聊天', '不做（只留在右侧栏）']) {
+for (const expected of ['多模型理事会', '开始评审', '主席模型', '接当前对话上下文', '自动附带问题里的本地路径', '会话工作区：demo', '静默注入主聊天', '直接唤醒主聊天', '不做（只留在右侧栏）']) {
   if (!tabHtml.includes(expected)) throw new Error(`tab body missing "${expected}": ${tabHtml.slice(0, 400)}`)
 }
 if (styleTags.length !== 1) throw new Error(`expected one injected style tag, got ${styleTags.length}`)
@@ -374,6 +379,8 @@ if (!fetchCalls.some((call) => call.url === '/council/run' && call.method === 'P
 if (resumeCalls.length !== 1 || resumeCalls[0].mode !== 'wake') {
   throw new Error(`finished run was not delivered to the chat: ${JSON.stringify(resumeCalls)}`)
 }
+const filesHtml = render(React.createElement(tabBody, { t }))
+if (!filesHtml.includes('已附带 1 个路径')) throw new Error('path-attachment note is missing after the run')
 
 /* Selection context menu: right-click a passage offers the council review item. */
 if (typeof command.icon !== 'function') throw new Error('command has no slash-menu icon')

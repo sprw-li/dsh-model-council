@@ -16,6 +16,9 @@
  *   POST /council/run/<id>/cancel   abort every in-flight call
  */
 
+import { readdir, readFile, stat } from 'node:fs/promises'
+import { extname, isAbsolute, join } from 'node:path'
+
 export const inject = ['webServer', 'llm', 'agents']
 
 /** Selected models per run. */
@@ -32,6 +35,27 @@ const CALL_TIMEOUT_MS = 180000
 const RUN_TTL_MS = 30 * 60 * 1000
 const MAX_RUNS = 16
 const MODEL_CACHE_MS = 60000
+
+/** Paths in the question whose directory tree / key files ride along. */
+const MAX_ATTACH_PATHS = 3
+const ATTACH_MAX_CHARS = 20000
+const MAX_TREE_ENTRIES = 120
+const MAX_FILE_CHARS = 8000
+const SKIP_DIRS = new Set([
+  '.git', 'node_modules', '__pycache__', '.pytest_cache', '.venv', 'venv',
+  '.mypy_cache', '.ruff_cache', 'runs', 'dist', 'build', '.tox',
+])
+const TEXT_EXTENSIONS = new Set([
+  '.md', '.py', '.toml', '.json', '.yml', '.yaml', '.txt', '.cfg', '.ini',
+  '.csv', '.jsonl', '.sh', '.ps1', '.html', '.css', '.js', '.ts', '.jsx',
+  '.tsx', '.mjs', '.cjs', '.c', '.h', '.cpp', '.rs', '.go', '.java',
+])
+const SECRET_NAME = /(^|[\\/])(\.env[^\\/]*|id_rsa[^\\/]*|id_ed25519[^\\/]*|credentials[^\\/]*|\.npmrc|\.pypirc|\.netrc)$/i
+/** A question that means the session workspace even without an explicit path. */
+const WORKSPACE_INTENT = /(工作区|项目|仓库|代码库|目录|本仓库|本项目|workspace|repository|repo\b|project|codebase)/i
+/** `@relative/path` mentions inside the question. */
+const AT_MENTION = /@([A-Za-z0-9_.\-]+(?:[\\/][A-Za-z0-9_.\-]+)*)/g
+const KEY_FILE = /(^|[\\/])(README[^\\/]*\.md|SKILL\.md|CLAUDE\.md|AGENTS\.md|CHECKPOINT\.md|pyproject\.toml|package\.json|setup\.py|requirements\.txt|ARCHITECTURE[^\\/]*\.md|STATUS[^\\/]*\.md|DEFAULTS[^\\/]*\.md|RELEASE_NOTES[^\\/]*\.md|DECISIONS[^\\/]*\.md)$/i
 
 /** Model ids that are not chat completions. */
 const EXCLUDED_MODEL = /(embedding|rerank|\btts\b|\basr\b|whisper|audio|speech|image|video|seedream|wan-|ocr|moderation)/i
@@ -107,16 +131,247 @@ function letter(index) {
   return String.fromCharCode(65 + index)
 }
 
+/** Local paths mentioned by the question: absolute tokens, `@mentions`, or workspace-relative. */
+function candidatePaths(text, workspaceCwd) {
+  const candidates = []
+  const push = (value) => {
+    if (typeof value === 'string' && value !== '' && candidates.indexOf(value) === -1) candidates.push(value)
+  }
+  const tokens = String(text || '').split(/[\s"'`<>|，。；：、（）()\[\]{}]+/)
+  for (const rawToken of tokens) {
+    const token = rawToken.replace(/[^\x20-\x7E]+$/g, '').replace(/[.,;:!?]+$/g, '')
+    if (token.length < 4) continue
+    const variants = [token]
+    const drive = /^([A-Za-z])[\\/](.+)$/.exec(token)
+    if (drive !== null) variants.push(`${drive[1]}:\\${drive[2]}`)
+    for (const variant of variants) {
+      if (!/^([A-Za-z]:[\\/]|\/)/.test(variant)) continue
+      push(variant)
+      break
+    }
+    if (candidates.length >= MAX_ATTACH_PATHS) return candidates
+  }
+  AT_MENTION.lastIndex = 0
+  let mention
+  while ((mention = AT_MENTION.exec(String(text || ''))) !== null) {
+    if (candidates.length >= MAX_ATTACH_PATHS) break
+    const value = mention[1]
+    if (isAbsolute(value)) push(value)
+    else if (typeof workspaceCwd === 'string' && workspaceCwd !== '') push(join(workspaceCwd, value))
+  }
+  return candidates
+}
+
+/** Stat one path, treating missing/invalid paths as absent. */
+async function statSafe(path) {
+  try {
+    return await stat(path)
+  } catch {
+    return undefined
+  }
+}
+
+/** Read one text file with the attachment budget; binary/missing files are skipped. */
+async function readTextFile(path, maxChars) {
+  if (SECRET_NAME.test(path)) return ''
+  try {
+    const info = await stat(path)
+    if (!info.isFile() || info.size > 1024 * 1024) return ''
+    if (!TEXT_EXTENSIONS.has(extname(path).toLowerCase())) return ''
+    const content = await readFile(path, 'utf8')
+    if (content.indexOf('\u0000') !== -1) return ''
+    return content.length > maxChars ? `${content.slice(0, maxChars)}\n…（已截断）` : content
+  } catch {
+    return ''
+  }
+}
+
+/** Depth-limited directory tree, one entry per line. */
+async function listTree(root, maxEntries) {
+  const lines = []
+  async function walk(dir, prefix, depth) {
+    if (lines.length >= maxEntries || depth > 2) return
+    let entries
+    try {
+      entries = await readdir(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name))
+    for (const entry of entries) {
+      if (lines.length >= maxEntries) return
+      if (entry.isSymbolicLink()) continue
+      if (entry.name.startsWith('.') && entry.name !== '.gitignore') continue
+      const full = join(dir, entry.name)
+      if (entry.isDirectory()) {
+        if (SKIP_DIRS.has(entry.name)) continue
+        lines.push(`${prefix}${entry.name}/`)
+        await walk(full, `${prefix}  `, depth + 1)
+      } else if (entry.isFile()) {
+        let size = 0
+        try {
+          size = (await stat(full)).size
+        } catch {
+          size = 0
+        }
+        lines.push(`${prefix}${entry.name} [${size}]`)
+      }
+    }
+  }
+  await walk(root, '', 1)
+  return lines
+}
+
+/** Documentation/manifest files worth reading for a code review. */
+async function keyFiles(root) {
+  const found = []
+  async function walk(dir, depth) {
+    if (depth > 2 || found.length >= 6) return
+    let entries
+    try {
+      entries = await readdir(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name))
+    for (const entry of entries) {
+      if (found.length >= 6) return
+      if (entry.isSymbolicLink()) continue
+      const full = join(dir, entry.name)
+      if (entry.isDirectory()) {
+        if (SKIP_DIRS.has(entry.name) || entry.name.startsWith('.')) continue
+        await walk(full, depth + 1)
+      } else if (entry.isFile() && KEY_FILE.test(entry.name) && !SECRET_NAME.test(full)) {
+        found.push(full)
+      }
+    }
+  }
+  await walk(root, 1)
+  return found
+}
+
+/** Directory tree plus key-file text for every path the question mentions, or the session workspace. */
+async function collectPathContext(question, maxChars, workspaceCwd) {
+  const candidates = candidatePaths(question, workspaceCwd)
+  if (candidates.length === 0 && typeof workspaceCwd === 'string' && workspaceCwd !== ''
+    && WORKSPACE_INTENT.test(String(question || ''))) {
+    candidates.push(workspaceCwd)
+  }
+  const sections = []
+  const valid = []
+  let used = 0
+  for (const candidate of candidates) {
+    const info = await statSafe(candidate)
+    if (info === undefined) continue
+    valid.push(candidate)
+    if (info.isDirectory()) {
+      const tree = await listTree(candidate, MAX_TREE_ENTRIES)
+      const files = await keyFiles(candidate)
+      const parts = [`【工作区附件：${candidate}】`, `目录树（最多 ${MAX_TREE_ENTRIES} 项）：`, tree.join('\n')]
+      for (const file of files) {
+        const budget = Math.min(MAX_FILE_CHARS, maxChars - used)
+        if (budget <= 0) break
+        const content = await readTextFile(file, budget)
+        if (content === '') continue
+        parts.push(`--- ${file} ---`, content)
+        used += content.length
+      }
+      sections.push(parts.join('\n'))
+    } else if (info.isFile()) {
+      const budget = Math.min(MAX_FILE_CHARS, maxChars - used)
+      const content = await readTextFile(candidate, budget)
+      if (content === '') continue
+      sections.push(`【工作区附件：${candidate}】\n${content}`)
+      used += content.length
+    }
+    if (used >= maxChars) break
+  }
+  const text = sections.join('\n\n')
+  return {
+    text: text === '' ? '' : `${text}\n\n（以上为本地文件内容，供评审参考；不要声称可以访问文件系统。）`,
+    state: valid.length === 0 ? 'none' : 'ok',
+    paths: valid,
+    chars: text.length,
+  }
+}
+
 export function apply(ctx, config) {
   /** Character budget for the attached conversation context (profile config). */
   const contextMaxChars = config !== null && typeof config === 'object'
     && Number.isSafeInteger(config.contextMaxChars) && config.contextMaxChars >= 500
     ? Math.min(config.contextMaxChars, 50000)
     : 6000
+  /** Character budget for path attachments extracted from the question. */
+  const filesMaxChars = config !== null && typeof config === 'object'
+    && Number.isSafeInteger(config.filesMaxChars) && config.filesMaxChars >= 2000
+    ? Math.min(config.filesMaxChars, 80000)
+    : ATTACH_MAX_CHARS
   /** Live runs by id. */
   const runs = new Map()
   /** Cached catalog; agent/account changes refresh it after MODEL_CACHE_MS. */
   let catalogCache = { at: 0, value: undefined }
+
+  /**
+   * Identify the session's workspace the same way the rest of the harness does:
+   * the session header's canonical cwd first, then the workspace registry entity.
+   */
+  function resolveWorkspace(sessionId) {
+    const info = { cwd: '', source: 'none', workspaceId: '', name: '' }
+    let agent
+    if (typeof sessionId === 'string' && sessionId !== '') {
+      try {
+        agent = ctx.agents.get(sessionId)
+      } catch {
+        agent = undefined
+      }
+    }
+    if (agent !== undefined && agent !== null) {
+      try {
+        const cwd = agent.session.header.cwd
+        if (typeof cwd === 'string' && cwd !== '') {
+          info.cwd = cwd
+          info.source = 'session-header'
+        }
+      } catch {
+        /* header unavailable */
+      }
+    }
+    let registry
+    try {
+      registry = ctx.get('workspaceRegistry')
+    } catch {
+      registry = undefined
+    }
+    if (registry !== undefined && registry !== null && typeof registry.list === 'function') {
+      let list = []
+      try {
+        list = registry.list()
+      } catch {
+        list = []
+      }
+      for (const workspace of list) {
+        if (workspace === null || typeof workspace !== 'object') continue
+        const ids = Array.isArray(workspace.sessionIds) ? workspace.sessionIds : []
+        const matched = typeof sessionId === 'string' && sessionId !== '' && ids.indexOf(sessionId) !== -1
+        const samePath = info.cwd !== '' && workspace.path === info.cwd
+        if (!matched && !samePath) continue
+        info.workspaceId = typeof workspace.id === 'string' ? workspace.id : ''
+        info.name = typeof workspace.name === 'string' && workspace.name !== ''
+          ? workspace.name
+          : String(workspace.path || '')
+        if (info.cwd === '') {
+          info.cwd = typeof workspace.path === 'string' ? workspace.path : ''
+          info.source = 'workspace-registry'
+        }
+        break
+      }
+    }
+    if (info.cwd === '') {
+      info.cwd = process.cwd()
+      info.source = 'process'
+    }
+    return info
+  }
 
   /** Enumerate every configured provider and its text models. */
   async function catalog() {
@@ -237,6 +492,11 @@ export function apply(ctx, config) {
       createdAt: run.createdAt,
       contextChars: run.contextBlock === '' ? 0 : run.contextBlock.length,
       contextState: run.contextState === undefined ? 'off' : run.contextState,
+      filesState: run.filesState === undefined ? 'off' : run.filesState,
+      filesPaths: run.filesPaths === undefined ? [] : run.filesPaths,
+      filesChars: run.filesChars === undefined ? 0 : run.filesChars,
+      workspace: run.workspace === undefined ? { cwd: '', source: 'none', workspaceId: '', name: '' } : run.workspace,
+      structure: run.structure === undefined ? { roles: {}, stages: [] } : run.structure,
       resumed: run.resumed === undefined ? '' : run.resumed,
       useChairman: run.useChairman !== false,
       answers: run.answers.map((answer) => ({
@@ -494,11 +754,16 @@ export function apply(ctx, config) {
 
         if (req.method === 'GET' && path === '/models') {
           const cat = await catalog()
-          sendJson(res, 200, { providers: cat.providers, contextMaxChars })
+          sendJson(res, 200, { providers: cat.providers, contextMaxChars, filesMaxChars })
+          return
+        }
+        if (req.method === 'GET' && path === '/workspace') {
+          const sessionId = url.searchParams.get('sessionId') || ''
+          sendJson(res, 200, resolveWorkspace(sessionId))
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v5' })
+          sendJson(res, 200, { ok: true, build: 'v7' })
           return
         }
         if (req.method === 'POST' && path === '/run') {
@@ -536,11 +801,24 @@ export function apply(ctx, config) {
           prune()
           const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
           const useChairman = body.useChairman !== false
+          const workspace = resolveWorkspace(sessionId)
           let chairman = selected[0]
           if (body.chairman !== null && typeof body.chairman === 'object') {
             const chosen = findRoute(cat, String(body.chairman.provider || ''), String(body.chairman.model || ''))
             if (chosen !== undefined && selected.some((route) => route.key === chosen.key)) chairman = chosen
           }
+          /* Optional reviewer group, defaulting to every answerer (subagent/group style roster). */
+          const reviewerRoutes = []
+          const requestedReviewers = Array.isArray(body.reviewers) ? body.reviewers : []
+          for (const item of requestedReviewers.slice(0, MAX_MODELS)) {
+            if (item === null || typeof item !== 'object') continue
+            const route = findRoute(cat, String(item.provider || ''), String(item.model || ''))
+            if (route === undefined) continue
+            if (!selected.some((candidate) => candidate.key === route.key)) continue
+            if (reviewerRoutes.some((candidate) => candidate.key === route.key)) continue
+            reviewerRoutes.push(route)
+          }
+          const reviewers = reviewerRoutes.length > 0 ? reviewerRoutes : selected
           const contextParts = []
           let contextState = 'off'
           if (body.context === true) {
@@ -548,12 +826,36 @@ export function apply(ctx, config) {
             contextState = context.state
             if (context.text !== '') contextParts.push(context.text)
           }
+          let filesState = 'off'
+          let filesPaths = []
+          let filesChars = 0
+          if (body.attachFiles !== false) {
+            const files = await collectPathContext(question, filesMaxChars, workspace.cwd)
+            filesState = files.state
+            filesPaths = files.paths
+            filesChars = files.chars
+            if (files.text !== '') contextParts.push(files.text)
+          }
+          const structure = {
+            roles: {
+              answerers: selected.map((route) => route.key),
+              reviewers: reviewers.map((route) => route.key),
+              arbiter: useChairman ? chairman.key : '',
+            },
+            stages: useChairman ? ['answers', 'reviews', 'synthesize'] : ['answers', 'reviews'],
+            workspace,
+          }
           const run = {
             id: `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`,
             createdAt: Date.now(),
             sessionId,
             useChairman,
             contextState,
+            filesState,
+            filesPaths,
+            filesChars,
+            workspace,
+            structure,
             contextBlock: contextParts.join('\n\n'),
             status: 'running',
             stage: 'answers',
@@ -569,7 +871,7 @@ export function apply(ctx, config) {
               done: false,
               error: '',
             })),
-            reviews: selected.map((route) => ({
+            reviews: reviewers.map((route) => ({
               key: route.key,
               reviewer: route.name,
               text: '',
