@@ -278,7 +278,7 @@ window.__ModuleLoader__.load({
         chairmanKey: typeof persisted.chairmanKey === 'string' ? persisted.chairmanKey : '',
         useContext: persisted.useContext !== false,
         attachFiles: persisted.attachFiles !== false,
-        useSubagentSeats: persisted.useSubagentSeats !== false,
+        useSubagentSeats: persisted.useSubagentSeats === true,
         feedbackMode: persisted.feedbackMode === 'silent' || persisted.feedbackMode === 'wake'
           ? persisted.feedbackMode
           : persisted.useFeedback === true ? 'wake' : 'off',
@@ -514,6 +514,39 @@ window.__ModuleLoader__.load({
       }
     }
     cancelOnPageHide()
+
+    /** Per-session council state so different chats do not share one run. */
+    const sessionCache = new Map()
+    const SESSION_KEYS = ['question', 'runId', 'run', 'running', 'feedbackRunId', 'workspace']
+
+    function saveSessionState() {
+      const sessionId = store.state.sessionId
+      if (typeof sessionId !== 'string' || sessionId === '') return
+      const cached = {}
+      for (const key of SESSION_KEYS) cached[key] = store.state[key]
+      sessionCache.set(sessionId, cached)
+    }
+
+    function restoreSessionState(sessionId) {
+      const cached = sessionCache.get(sessionId)
+      if (cached === undefined) {
+        store.publish({ question: '', runId: '', run: null, running: false, feedbackRunId: '', error: '' })
+        return
+      }
+      store.publish({ ...cached, error: '' })
+      if (cached.running === true && typeof cached.runId === 'string' && cached.runId !== '') schedulePoll(cached.runId)
+    }
+
+    function switchSession(sessionId) {
+      if (typeof sessionId !== 'string' || sessionId === '') return
+      const current = store.state.sessionId
+      if (sessionId === current) return
+      saveSessionState()
+      store.publish({ sessionId })
+      restoreSessionState(sessionId)
+      void loadWorkspace()
+      void adoptRunningRun()
+    }
 
     function stopPolling() {
       if (pollTimer !== 0) {
@@ -815,6 +848,9 @@ window.__ModuleLoader__.load({
       draftBridge.draft = draft
       if (props.sessionId !== undefined) draftBridge.sessionId = props.sessionId
       if (props.inputActions !== undefined) draftBridge.inputActions = props.inputActions
+      React.useEffect(() => {
+        if (typeof props.sessionId === 'string' && props.sessionId !== '') switchSession(props.sessionId)
+      }, [props.sessionId])
       return h('span', { hidden: true, 'aria-hidden': true, style: { display: 'none' } })
     }
 
@@ -825,8 +861,10 @@ window.__ModuleLoader__.load({
       const [copied, setCopied] = React.useState(false)
 
       React.useEffect(() => {
+        if (typeof draftBridge.sessionId === 'string' && draftBridge.sessionId !== '') switchSession(draftBridge.sessionId)
         if (state.catalog.length === 0) void loadModels()
         void adoptRunningRun()
+        return () => saveSessionState()
       }, [])
 
       React.useEffect(() => {
