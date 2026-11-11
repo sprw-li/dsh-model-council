@@ -2,8 +2,8 @@
 
 **最后更新**：2026-11-12 02:0x（Asia/Shanghai）
 **仓库**：`D:\Documents\deepseek-harness\default-workspace\dsh-council`（package `dsh-model-council`）
-**HEAD**：`e0e2d3e9`（remote = local 待推，v0.2.17）
-**版本**：0.2.17 ／ host build `v47`
+**HEAD**：`607582db`（0.2.18，remote 已同步）
+**版本**：0.2.18 ／ host build `v48`
 
 ## 一句话状态
 
