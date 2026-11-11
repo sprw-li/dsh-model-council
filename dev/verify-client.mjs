@@ -641,6 +641,16 @@ if (!silentHtml.includes('已静默放进上下文')) throw new Error('silent de
   if (!/stopEventStream\(\)/.test(pagehideBlock)) {
     throw new Error('pagehide should release the tab channels')
   }
+  /* Both schedulers refuse to arm for a follower, so the "every poll path is
+     leader-gated" invariant holds locally instead of by call-site inspection. */
+  for (const name of ['schedulePoll', 'schedulePollRetry']) {
+    const at = source.indexOf('function ' + name + '(')
+    if (at === -1) throw new Error(name + ' not found')
+    const head = source.slice(at, at + 400)
+    if (!/isPollLeader\(\) !== true/.test(head)) {
+      throw new Error(name + ' must refuse to arm for a non-leader')
+    }
+  }
 }
 
 for (const cleanup of cleanups.reverse()) {

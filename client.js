@@ -794,6 +794,10 @@ window.__ModuleLoader__.load({
     }
 
     function schedulePoll(runId) {
+      /* Defensive: every poll is a leader duty. Call sites are already gated,
+         but the invariant is easier to verify (and to trust) when the
+         scheduler itself refuses to arm for a follower. */
+      if (isPollLeader() !== true) return
       stopPolling()
       pollTimer = window.setTimeout(() => {
         /* Clear the handle when it fires: a stale non-zero id made the
@@ -805,6 +809,7 @@ window.__ModuleLoader__.load({
 
     /** Same loop, longer delay: used while the network is failing. */
     function schedulePollRetry(runId, attempt) {
+      if (isPollLeader() !== true) return
       stopPolling()
       const delay = Math.min(8000, 320 * Math.pow(2, Math.min(5, attempt)))
       pollTimer = window.setTimeout(() => {
