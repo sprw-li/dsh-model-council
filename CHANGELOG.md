@@ -1,3 +1,16 @@
+# 0.2.26
+
+签发通过后的收尾：把复审遗留的 P2 清掉。
+
+- **`pageshow` 恢复**（真实缺陷）：`pagehide` 释放了轮询/SSE/leader channel，但 bfcache 返回
+  （浏览器后退、恢复标签页）时没有任何重建路径——面板会静默冻结，既无轮询也无流也无 leader。
+  现在 `pageshow` 重建选举并重新接回运行中的 run（`watchRun` 或 `adoptRunningRun`）。
+- **成本提示高估一次调用**：`silent` 是把结论注入上下文、不产生 provider 往返；`wake` 是普通聊天轮次。
+  交付步骤不再计入「预计 N 次模型调用」。
+- **`useStore` 选择门控**：此前任何 `publish` 都强制整棵 tab 树重渲染（流式输出下每帧一次）。
+  现在浅比较选中的切片，未变化则跳过重渲染；`dev/verify-client.mjs` 的 fake React 补了分槽 `useRef`。
+- 三条回归断言：pageshow 必须重建 leader 并重接 run、成本提示不得含 `feedbackMode`、`useStore` 必须比较后再生效。
+
 # 0.2.25
 
 **验收门反复卡在"证据不足"的根因：包太小，六项机制无法同时可见。**
