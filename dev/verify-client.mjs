@@ -194,6 +194,23 @@ const React = {
   },
   useState(initial) { return [typeof initial === 'function' ? initial() : initial, () => {}] },
   useEffect(fn) { if (typeof fn === 'function') effectQueue.push(fn) },
+  useRef(value) {
+    const slot = refIndex
+    refIndex += 1
+    if (refSlots[slot] === undefined) refSlots[slot] = { current: value }
+    return refSlots[slot]
+  },
+}
+
+/* One ref slot per hook call within the component currently rendering. Each
+   harness render starts components from scratch, so slots reset per component. */
+let refSlots = []
+let refIndex = 0
+
+/** Reset hook slots at the start of one component invocation. */
+function freshRefs() {
+  refSlots = []
+  refIndex = 0
 }
 
 /** Run queued effects the way React does after commit. */
@@ -321,6 +338,7 @@ function render(node) {
   if (Array.isArray(node)) return node.map(render).join('')
   if (typeof node.type === 'function') {
     renderedComponentCount += 1
+    freshRefs()
     return render(node.type(Object.assign({}, node.props, { children: node.children })))
   }
   const children = node.children !== undefined && node.children.length > 0 ? node.children : node.props.children
@@ -329,6 +347,7 @@ function render(node) {
 
 /** Render a component tree and run its effects, as a real commit would. */
 function renderAndFlush(node) {
+  freshRefs()
   const html = render(node)
   flushEffects()
   return html
@@ -650,6 +669,33 @@ if (!silentHtml.includes('已静默放进上下文')) throw new Error('silent de
     if (!/isPollLeader\(\) !== true/.test(head)) {
       throw new Error(name + ' must refuse to arm for a non-leader')
     }
+  }
+  /* pageshow must rebuild what pagehide released, or a bfcache restore leaves
+     the panel frozen (no poller, no stream, no leader role). */
+  const pageshowAt = source.indexOf("addEventListener('pageshow'")
+  if (pageshowAt === -1) throw new Error('pageshow recovery handler not found')
+  const pageshowBlock = source.slice(pageshowAt, pageshowAt + 600)
+  if (!/initLeaderElection\(/.test(pageshowBlock)) {
+    throw new Error('pageshow must re-establish the leader role')
+  }
+  if (!/watchRun\(|adoptRunningRun\(/.test(pageshowBlock)) {
+    throw new Error('pageshow must reattach the live run')
+  }
+  /* Delivery is not a model call: silent injects context, wake starts a chat
+     turn. Counting it made the cost hint overstate by one. */
+  const costAt = source.indexOf('const estimatedCalls =')
+  if (costAt === -1) throw new Error('estimatedCalls not found')
+  const costLine = source.slice(costAt, source.indexOf('\n', costAt))
+  if (/feedbackMode/.test(costLine)) {
+    throw new Error('estimatedCalls must not count delivery as a model call')
+  }
+  /* The store subscription must skip publishes that leave the selection as-is. */
+  if (!/function sameSelection\(/.test(source)) throw new Error('sameSelection helper missing')
+  const storeAt = source.indexOf('function useStore(selector)')
+  if (storeAt === -1) throw new Error('useStore not found')
+  const storeBlock = source.slice(storeAt, storeAt + 700)
+  if (!/sameSelection\(next, box\.current\.selected\)/.test(storeBlock)) {
+    throw new Error('useStore must compare before forcing a re-render')
   }
 }
 

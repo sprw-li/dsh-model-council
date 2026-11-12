@@ -349,11 +349,43 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** Subscribe one component to the store. */
+    /** Shallow compare of two selected values, one level deep. */
+    function sameSelection(a, b) {
+      if (a === b) return true
+      if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false
+      const left = Object.keys(a)
+      const right = Object.keys(b)
+      if (left.length !== right.length) return false
+      for (const key of left) {
+        if (a[key] !== b[key]) return false
+      }
+      return true
+    }
+
+    /**
+     * Subscribe one component to the store. A publish that leaves the selected
+     * slice untouched does not re-render, so the sidebar is not redrawn for
+     * every unrelated store write.
+     */
     function useStore(selector) {
       const [, force] = React.useState(0)
-      React.useEffect(() => store.subscribe(() => force((value) => value + 1)), [])
-      return selector(store.state)
+      const box = React.useRef({ selected: undefined, ready: false, selector })
+      box.current.selector = selector
+      const selected = selector(store.state)
+      if (box.current.ready !== true) {
+        box.current.selected = selected
+        box.current.ready = true
+      }
+      React.useEffect(() => {
+        box.current.selected = selected
+        return store.subscribe(() => {
+          const next = box.current.selector(store.state)
+          if (sameSelection(next, box.current.selected)) return
+          box.current.selected = next
+          force((value) => value + 1)
+        })
+      })
+      return selected
     }
 
     /** Latest composer draft and write verbs seen by a session-scoped component. */
@@ -642,13 +674,24 @@ window.__ModuleLoader__.load({
      * leaves the run to the host watchdog; an explicit 停止 still cancels.
      */
     function releaseOnPageHide() {
-      if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
-        window.addEventListener('pagehide', () => {
-          stopPolling()
-          stopEventStream()
-          closeLeaderChannel()
-        })
-      }
+      if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return
+      window.addEventListener('pagehide', () => {
+        stopPolling()
+        stopEventStream()
+        closeLeaderChannel()
+      })
+      /* Back from bfcache (browser Back, or a restored tab): pagehide released
+         our channels, so without this the panel would sit frozen — no poller,
+         no stream, no leader role. Rebuild them and reattach the live run. */
+      window.addEventListener('pageshow', () => {
+        if (store.state.sessionId === '') return
+        initLeaderElection(store.state.sessionId)
+        if (store.state.running === true && typeof store.state.runId === 'string' && store.state.runId !== '') {
+          watchRun(store.state.runId)
+          return
+        }
+        void adoptRunningRun()
+      })
     }
     releaseOnPageHide()
 
@@ -1290,7 +1333,11 @@ window.__ModuleLoader__.load({
         return `${phase} · ${activity}${waiting}`
       }
       const participants = state.selected.length
-      const estimatedCalls = participants * 2 + (state.useChairman !== false ? 1 : 0) + (state.feedbackMode !== 'off' ? 1 : 0)
+      /* Answers + peer reviews per model, plus the chairman. Delivery is NOT a
+         model call: `silent` injects the conclusion as context (no provider
+         round-trip) and `wake` starts a normal chat turn the user can see.
+         Counting it over-reported the cost by one. */
+      const estimatedCalls = participants * 2 + (state.useChairman !== false ? 1 : 0)
       const failedAnswers = run !== null ? run.answers.filter((answer) => answer.error !== '').length : 0
       const resumedMode = run === null
         ? ''
