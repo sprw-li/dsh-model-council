@@ -239,7 +239,15 @@ CI：`.github/workflows/verify.yml`（文件已随目录保留；当前仓库 to
 
 ## 推送到 GitHub（本机沙箱的可用路径）
 
-本机 `git.exe` 连不上 github.com（连接被重置），但 REST API 可用，所以用「API 增量推送」而不是 `git push`：
+**先试 `git push`。** 2026-11-16 实测本机 `git.exe` **可以**直连 github.com：
+`git ls-remote` 成功、真实推送成功（认证走 Git Credential Manager，`credential.helper = manager`）。
+早期"连接被重置"的结论已不成立——那次是当时的网络状态，不是长期限制。
+
+```powershell
+git push origin main          # 常规路径；实测：dry-run 0.2s，首次 34s（含凭据握手），之后 10.6s
+```
+
+**只有 `git push` 真的失败**（连接重置 / 超时 / 认证修不好）才走 REST 回退：
 
 ```powershell
 $env:GITHUB_TOKEN = gh auth token
@@ -248,7 +256,13 @@ node <workspace>\tmp\push-council.mjs <本目录> sprw-li/dsh-model-council main
 
 这个脚本只推送远端还没有的本地 commit，并且**用原始的 tree / parent / 作者与时间重建提交**，因此远端 SHA 与本地 SHA 完全相同——不会出现两条分叉历史。首次对齐用 `tmp\align-history.mjs`（重放整条链，SHA 不等就拒绝移动 ref）。
 
-网络恢复后可直接改用原生 git：`git fetch origin && git reset --hard origin/main`（现在两端 commit 已一致，无需 reset）。
+**为什么 REST 回退慢**：它把"一次 packfile 传输"拆成十几次**串行** HTTP —— 1（取 ref）+ 变更文件数（逐个 blob）+ 目录数（每个目录一次 trees，**没变也 POST**）+ 1（commit）+ 1（ref PATCH）；而本机单次 `api.github.com` 往返约 **2.5 s**，一次 6 文件提交约 **30–35 s**。
+
+**`gh` 的写操作在本机会挂住**（实测 `gh release create` 240 s 无输出）。建 tag / release 用 REST 直连：
+`gh api -X POST repos/<o>/<r>/git/refs -f ref=refs/tags/vX.Y.Z -f sha=<commit>`，
+资产上传用 `tmp/release-council.mjs`（POST `uploads.github.com`）。
+
+> 这套排障与回退流程已收进 skill `git-push-workflow`（agent-library catalog），含实测耗时与诊断阶梯。
 
 ## 发布记录与后续
 
