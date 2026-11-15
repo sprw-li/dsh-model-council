@@ -244,7 +244,7 @@ CI：`.github/workflows/verify.yml`（文件已随目录保留；当前仓库 to
 早期"连接被重置"的结论已不成立——那次是当时的网络状态，不是长期限制。
 
 ```powershell
-git push origin main          # 常规路径；实测：dry-run 0.2s，首次 34s（含凭据握手），之后 10.6s
+git push origin main          # 常规路径；实测 1 文件提交 ≈40s（首次 34s，删分支 10.6s，dry-run 0.2s）
 ```
 
 **只有 `git push` 真的失败**（连接重置 / 超时 / 认证修不好）才走 REST 回退：
@@ -256,7 +256,7 @@ node <workspace>\tmp\push-council.mjs <本目录> sprw-li/dsh-model-council main
 
 这个脚本只推送远端还没有的本地 commit，并且**用原始的 tree / parent / 作者与时间重建提交**，因此远端 SHA 与本地 SHA 完全相同——不会出现两条分叉历史。首次对齐用 `tmp\align-history.mjs`（重放整条链，SHA 不等就拒绝移动 ref）。
 
-**为什么 REST 回退慢**：它把"一次 packfile 传输"拆成十几次**串行** HTTP —— 1（取 ref）+ 变更文件数（逐个 blob）+ 目录数（每个目录一次 trees，**没变也 POST**）+ 1（commit）+ 1（ref PATCH）；而本机单次 `api.github.com` 往返约 **2.5 s**，一次 6 文件提交约 **30–35 s**。
+**为什么两条路径都慢**：本机单次 `api.github.com` 往返约 **2.5 s**。REST 回退把"一次 packfile 传输"拆成十几次**串行** HTTP（1 取 ref + 变更文件数逐个 blob + 每个目录一次 trees + 1 commit + 1 ref PATCH），一次 6 文件提交约 **30–35 s**；`git push` 单次真实推送实测 **39.7 s**。**量级相同——换路径不会变快**；选 `git push` 是为了正确性与可维护性（标准协议、无 SHA 重放），不是为了提速。
 
 **`gh` 的写操作在本机会挂住**（实测 `gh release create` 240 s 无输出）。建 tag / release 用 REST 直连：
 `gh api -X POST repos/<o>/<r>/git/refs -f ref=refs/tags/vX.Y.Z -f sha=<commit>`，
