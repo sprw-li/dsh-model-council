@@ -14,7 +14,7 @@ import { readFileSync } from 'node:fs'
    `npm install --no-save --no-package-lock @deepseek-ai/schemastery` — the DSH
    installation also routes a linked plugin's declared peerDependencies, but a plain
    `node dev/verify-host.mjs` has no such router. */
-import { TRANSIENT_FAILURE, SEAT_RESULT_TIMEOUT_MS, SEAT_START_TIMEOUT_MS, PROVIDER_CONCURRENCY, MAX_FALLBACKS_PER_RUN, RUN_TIMEOUT_MS, defaultRoutesFromCatalog, candidatePaths, collectCodeContext, collectPathContext, isPathInside, readTextFile, runLimited, withTimeout, apply, Config, councilEnabled, parseRouteSpec, resolveConfiguredRoutes, selectCouncilRoutes, pickChairmanRoute, readSetting } from '../index.js'
+import { TRANSIENT_FAILURE, SEAT_RESULT_TIMEOUT_MS, SEAT_START_TIMEOUT_MS, PROVIDER_CONCURRENCY, MAX_FALLBACKS_PER_RUN, RUN_TIMEOUT_MS, CODE_FILE_CHARS, CODE_MAX_CHARS, CODE_WALK_ENTRIES, defaultRoutesFromCatalog, candidatePaths, collectCodeContext, collectPathContext, isPathInside, readTextFile, runLimited, withTimeout, apply, Config, toolEnabled, panelEnabled, parseRouteSpec, resolveConfiguredRoutes, selectCouncilRoutes, pickChairmanRoute, readSetting } from '../index.js'
 
 const root = await mkdtemp(join(tmpdir(), 'council-host-'))
 try {
@@ -220,8 +220,24 @@ try {
   const seatRow = /\| \*\*subagent 只读席位（混合）\*\* \| (开|关) \|/.exec(readme)
   assert.ok(seatRow !== null, 'README must state the subagent-seat default')
   assert.equal(seatRow[1], '关', 'subagent seats must ship disabled by default')
-  const npmClaim = /0\.1\.0/.test(readme) && readme.includes('0.2.0 未发布')
-  assert.ok(npmClaim, 'README must distinguish the published npm version (0.1.0) from the unreleased 0.2.0')
+  /* Version claims must track package.json, not a number someone typed once.
+     The earlier form hard-coded "0.2.0 未发布" and therefore *locked the drift
+     in*: it passed only while the README still advertised a stale version. */
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  assert.ok(readme.includes(pkg.version), `README must state the repository source version (${pkg.version})`)
+  assert.ok(!readme.includes('0.2.0 未发布'), 'README must not claim 0.2.0 is the unreleased source version')
+  assert.ok(readme.includes('0.1.0'), 'README must state the published npm version (0.1.0)')
+
+  /* The source-pack budget the README quotes must be the budget the code uses. */
+  assert.ok(readme.includes(String(CODE_FILE_CHARS)),
+    `README must state the per-file source budget (${CODE_FILE_CHARS})`)
+  assert.ok(readme.includes(String(CODE_MAX_CHARS)),
+    `README must state the total source budget (${CODE_MAX_CHARS})`)
+  assert.ok(readme.includes(String(CODE_WALK_ENTRIES)),
+    `README must state the walk entry cap (${CODE_WALK_ENTRIES})`)
+  for (const stale of ['24 个源码文件', '单文件 4k 字', '默认 40k']) {
+    assert.ok(!readme.includes(stale), `README must not keep the superseded source-pack claim "${stale}"`)
+  }
 
   /* The tool's auto-pick must be heterogeneous: one provider, one model name each. */
   const catalog = {
@@ -281,19 +297,24 @@ try {
    * default models, and the live (volatile) path the Settings page uses. *
    * ------------------------------------------------------------------ */
 
-  /* `Config` keeps the three tool settings live: a `.volatile()` field reaches
+  /* `Config` keeps the four entry switches live: a `.volatile()` field reaches
      the plugin as a `{ get() }` source the loader rewrites in place
      (cordis-plugin-loader lib/index.js:513 gate, :526-558 commit), which is what
      makes a Settings-page write take effect without restarting the plugin. */
   {
     const defaults = Config(undefined)
-    assert.equal(typeof defaults.enabled.get, 'function', 'enabled must be a live source (volatile)')
-    assert.equal(defaults.enabled.get(), true, 'enabled must default to true')
+    for (const name of ['toolEnabled', 'panelEnabled']) {
+      assert.equal(typeof defaults[name].get, 'function', `${name} must be a live source (volatile)`)
+      assert.equal(defaults[name].get(), true, `${name} must default to true`)
+    }
     assert.deepEqual(defaults.defaultModels.get(), [], 'defaultModels must default to []')
     assert.equal(defaults.defaultChairman.get(), '', 'defaultChairman must default to ""')
-    for (const name of ['enabled', 'defaultModels', 'defaultChairman']) {
+    for (const name of ['toolEnabled', 'panelEnabled', 'defaultModels', 'defaultChairman']) {
       assert.equal(Config.dict[name].meta.volatile, true, `${name} must be declared .volatile()`)
     }
+    /* The single `enabled` switch is gone in 0.2.27: one knob must not mute both
+       the built-in tool and the external panel. */
+    assert.equal(Object.hasOwn(Config.dict, 'enabled'), false, 'the old `enabled` field must be removed')
     /* The historical plugin-config keys stay ordinary: they may restart the
        plugin, but the schema must still declare and default them. */
     for (const name of ['contextMaxChars', 'filesMaxChars', 'codeMaxChars', 'skillDirs', 'attachRoots']) {
@@ -301,7 +322,8 @@ try {
       assert.notEqual(readSetting(defaults[name], undefined), undefined, `${name} must resolve`)
     }
     assert.equal(defaults.contextMaxChars, 6000, 'contextMaxChars keeps its documented default')
-    assert.throws(() => Config({ enabled: 'yes' }), 'enabled must reject a non-boolean')
+    assert.throws(() => Config({ toolEnabled: 'yes' }), 'toolEnabled must reject a non-boolean')
+    assert.throws(() => Config({ panelEnabled: 'yes' }), 'panelEnabled must reject a non-boolean')
     assert.throws(() => Config({ defaultModels: 'deepseek/pro' }), 'defaultModels must reject a non-array')
     assert.throws(() => Config({ defaultChairman: 7 }), 'defaultChairman must reject a non-string')
   }
@@ -395,20 +417,28 @@ try {
       'a malformed chairman falls back')
   }
 
-  /* The reader behind `enabled`: plain values and live sources behave alike, and
-     an in-place write to a live source is observed without re-reading the row. */
+  /* The reader behind both switches: plain values and live sources behave alike,
+     and an in-place write to a live source is observed without re-reading the row. */
   {
     const write = Symbol.for('cosmokit.volatile.write')
     const live = (value) => { let current = value; return { get: () => current, [write]: (next) => { current = next } } }
-    assert.equal(councilEnabled({}), true, 'enabled defaults to true when unset')
-    assert.equal(councilEnabled({ enabled: true }), true)
-    assert.equal(councilEnabled({ enabled: false }), false)
-    assert.equal(councilEnabled(undefined), true)
-    assert.equal(councilEnabled({ enabled: 'no' }), true, 'only an explicit false disables the tool')
+    assert.equal(toolEnabled({}), true, 'toolEnabled defaults to true when unset')
+    assert.equal(panelEnabled({}), true, 'panelEnabled defaults to true when unset')
+    assert.equal(toolEnabled({ toolEnabled: false }), false)
+    assert.equal(panelEnabled({ panelEnabled: false }), false)
+    assert.equal(toolEnabled(undefined), true)
+    assert.equal(toolEnabled({ toolEnabled: 'no' }), true, 'only an explicit false disables the tool')
+    assert.equal(panelEnabled({ panelEnabled: 'no' }), true, 'only an explicit false disables the panel')
+    /* The two switches are independent: one being off must not read the other. */
+    assert.equal(toolEnabled({ toolEnabled: false, panelEnabled: true }), false)
+    assert.equal(panelEnabled({ toolEnabled: false, panelEnabled: true }), true,
+      'toolEnabled must not mute the panel')
+    assert.equal(toolEnabled({ toolEnabled: true, panelEnabled: false }), true,
+      'panelEnabled must not mute the tool')
     const source = live(true)
-    assert.equal(councilEnabled({ enabled: source }), true)
+    assert.equal(toolEnabled({ toolEnabled: source }), true)
     source[write](false)
-    assert.equal(councilEnabled({ enabled: source }), false, 'a live source is observed after an in-place write')
+    assert.equal(toolEnabled({ toolEnabled: source }), false, 'a live source is observed after an in-place write')
   }
 
   /* Drive the real `apply` through a fake cordis context: the tool is registered,
@@ -443,6 +473,37 @@ try {
       return state
     }
     const roster = async (state) => (await state.tool.execute({ question: 'roster probe', attachFiles: false }, {})).models
+    /* Minimal request/response doubles for the registered HTTP prefix: the
+       handler needs `method`/`url`, an event emitter (body + SSE close) and a
+       writable response. readBody()/SSE register their listeners in the order
+       data → error → end / close, so firing on registration reproduces a
+       complete body. */
+    const fakeReq = (method, url, body) => ({
+      method,
+      url,
+      on(event, handler) {
+        if (event === 'data' && typeof body === 'string' && body !== '') handler(Buffer.from(body))
+        if (event === 'end' && body !== undefined) handler()
+        return this
+      },
+    })
+    const fakeRes = () => ({
+      statusCode: 0,
+      headers: {},
+      body: '',
+      setHeader(name, value) { this.headers[name] = value },
+      writeHead(code, headers) { this.statusCode = code; Object.assign(this.headers, headers ?? {}) },
+      write(chunk) { this.body += String(chunk) },
+      end(chunk) { if (chunk !== undefined) this.body += String(chunk) },
+    })
+    const http = async (state, method, url, body) => {
+      const res = fakeRes()
+      await state.server.handler(fakeReq(method, url, body), res)
+      let json
+      try { json = JSON.parse(res.body) } catch { json = undefined }
+      return { status: res.statusCode, json, text: res.body }
+    }
+    const write = Symbol.for('cosmokit.volatile.write')
 
     try {
       /* A configured list is used verbatim; the auto-pick would give
@@ -461,21 +522,21 @@ try {
          rewrites the same live source, so `apply` is not re-run. */
       const liveConfig = Config({})
       const hot = fakeHost(liveConfig)
-      liveConfig.defaultModels[Symbol.for('cosmokit.volatile.write')](['providerA/glm'])
+      liveConfig.defaultModels[write](['providerA/glm'])
       assert.deepEqual(await roster(hot), ['providerA/glm'],
         'a settings write must change the roster without a plugin restart')
 
-      /* enabled=false refuses with a reason, before any catalog or run work. */
-      const off = fakeHost(Config({ enabled: false }))
-      await assert.rejects(off.tool.execute({ question: 'x', attachFiles: false }, {}), /已在设置中关闭/,
-        'a disabled tool must refuse with a reason')
+      /* toolEnabled=false refuses with a reason that names the right setting. */
+      const off = fakeHost(Config({ toolEnabled: false }))
+      await assert.rejects(off.tool.execute({ question: 'x', attachFiles: false }, {}), /启用 council_review 工具/,
+        'a disabled tool must refuse and name the toolEnabled setting')
 
       /* The same refusal after a live write, on an already-registered tool. */
-      const liveOn = Config({ enabled: true })
+      const liveOn = Config({})
       const hotOff = fakeHost(liveOn)
-      liveOn.enabled[Symbol.for('cosmokit.volatile.write')](false)
-      await assert.rejects(hotOff.tool.execute({ question: 'x', attachFiles: false }, {}), /已在设置中关闭/,
-        'a live disable must reach an already-registered tool')
+      liveOn.toolEnabled[write](false)
+      await assert.rejects(hotOff.tool.execute({ question: 'x', attachFiles: false }, {}), /启用 council_review 工具/,
+        'a live tool disable must reach an already-registered tool')
 
       /* A set-but-unusable defaultModels refuses loudly instead of silently
          auto-picking. */
@@ -486,11 +547,67 @@ try {
       /* defaultChairman is recorded on the run and served to the panel. */
       const chaired = fakeHost(Config({ defaultModels: ['deepseek/pro', 'providerA/glm'], defaultChairman: 'providerA/glm' }))
       await roster(chaired)
-      const res = { statusCode: 0, body: '', setHeader() {}, end(text) { this.body = text } }
-      await chaired.server.handler({ method: 'GET', url: '/council/runs?sessionId=' }, res)
-      const run = JSON.parse(res.body).runs[0]
+      const run = (await http(chaired, 'GET', '/council/runs?sessionId=')).json.runs[0]
       assert.equal(run.chairman.key, 'providerA|glm', 'defaultChairman must become the chairman')
       assert.equal(run.structure.roles.arbiter, 'providerA|glm', 'the arbiter role must follow the chairman')
+
+      /* panelEnabled=false refuses every change-class route with 403 + a
+         structured code, before any run lookup (the ids do not exist). */
+      const panelOff = fakeHost(Config({ panelEnabled: false }))
+      for (const [method, url, label] of [
+        ['POST', '/council/run', 'POST /council/run'],
+        ['POST', '/council/run/cmissing/resume', 'POST /council/run/<id>/resume'],
+        ['POST', '/council/run/cmissing/cancel', 'POST /council/run/<id>/cancel'],
+      ]) {
+        const denied = await http(panelOff, method, url, '{"question":"x"}')
+        assert.equal(denied.status, 403, `${label} must be 403 while panelEnabled=false`)
+        assert.equal(denied.json.code, 'panel-disabled', `${label} must carry code=panel-disabled`)
+        assert.ok(String(denied.json.error).includes('启用 /council 面板'), `${label} must name the panel setting`)
+      }
+
+      /* Read-only GETs stay available with the panel off, including the health
+         probe and the runs that already exist. */
+      const health = await http(panelOff, 'GET', '/council/')
+      assert.equal(health.status, 200, 'the health probe must never be gated')
+      assert.equal(health.json.toolEnabled, true, 'the probe must report the live tool switch')
+      assert.equal(health.json.panelEnabled, false, 'the probe must report the live panel switch')
+      assert.equal((await http(panelOff, 'GET', '/council/models')).status, 200,
+        'GET /council/models must stay readable')
+      assert.equal((await http(panelOff, 'GET', '/council/runs')).status, 200,
+        'GET /council/runs must stay readable')
+
+      /* A panel-created run stays observable after a live panel disable; only
+         starting/intervening becomes impossible. */
+      const livePanel = Config({})
+      const hotPanel = fakeHost(livePanel)
+      const created = await http(hotPanel, 'POST', '/council/run', JSON.stringify({
+        question: 'panel probe',
+        models: [{ provider: 'deepseek', model: 'pro' }, { provider: 'providerA', model: 'glm' }],
+      }))
+      assert.equal(created.status, 200, 'POST /council/run must work while panelEnabled=true')
+      assert.equal(typeof created.json.runId, 'string', 'POST /council/run must return a runId')
+      livePanel.panelEnabled[write](false)
+      assert.equal((await http(hotPanel, 'GET', `/council/run/${created.json.runId}`)).status, 200,
+        'GET /council/run/<id> must stay readable after a live panel disable')
+      const streamed = await http(hotPanel, 'GET', `/council/run/${created.json.runId}/stream`)
+      assert.equal(streamed.status, 200, 'GET /council/run/<id>/stream must stay readable')
+      assert.ok(streamed.text.includes('data:'), 'the SSE stream must still deliver a snapshot')
+      assert.equal((await http(hotPanel, 'POST', '/council/run', '{"question":"x"}')).status, 403,
+        'a live panel disable must reach POST /council/run')
+
+      /* The two entries are independent: the tool switch must not mute the
+         panel, and the panel switch must not mute the tool. */
+      const toolOnlyOff = fakeHost(Config({ toolEnabled: false }))
+      await assert.rejects(toolOnlyOff.tool.execute({ question: 'x', attachFiles: false }, {}), /已在设置中关闭/,
+        'toolEnabled=false still refuses the tool')
+      const panelStillOn = await http(toolOnlyOff, 'POST', '/council/run', JSON.stringify({
+        question: 'panel probe',
+        models: [{ provider: 'deepseek', model: 'pro' }, { provider: 'providerA', model: 'glm' }],
+      }))
+      assert.equal(panelStillOn.status, 200, 'toolEnabled=false must not mute the panel')
+      const panelOnlyOff = fakeHost(Config({ panelEnabled: false, defaultModels: ['providerA/glm'] }))
+      assert.deepEqual(await roster(panelOnlyOff), ['providerA/glm'],
+        'panelEnabled=false must not mute the council_review tool')
     } finally {
       if (previousHome === undefined) delete process.env.DSH_HOME
       else process.env.DSH_HOME = previousHome

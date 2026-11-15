@@ -179,20 +179,26 @@ function errorText(error) {
 
 /**
  * Entry config for the `council` row (`cordis.patch.yml`). The Settings page
- * writes these fields, so the three tool settings are declared `.volatile()`:
+ * writes these fields, so the four entry switches are declared `.volatile()`:
  * cordis commits a volatile-only write into the SAME live source instead of
  * restarting the plugin (`equalExceptVolatile` gate at cordis-plugin-loader
  * lib/index.js:513, `_commitVolatile`/`updateVolatile` at :526-558),
  * and {@link readSetting} observes the new value on the next tool call.
  * Editing a non-volatile key keeps the historical behaviour: the row's ordinary
  * update restarts the plugin so `apply` rebuilds its state.
+ *
+ * `toolEnabled` and `panelEnabled` are deliberately separate: the built-in
+ * `council_review` tool (agent side) and the external `/council` panel (user
+ * side) are two entries, so one switch never silently mutes the other.
  */
 export const Config = z.object({
-  /** Master switch; false makes `council_review` refuse with a clear reason. */
-  enabled: z.boolean().default(true).volatile().description('是否启用 council_review 工具'),
+  /** Built-in tool entry; false makes `council_review` refuse with a reason. */
+  toolEnabled: z.boolean().default(true).volatile().description('启用 council_review 工具'),
+  /** External entry; false refuses POST /council/run|resume|cancel with 403. */
+  panelEnabled: z.boolean().default(true).volatile().description('启用 /council 面板'),
   /** Default participants as "<provider>/<model>"; empty keeps the auto-pick. */
   defaultModels: z.array(z.string()).default([]).volatile()
-    .description('默认参与模型，每项 "<provider>/<model>"；留空则自动挑选'),
+    .description('council_review 默认评审模型，每项 "<provider>/<model>"；留空则自动挑选'),
   /** Default chairman as "<provider>/<model>"; empty elects the first participant. */
   defaultChairman: z.string().default('').volatile().description('默认主席 "<provider>/<model>"；留空则自动'),
   contextMaxChars: z.number().default(6000).description('会话上下文预算（字符）'),
@@ -244,10 +250,20 @@ export function readSetting(field, fallback) {
   return value === undefined || value === null ? fallback : value
 }
 
-/** `enabled` ships true; only an explicit false turns the tool off. */
-export function councilEnabled(config) {
-  const raw = config !== null && typeof config === 'object' ? config.enabled : undefined
+/** One boolean entry switch: ships true, and only an explicit false turns it off. */
+export function settingEnabled(config, field) {
+  const raw = config !== null && typeof config === 'object' ? config[field] : undefined
   return readSetting(raw, true) !== false
+}
+
+/** Built-in entry (`council_review`, agent side). */
+export function toolEnabled(config) {
+  return settingEnabled(config, 'toolEnabled')
+}
+
+/** External entry (the change-class `/council` routes, user side). */
+export function panelEnabled(config) {
+  return settingEnabled(config, 'panelEnabled')
 }
 
 /** Parse one `"<provider>/<model>"` setting; malformed input yields undefined. */
@@ -1067,10 +1083,11 @@ export function apply(ctx, config) {
     ? config.attachRoots.filter((dir) => typeof dir === 'string' && dir !== '')
     : []
   /**
-   * The live entry config. `enabled`/`defaultModels`/`defaultChairman` are
-   * declared `.volatile()`, so their values are read per tool call through
-   * {@link readSetting}: a Settings-page write rewrites the same source and is
-   * visible immediately, without re-running `apply`.
+   * The live entry config. `toolEnabled`/`panelEnabled`/`defaultModels`/
+   * `defaultChairman` are declared `.volatile()`, so their values are read per
+   * tool call or HTTP request through {@link readSetting}: a Settings-page write
+   * rewrites the same source and is visible immediately, without re-running
+   * `apply`.
    */
   const liveConfig = config !== null && typeof config === 'object' ? config : {}
   const defaultAgentsHome = process.env.DSH_AGENTS_HOME || join(process.env.USERPROFILE || '', '.agents')
@@ -2098,9 +2115,10 @@ export function apply(ctx, config) {
     isConcurrencySafe: () => false,
     async execute(args, exec) {
       /* The Settings page owns this switch, so it is read live — a disabled tool
-         must answer with a reason instead of vanishing from the surface. */
-      if (!councilEnabled(liveConfig)) {
-        throw new Error('council_review 已在设置中关闭（设置 → dsh-model-council → enabled = false）')
+         must answer with a reason instead of vanishing from the surface. This is
+         the TOOL switch only; `panelEnabled` governs the /council HTTP panel. */
+      if (!toolEnabled(liveConfig)) {
+        throw new Error('council_review 已在设置中关闭（设置 → 理事会 → “启用 council_review 工具” = false）')
       }
       const input = args === null || typeof args !== 'object' ? {} : args
       const question = typeof input.question === 'string' ? input.question.trim() : ''
@@ -2252,6 +2270,23 @@ export function apply(ctx, config) {
         const url = new URL(typeof req.url === 'string' ? req.url : '/council', 'http://127.0.0.1')
         const path = url.pathname.replace(/^\/council/, '') || '/'
 
+        /* The panel switch gates starting/intervening in a run, never observing
+           one: POST /run, /run/<id>/resume, /run/<id>/cancel. Read-only GETs
+           (/models, /runs, /run/<id>, /stream) stay available so the client and
+           the status overlay can still describe runs that already exist. */
+        const panelWrite = req.method === 'POST' && (
+          path === '/run'
+          || /^\/run\/[A-Za-z0-9]+\/resume$/.test(path)
+          || /^\/run\/[A-Za-z0-9]+\/cancel$/.test(path)
+        )
+        if (panelWrite && !panelEnabled(liveConfig)) {
+          sendJson(res, 403, {
+            error: 'council 面板已在设置中关闭（设置 → 理事会 → “启用 /council 面板” = false）',
+            code: 'panel-disabled',
+          })
+          return
+        }
+
         if (req.method === 'GET' && path === '/models') {
           const cat = await catalog()
           sendJson(res, 200, { providers: cat.providers, contextMaxChars, filesMaxChars })
@@ -2281,7 +2316,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v57', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v58', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -2290,7 +2325,14 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v57' })
+          /* Health probe: never gated, and it reports both entry switches so a
+             human or the client can see which side is off. */
+          sendJson(res, 200, {
+            ok: true,
+            build: 'v58',
+            toolEnabled: toolEnabled(liveConfig),
+            panelEnabled: panelEnabled(liveConfig),
+          })
           return
         }
         if (req.method === 'POST' && path === '/run') {
@@ -2645,6 +2687,9 @@ export function apply(ctx, config) {
 export {
   CHAIRMAN_MAX_TOKENS,
   ANSWER_MAX_TOKENS,
+  CODE_FILE_CHARS,
+  CODE_MAX_CHARS,
+  CODE_WALK_ENTRIES,
   MAX_FALLBACKS_PER_RUN,
   PROVIDER_CONCURRENCY,
   REVIEW_MAX_TOKENS,

@@ -72,8 +72,10 @@ window.__ModuleLoader__.load({
       'overlay.starting': '正在启动',
       'overlay.hide': '隐藏浮窗',
       'settings.title': '理事会',
-      'settings.enabled': '启用 council_review 工具',
-      'settings.enabledHint': '关闭后模型调用 council_review 会被拒绝，并在工具结果里说明原因。',
+      'settings.toolEnabled': '启用内置工具 council_review',
+      'settings.toolEnabledHint': '这是 agent 侧入口：关闭后模型调用 council_review 会被拒绝，并在工具结果里说明原因。',
+      'settings.panelEnabled': '启用 /council 面板入口',
+      'settings.panelEnabledHint': '这是用户侧入口：关闭后侧栏面板与 /council 无法发起、恢复或取消评审（只读查询仍然可用）。',
       'settings.models': '默认模型',
       'settings.modelsHint': '留空则沿用自动挑选（同一 provider、模型名互不相同、最多 3 个）。列表来自当前可用模型目录，模型下线后会在此标出。',
       'settings.chairman': '默认主席',
@@ -177,8 +179,10 @@ window.__ModuleLoader__.load({
       'overlay.starting': 'Starting',
       'overlay.hide': 'Hide overlay',
       'settings.title': 'Council',
-      'settings.enabled': 'Enable the council_review tool',
-      'settings.enabledHint': 'When disabled, a model calling council_review is refused with the reason in the tool result.',
+      'settings.toolEnabled': 'Enable the built-in council_review tool',
+      'settings.toolEnabledHint': 'The agent-facing entry: when disabled, a model calling council_review is refused with the reason in the tool result.',
+      'settings.panelEnabled': 'Enable the /council panel entry',
+      'settings.panelEnabledHint': 'The user-facing entry: when disabled, the sidebar panel and /council cannot start, resume, or cancel a review (read-only queries still work).',
       'settings.models': 'Default models',
       'settings.modelsHint': 'Leave empty to keep automatic picking (one provider, distinct model names, at most three). Choices come from the live catalog; a model that went away is called out below.',
       'settings.chairman': 'Default chairman',
@@ -1352,7 +1356,8 @@ const RUN_DISCOVERY_MS = 4000
       /* Seeded from the accepted Host value during render, not from an effect:
          the draft must already equal what the Host holds on the first paint,
          or a reader who saves immediately would write an empty selection. */
-      const [draftEnabled, setDraftEnabled] = React.useState(() => acceptedSettings().enabled !== false)
+      const [draftToolEnabled, setDraftToolEnabled] = React.useState(() => acceptedSettings().toolEnabled !== false)
+      const [draftPanelEnabled, setDraftPanelEnabled] = React.useState(() => acceptedSettings().panelEnabled !== false)
       const [draftModels, setDraftModels] = React.useState(() => acceptedDefaultModels())
       const [draftChairman, setDraftChairman] = React.useState(() => {
         const value = acceptedSettings().defaultChairman
@@ -1370,7 +1375,8 @@ const RUN_DISCOVERY_MS = 4000
         const form = settingsForm
         if (form === null) return undefined
         const sync = () => {
-          setDraftEnabled(acceptedSettings().enabled !== false)
+          setDraftToolEnabled(acceptedSettings().toolEnabled !== false)
+          setDraftPanelEnabled(acceptedSettings().panelEnabled !== false)
           setDraftModels(acceptedDefaultModels())
           const chairman = acceptedSettings().defaultChairman
           setDraftChairman(typeof chairman === 'string' ? chairman : '')
@@ -1411,7 +1417,8 @@ const RUN_DISCOVERY_MS = 4000
         setNotice('')
         try {
           await form.mutate([
-            { op: 'set', path: ['enabled'], value: draftEnabled },
+            { op: 'set', path: ['toolEnabled'], value: draftToolEnabled },
+            { op: 'set', path: ['panelEnabled'], value: draftPanelEnabled },
             { op: 'set', path: ['defaultModels'], value: draftModels },
             { op: 'set', path: ['defaultChairman'], value: draftChairman },
           ], revision)
@@ -1434,12 +1441,22 @@ const RUN_DISCOVERY_MS = 4000
         h('label', { className: 'dsc-settings-row' },
           h('input', {
             type: 'checkbox',
-            checked: draftEnabled === true,
-            onChange: (event) => setDraftEnabled(event.target.checked === true),
+            checked: draftToolEnabled === true,
+            onChange: (event) => setDraftToolEnabled(event.target.checked === true),
           }),
-          h('span', null, t('settings.enabled')),
+          h('span', null, t('settings.toolEnabled')),
         ),
-        h('div', { className: 'dsc-settings-hint' }, t('settings.enabledHint')),
+        h('div', { className: 'dsc-settings-hint' }, t('settings.toolEnabledHint')),
+
+        h('label', { className: 'dsc-settings-row' },
+          h('input', {
+            type: 'checkbox',
+            checked: draftPanelEnabled === true,
+            onChange: (event) => setDraftPanelEnabled(event.target.checked === true),
+          }),
+          h('span', null, t('settings.panelEnabled')),
+        ),
+        h('div', { className: 'dsc-settings-hint' }, t('settings.panelEnabledHint')),
 
         h('div', { className: 'dsc-settings-label' }, t('settings.models')),
         h('div', { className: 'dsc-settings-hint' }, t('settings.modelsHint')),

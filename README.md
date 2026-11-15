@@ -2,7 +2,7 @@
 
 > 仓库：<https://github.com/sprw-li/dsh-model-council>
 >
-> **Status: alpha (`v0.1.0-alpha`)** — 接口与行为仍可能变化，正式版等外部反馈后再定。
+> **Status: alpha** — 接口与行为仍可能变化，正式版等外部反馈后再定。已发布到 npm 的只有 `0.1.0`；仓库源码为 `0.2.27`（见文末「版本与发布」）。
 
 DeepSeek Harness 的多模型理事会插件：一个入口把问题交给多个模型并行作答、匿名互评，可选主席汇总，并可把结论回投主聊天。结果常驻右侧栏 tab。
 
@@ -32,7 +32,7 @@ DeepSeek Harness 的多模型理事会插件：一个入口把问题交给多个
 
 - 开启上下文时，**最近约 6000 字会话内容会发送至所选模型提供商**；回投会再向主 Agent 发一条消息。
 - 单轮模型调用数：`2 × 参与模型数 + 主席(0/1) + 回投(0/1)`，开始按钮旁会显示预计次数。
-- **静默注入**不产生额外模型调用（结论进入 inbox，等下一次对话才被消费）；**直接唤醒**会额外触发一轮主 Agent 回复。
+- **静默注入**不产生额外模型调用（`agent.inject()` 把结论放进下一次模型请求前的上下文，**不排队、不唤醒**）；**直接唤醒**会额外触发一轮主 Agent 回复。
 - 上下文上限可配置（见下），范围 500–50000 字。
 - 插件不读取或记录 API Key；模型调用全部走 DSH 的 `ctx.llm`。
 
@@ -133,11 +133,16 @@ council_review({
 
 **设置 → 理事会**
 
-| 设置项 | 作用 |
+本插件有**两个入口**，各自独立开关（一个关掉不影响另一个）：
+
+| 设置项 | 管什么 |
 |---|---|
-| `enabled` | 关闭后模型调用 `council_review` 会被拒绝，并在工具结果里说明原因（面板入口 `/council` 不受影响） |
-| `defaultModels` | 工具未显式传 `models` 时用它。**选项来自 Host 的实时模型目录**（`GET /council/models`），模型下线后会标为"已保存但当前不可用"而不是静默改写 |
+| `toolEnabled` | **内置工具入口**（agent 侧）：`council_review`。关闭后模型调用它会被拒绝，并在工具结果里说明原因 |
+| `panelEnabled` | **外部入口**（用户侧）：侧栏面板与 `/council` 命令，以及 `POST /council/run`、`/resume`、`/cancel`。关闭后无法发起/恢复/取消评审，**只读查询（`/council/runs`、`/council/models`、运行详情）仍然可用** |
+| `defaultModels` | 内置工具未显式传 `models` 时的默认评审模型。**选项来自 Host 的实时模型目录**（`GET /council/models`），模型下线后会标为"已保存但当前不可用"而不是静默改写 |
 | `defaultChairman` | 未显式传 chairman 时的默认主席；必须同时在参与者名单内，否则回退首位 |
+
+> 早先版本用单个 `enabled` 只关工具、面板照跑，字段名会让人以为整个插件停了。现在拆成两个显式开关。
 
 `defaultModels` 只要求"与模型目录同步"（解析成功、去重、≤6 条）；**不强制异构性** —— 同一 provider 的多个模型是用户的显式选择。异构性（单 provider、模型名互不相同、≤3）只在**自动挑选**分支强制。
 
@@ -149,7 +154,8 @@ council_review({
 - id: council
   name: dsh-model-council
   config:
-    enabled: true
+    toolEnabled: true
+    panelEnabled: true
     defaultModels: []
     defaultChairman: ''
     contextMaxChars: 6000
@@ -182,7 +188,7 @@ council_review({
 - **降级熔断 3**：每个 run 最多降级 3 席（超时/失败 → 纯模型）——刻意低于 `MAX_MODELS = 6`，因为连续多席失败通常意味着 provider 故障而非单席偶发，继续降级只会放大负载；触发熔断时整轮报错并注明原因。`seat.fallback/fallbackFrom` 与 `run.fallbacks/fallbackLimit` 可在快照里审计。
 - **单会话单 run**：同一 `sessionId` 已有运行中的评审时，`POST /council/run` 返回 409 + 现有 runId，前端改为接回而不是再开一份。
 - **运行注册表持久化**：写入 `${DSH_HOME:-~/.dsh}/council-runs.json`（最多 20 条，500ms 防抖）；Host 重启后仍能查到历史运行，重启前仍在跑的被标注为「Host 重启，运行中断」。
-- **源码包（评审必读）**：问题含 `评审/审查/review/audit` 等意图时，除目录树与关键文档外，还会自动打包**真实源码**：最多 24 个源码文件、单文件 4k 字、总预算 `codeMaxChars`（默认 40k），路径全部标注；提示词要求结论必须引用具体文件、附件未覆盖的内容标注【推断】。快照新增 `codeState/codeFiles/codeChars` 与**覆盖率** `codeDiscovered/codeTruncated`（发现数 vs 附带数、截断数），UI 显示「已附带源码 N 个文件（X 字）」——**这是抽样初审，不是全项目审查**；附件头部自带覆盖率声明。
+- **源码包（评审必读）**：问题含 `评审/审查/review/audit` 等意图时，除目录树与关键文档外，还会自动打包**真实源码**：单文件 ≤ `CODE_FILE_CHARS`（12000 字）、总预算 `codeMaxChars`（默认 120000 字，即 `CODE_MAX_CHARS`），遍历条目上限 `CODE_WALK_ENTRIES`（2000）；主文件拿 80% 预算，大文件按问题关键词锚定采样（完整函数体 → 命名符号窗口 → 关键词簇），路径全部标注；提示词要求结论必须引用具体文件、附件未覆盖的内容标注【推断】。快照新增 `codeState/codeFiles/codeChars` 与**覆盖率** `codeDiscovered/codeTruncated`（发现数 vs 附带数、截断数），UI 显示「已附带源码 N 个文件（X 字）」——**这是抽样初审，不是全项目审查**；附件头部自带覆盖率声明。
 - **附件安全**：`@mention` 只解析到工作区内（拒绝 `..` 穿越）；路径附件拒绝符号链接、密钥类文件（`.env`/`.pem`/`.key`/`.ssh`/`.aws`/`.kube`/`id_rsa` 等）、二进制与 >1MB 文件；skill 只读加载、脚本不执行。
 - **自动化回归**：`npm run verify` 现在同时跑 host 与 client harness（路径修复/穿越拒绝/密钥跳过/超时语义/并发窗口）。
 
@@ -203,7 +209,7 @@ council_review({
 
 ## 安装
 
-npm 上的发布版本为 **0.1.0**（dist-tags `latest` / `alpha`）；本仓库源码版本 **0.2.0** 尚未发布到 npm——发布 0.2.x 需要新的 granular token（旧的已吊销）。
+npm 上的发布版本为 **0.1.0**（dist-tags `latest` / `alpha`）；本仓库源码版本 **0.2.27**，尚未发布到 npm——发布 0.2.x 需要新的 granular token（旧的已吊销）。
 
 ```sh
 # 从 npm
@@ -246,7 +252,7 @@ node <workspace>\tmp\push-council.mjs <本目录> sprw-li/dsh-model-council main
 
 ## 发布记录与后续
 
-- GitHub：<https://github.com/sprw-li/dsh-model-council>，首个 release `v0.1.0-alpha`（pre-release，含可安装 tarball）。
-- npm：<https://www.npmjs.com/package/dsh-model-council>（已发布 `0.1.0`；**0.2.0 未发布**——`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
+- GitHub：<https://github.com/sprw-li/dsh-model-council>，release 有 `v0.1.0-alpha` 与 `v0.2.0`（pre-release）。
+- npm：<https://www.npmjs.com/package/dsh-model-council>（已发布 `0.1.0`；仓库源码 `0.2.27` **尚未发布**——`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
 
 发新版本：更新 `CHANGELOG.md` 与 `package.json` 版本 → `npm run verify` → commit/tag → `npm publish --tag alpha`（npm 新包首次发布会进入 staged 审核，通常几分钟内变为可安装）→ `npm pack` + `gh release create vX.Y.Z --prerelease --notes-file CHANGELOG.md <tarball>`。

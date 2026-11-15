@@ -17,13 +17,18 @@
 
 ## 2. 设置页 + 默认 models（host + client）
 
-设置 → **理事会**，三个字段：
+设置 → **理事会**。本插件有**两个入口**，各自独立开关——早期版本用一个 `enabled` 只关工具、
+面板照跑，字段名会让人以为整个插件都停了：
 
-| 字段 | 行为 |
+| 字段 | 管什么 |
 |---|---|
-| `enabled` | `false` 时 `council_review` 抛出「已在设置中关闭」并说明原因（面板入口不受影响） |
-| `defaultModels` | 未显式传 `models` 时用它；**选项来自实时模型目录**，下线模型标为"已保存但当前不可用" |
+| `toolEnabled` | **内置工具入口**（agent 侧）：`council_review`。关闭后模型调用它会被拒绝并说明原因 |
+| `panelEnabled` | **外部入口**（用户侧）：侧栏面板与 `/council`；关闭后 `POST /council/run`、`/resume`、`/cancel` 返回 `403 { code: "panel-disabled" }`，**只读查询仍然可用** |
+| `defaultModels` | 工具未显式传 `models` 时的默认评审模型。**选项来自实时模型目录**，下线模型标为"已保存但当前不可用" |
 | `defaultChairman` | 未显式传时作为默认主席；须同时在参与者名单内，否则回退首位 |
+
+只读路由（`GET /council/runs`、`/council/models`、运行详情、`/stream`）不随 `panelEnabled` 关闭：
+闸门关的是"发起/干预运行"，不是"观察已存在的运行"。
 
 挑选优先级：显式 `models` > 非空 `defaultModels` > 自动挑选。`defaultModels` 配置了却**全部不可用**时
 **不静默回退**，而是抛出「defaultModels 中没有可用模型」——静默回退会让设置看起来生效了实际没生效。
@@ -50,12 +55,32 @@ run 记录新增 `modelSource` / `defaultModelProblems` 便于诊断。
 
 ## 4. 测试
 
-- `dev/verify-host.mjs` 新增整节（Config 契约含 `meta.volatile===true`、`provider/model` 解析、
-  目录对齐、挑选优先级、主席回退、`enabled` 用**与 loader 相同的 volatile 写入协议**做活写并断言立即生效）
+- `dev/verify-host.mjs` 新增整节（Config 契约含 `meta.volatile===true`、两个开关的独立性与默认值、
+  `toolEnabled=false` 拒绝工具、`panelEnabled=false` 时三个变更路由 403 + `code=panel-disabled` 且只读 GET 仍 200、
+  `provider/model` 解析、目录对齐、挑选优先级、主席回退、`enabled` 用**与 loader 相同的 volatile 写入协议**做活写并断言立即生效）
+- **新增「文档契约」断言：README 引用的常量与 `package.json` 版本必须与代码一致，漂移即测试失败。**
+  覆盖：源码包限额（`CODE_FILE_CHARS`/`CODE_MAX_CHARS`/`CODE_WALK_ENTRIES`）、仓库源码版本、
+  不得再出现被取代的旧值（`24 个源码文件`/`单文件 4k 字`/`默认 40k`/`0.2.0 未发布`）、
+  回投机制必须写成 `agent.inject()`、subagent 默认关。
+  为此把三个限额常量从 `index.js` 导出（与既有 `RUN_TIMEOUT_MS` 等同做法），避免断言里硬编码数字。
 - `dev/verify-client.mjs` 补 `react-dom` 假实现（记录 portal 目标）与 `configForms` 桩，新增断言：
   浮窗注册 id / 渲染席位与问题 / **portal 到 `document.body`** / 渲染不投递不取消 / 发现机制 leader 门控；
-  设置页用 cordis entry id 绑定 / 保存原子写三个字段且带 revision / 已下线的已保存模型被报出
-- 基线对照：改动前后 `npm run verify` 均 exit 0
+  设置页用 cordis entry id 绑定 / 保存原子写**四个**字段且带 revision / **两个开关互不代偿**（一个关不影响另一个）/
+  已下线的已保存模型被报出
+- 基线对照：改动前后 `npm run verify` 均 exit 0；全套耗时约 17.5 s
+
+### 4.1 顺手修掉的 README 漂移（外部审查报告 P1）
+
+审查报告指出"文档与实现漂移"，其中两处到 0.2.27 仍在：
+
+| 位置 | 原值 | 现值 |
+|---|---|---|
+| 结果回投描述 | "结论进入 inbox" | `agent.inject()`（**不排队、不唤醒**） |
+| 仓库源码版本 | `0.2.0` | `0.2.27` |
+| 源码包限额 | "最多 24 个源码文件、单文件 4k 字、总预算 40k" | 12000 / 120000 / 2000 条目（v0.2.25 已改代码，README 未同步） |
+
+这些不再靠人工对齐——第 4 节那组文档契约断言会在漂移时报错。已实测其**判别力**：
+真实 README 全过，把版本与限额改回旧值后 5 条谓词失败。
 
 **未验证**：真实 GUI 里的设置页渲染与写入往返（Web 服务器全部路由需鉴权，命令行取不到客户端模块）。
 Host 侧已实测：热加载后 `GET /council/` 报 `build=v57`、`GET /council/models` 200（3 个 provider）。

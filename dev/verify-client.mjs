@@ -278,7 +278,7 @@ const configEntryRequests = []
 const configWrites = []
 const configListeners = new Set()
 const configForm = {
-  value: { enabled: true, defaultModels: [], defaultChairman: '' },
+  value: { toolEnabled: true, panelEnabled: true, defaultModels: [], defaultChairman: '' },
   revision: 7,
   getSnapshot() { return { revision: this.revision, value: Object.assign({}, this.value) } },
   subscribe(listener) {
@@ -556,7 +556,7 @@ if (!configEntryRequests.includes('council')) {
 configForm.value.defaultModels = ['providerA/modelC']
 const settingsTree = build(React.createElement(sectionReg.component, { t }))
 const settingsHtml = render(React.createElement(sectionReg.component, { t }))
-for (const expected of ['默认模型', '默认主席', '启用 council_review 工具']) {
+for (const expected of ['默认模型', '默认主席', '启用内置工具 council_review', '启用 /council 面板入口']) {
   if (!settingsHtml.includes(expected)) throw new Error(`settings page missing "${expected}": ${settingsHtml.slice(0, 400)}`)
 }
 const saveButton = findButtonByText(settingsTree, '保存')
@@ -566,8 +566,15 @@ await new Promise((resolve) => setTimeout(resolve, 60))
 if (configWrites.length === 0) throw new Error('save did not write the configuration form')
 const write = configWrites[configWrites.length - 1]
 const written = new Map(write.ops.map((op) => [op.path[0], op.value]))
-if (!written.has('enabled') || !written.has('defaultModels') || !written.has('defaultChairman')) {
-  throw new Error(`save must write all three fields atomically, got ${JSON.stringify(write.ops)}`)
+/* The tool entry and the panel entry are two distinct surfaces: one switch must
+   not silently stand in for the other, so both are written explicitly. */
+for (const field of ['toolEnabled', 'panelEnabled', 'defaultModels', 'defaultChairman']) {
+  if (!written.has(field)) {
+    throw new Error(`save must write "${field}" atomically, got ${JSON.stringify(write.ops)}`)
+  }
+}
+if (written.get('toolEnabled') !== true || written.get('panelEnabled') !== true) {
+  throw new Error(`save wrote the wrong switch values: ${JSON.stringify(written.get('toolEnabled'))}/${JSON.stringify(written.get('panelEnabled'))}`)
 }
 if (JSON.stringify(written.get('defaultModels')) !== JSON.stringify(['providerA/modelC'])) {
   throw new Error(`save wrote the wrong default models: ${JSON.stringify(written.get('defaultModels'))}`)
@@ -582,6 +589,34 @@ if (!missingHtml.includes('retired/gone-model')) {
   throw new Error(`a saved but unavailable model must be reported: ${missingHtml.slice(0, 400)}`)
 }
 configForm.value.defaultModels = []
+
+/* The two switches must be independent: the panel entry is not the tool entry,
+   so one being off must not flip the other. */
+configForm.value.toolEnabled = false
+configForm.value.panelEnabled = true
+function collectCheckboxes(node, out = []) {
+  if (node === null || node === undefined) return out
+  if (Array.isArray(node)) {
+    for (const item of node) collectCheckboxes(item, out)
+    return out
+  }
+  if (node.type === 'input' && node.props !== undefined && node.props.type === 'checkbox') out.push(node)
+  collectCheckboxes(node.children, out)
+  return out
+}
+const splitTree = build(React.createElement(sectionReg.component, { t }))
+const boxes = collectCheckboxes(splitTree)
+/* Model cells are checkboxes too; the two entry switches render first. */
+const switchBoxes = boxes.slice(0, 2)
+if (switchBoxes.length !== 2) {
+  throw new Error(`settings page must render exactly two entry switches, got ${switchBoxes.length}`)
+}
+const checkedStates = switchBoxes.map((box) => box.props.checked)
+if (checkedStates[0] !== false || checkedStates[1] !== true) {
+  throw new Error(`the two entry switches must be independent, got ${JSON.stringify(checkedStates)}`)
+}
+configForm.value.toolEnabled = true
+configForm.value.panelEnabled = true
 
 /* Selection context menu: right-click a passage offers the council review item. */
 if (typeof command.icon !== 'function') throw new Error('command has no slash-menu icon')
