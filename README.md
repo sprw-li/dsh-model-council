@@ -219,9 +219,15 @@ npx --yes @deepseek-ai/dsh@latest plugin --profile <name> add `
 ## 开发与测试
 
 ```sh
-npm run verify    # 离线客户端 harness：入口、开关、回投、部分失败、全失败、防重入、桥接
+npm install       # 必需：index.js 导入 @deepseek-ai/schemastery（声明 Config 用），
+                  # harness 跑在普通 node 下，没有它 dev/verify-host.mjs 会 ERR_MODULE_NOT_FOUND
+npm run verify    # 客户端 + host + runtime + sampler 四个 harness
 npm run syntax    # node --check 两个入口
 ```
+
+> `@deepseek-ai/schemastery` 同时声明为 `peerDependencies`（运行期：DSH 给 linked 插件装的路由层
+> 要求祖先 package.json 声明它，否则回落 native 解析）与 `devDependencies`（普通 node 跑 harness）。
+> 干净检出必须先 `npm install`。CI 的安装步骤已写进 `.github/workflows/verify.yml`。
 
 CI：`.github/workflows/verify.yml`（文件已随目录保留；当前仓库 token 无 `workflow` scope 时 GitHub 会拒绝推送该文件，执行 `gh auth refresh -s workflow` 后 `git add .github/workflows/verify.yml && git push` 即可补上。本地等价的检查是 `npm run verify`）。
 

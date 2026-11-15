@@ -29,6 +29,9 @@
   "peerDependencies": {
     "@deepseek-ai/schemastery": "^3.18.5"
   },
+  "devDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.5"
+  },
   "scripts": {
     "verify": "node dev/verify-client.mjs && node dev/verify-host.mjs && node dev/verify-runtime.mjs && node dev/tune-sampler.mjs",
     "verify:host": "node dev/verify-host.mjs",
