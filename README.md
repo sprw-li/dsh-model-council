@@ -256,7 +256,7 @@ node <workspace>\tmp\push-council.mjs <本目录> sprw-li/dsh-model-council main
 
 这个脚本只推送远端还没有的本地 commit，并且**用原始的 tree / parent / 作者与时间重建提交**，因此远端 SHA 与本地 SHA 完全相同——不会出现两条分叉历史。首次对齐用 `tmp\align-history.mjs`（重放整条链，SHA 不等就拒绝移动 ref）。
 
-**为什么两条路径都慢**：本机单次 `api.github.com` 往返约 **2.5 s**。REST 回退把"一次 packfile 传输"拆成十几次**串行** HTTP（1 取 ref + 变更文件数逐个 blob + 每个目录一次 trees + 1 commit + 1 ref PATCH），一次 6 文件提交约 **30–35 s**；`git push` 单次真实推送实测 **39.7 s**。**量级相同——换路径不会变快**；选 `git push` 是为了正确性与可维护性（标准协议、无 SHA 重放），不是为了提速。
+**为什么两条路径都慢**：本机单次 `api.github.com` 往返约 **2.5 s**。REST 回退把"一次 packfile 传输"拆成十几次**串行** HTTP（1 取 ref + 变更文件数逐个 blob + 每个目录一次 trees + 1 commit + 1 ref PATCH），一次 6 文件提交约 **30–35 s**；`git push` 真实推送实测 **10.6–39.7 s**（两次 39.7 / 14.5，随链路抖动）。**量级相同——换路径不会变快**；选 `git push` 是为了正确性与可维护性（标准协议、无 SHA 重放），不是为了提速。
 
 **`gh` 的写操作在本机会挂住**（实测 `gh release create` 240 s 无输出）。建 tag / release 用 REST 直连：
 `gh api -X POST repos/<o>/<r>/git/refs -f ref=refs/tags/vX.Y.Z -f sha=<commit>`，
