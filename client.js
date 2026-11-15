@@ -67,6 +67,23 @@ window.__ModuleLoader__.load({
       'tab.title': '理事会',
       'panel.loadModels': '重新读取模型',
       'stage.answers': '独立作答',
+      'overlay.title': '理事会运行',
+      'overlay.running': '运行中',
+      'overlay.starting': '正在启动',
+      'overlay.hide': '隐藏浮窗',
+      'settings.title': '理事会',
+      'settings.enabled': '启用 council_review 工具',
+      'settings.enabledHint': '关闭后模型调用 council_review 会被拒绝，并在工具结果里说明原因。',
+      'settings.models': '默认模型',
+      'settings.modelsHint': '留空则沿用自动挑选（同一 provider、模型名互不相同、最多 3 个）。列表来自当前可用模型目录，模型下线后会在此标出。',
+      'settings.chairman': '默认主席',
+      'settings.chairmanAuto': '自动',
+      'settings.save': '保存',
+      'settings.saving': '保存中…',
+      'settings.saved': '已保存',
+      'settings.saveFailed': '保存未生效（可能被更新的一版覆盖）',
+      'settings.unavailable': '已保存但当前不可用的模型：{list}',
+      'settings.noForm': '当前客户端没有提供设置表单接口（configForms），无法在这里修改配置。',
       'stage.reviews': '交叉互评',
       'stage.chairman': '主席汇总',
       'stage.done': '已完成',
@@ -155,6 +172,23 @@ window.__ModuleLoader__.load({
       'tab.title': 'Council',
       'panel.loadModels': 'Reload models',
       'stage.answers': 'Answers',
+      'overlay.title': 'Council run',
+      'overlay.running': 'Running',
+      'overlay.starting': 'Starting',
+      'overlay.hide': 'Hide overlay',
+      'settings.title': 'Council',
+      'settings.enabled': 'Enable the council_review tool',
+      'settings.enabledHint': 'When disabled, a model calling council_review is refused with the reason in the tool result.',
+      'settings.models': 'Default models',
+      'settings.modelsHint': 'Leave empty to keep automatic picking (one provider, distinct model names, at most three). Choices come from the live catalog; a model that went away is called out below.',
+      'settings.chairman': 'Default chairman',
+      'settings.chairmanAuto': 'Automatic',
+      'settings.save': 'Save',
+      'settings.saving': 'Saving…',
+      'settings.saved': 'Saved',
+      'settings.saveFailed': 'Save did not land (a newer revision may have superseded it)',
+      'settings.unavailable': 'Saved but currently unavailable: {list}',
+      'settings.noForm': 'This client does not expose the configuration form API (configForms), so the settings cannot be edited here.',
       'stage.reviews': 'Peer review',
       'stage.chairman': 'Synthesis',
       'stage.done': 'Done',
@@ -189,6 +223,13 @@ window.__ModuleLoader__.load({
 
     /** Max participants requested from the host. */
     const MAX_MODELS = 6
+/* Cordis entry id of this plugin (see cordis.patch.yml). The settings page
+   binds the Host-backed configuration form through `ctx.configForms.get`. */
+const CONFIG_ENTRY_ID = 'council'
+/* How often the leader looks for a run this tab did not start. An agent-issued
+   `council_review` creates a Host run with no client involvement, so without
+   discovery the floating status card stays empty until the tab is opened. */
+const RUN_DISCOVERY_MS = 4000
     /** Version of the quick-quote ↔ council selection bridge. */
     const REVIEW_API_VERSION = 1
     /** Browser storage for selected models and row expansion. */
@@ -267,6 +308,37 @@ window.__ModuleLoader__.load({
 .dsc-section{display:flex;flex-direction:column;gap:6px}
 .dsc-section-title{font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary)}
 .dsc-chairman{padding:11px 12px;border:1px solid var(--dsw-alias-brand-primary);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-1);font-size:13px;line-height:1.65;white-space:pre-wrap;word-break:break-word}
+/* Floating run status. Portal-rendered, so it owns its own stacking. */
+.dsc-float{position:fixed;right:16px;bottom:96px;z-index:2147483000;width:min(330px,calc(100vw - 32px));display:flex;flex-direction:column;gap:7px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;background:var(--dsw-alias-bg-primary,#fff);box-shadow:0 8px 28px rgba(0,0,0,.18);font-size:12px}
+.dsc-float-head{display:flex;align-items:center;gap:8px}
+.dsc-float-title{font-weight:600}
+.dsc-float-stage{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary)}
+.dsc-float-count{flex:none;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums}
+.dsc-float-btn{flex:none;width:18px;height:18px;line-height:1;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}
+.dsc-float-btn:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.dsc-float-q{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary)}
+.dsc-float-seats{display:flex;flex-direction:column;gap:4px;max-height:168px;overflow:auto}
+.dsc-float-seat{display:flex;align-items:center;gap:6px;min-width:0}
+.dsc-float-dot{flex:none;width:7px;height:7px;border-radius:50%;background:var(--dsw-alias-label-secondary)}
+.dsc-float-dot.is-live{background:var(--dsw-alias-brand-primary);animation:dsc-pulse 1.2s ease-in-out infinite}
+.dsc-float-dot.is-done{background:var(--dsw-alias-state-success,#2e7d32)}
+.dsc-float-dot.is-error{background:var(--dsw-alias-state-error,#c62828)}
+@keyframes dsc-pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.dsc-float-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dsc-float-state{flex:none;color:var(--dsw-alias-label-secondary)}
+.dsc-float-error{color:var(--dsw-alias-state-error,#c62828);word-break:break-word}
+/* Settings page */
+.dsc-settings{display:flex;flex-direction:column;gap:8px;max-width:720px}
+.dsc-settings-row{display:flex;align-items:center;gap:8px}
+.dsc-settings-hint{font-size:12px;color:var(--dsw-alias-label-secondary)}
+.dsc-settings-label{margin-top:6px;font-size:12px;font-weight:600}
+.dsc-settings-group{display:flex;flex-direction:column;gap:4px}
+.dsc-settings-group-name{font-size:12px;color:var(--dsw-alias-label-secondary)}
+.dsc-settings-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:4px 10px}
+.dsc-settings-cell{display:flex;align-items:center;gap:6px;min-width:0}
+.dsc-settings-cell span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dsc-settings-select{max-width:340px;padding:4px 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-primary,#fff);color:inherit}
+.dsc-settings-actions{display:flex;align-items:center;gap:10px;margin-top:6px}
 `
 
     /* ------------------------------------------------------------------ *
@@ -863,6 +935,45 @@ window.__ModuleLoader__.load({
 
     let pollFailures = 0
     let resumeInFlight = ''
+    let discoveryTimer = 0
+
+    /**
+     * Look for a run this tab did not start.
+     *
+     * An agent-issued `council_review` creates the Host run without any client
+     * involvement, so nothing calls `watchRun`. The floating status card must
+     * not depend on the user opening the sidebar tab first.
+     *
+     * Leader-gated on purpose: "followers never schedule" is a fixed defect
+     * (a per-tab discovery timer is the same idle loop), and the leader is the
+     * tab that already owns polling.
+     */
+    function scheduleRunDiscovery() {
+      if (isPollLeader() !== true) return
+      if (discoveryTimer !== 0) return
+      if (typeof window === 'undefined') return
+      discoveryTimer = window.setTimeout(() => {
+        discoveryTimer = 0
+        if (isPollLeader() !== true) return
+        /* A live run already has a stream; discovery is only for finding one. */
+        if (store.state.running === true && store.state.runId !== '' && store.state.run !== null) {
+          scheduleRunDiscovery()
+          return
+        }
+        void adoptRunningRun().then(() => {
+          scheduleRunDiscovery()
+        }, () => {
+          scheduleRunDiscovery()
+        })
+      }, RUN_DISCOVERY_MS)
+    }
+
+    function stopRunDiscovery() {
+      if (discoveryTimer !== 0) {
+        window.clearTimeout(discoveryTimer)
+        discoveryTimer = 0
+      }
+    }
 
     async function pollRun(runId) {
       if (store.state.runId !== runId) return
@@ -1064,6 +1175,327 @@ window.__ModuleLoader__.load({
      * entry point: the tab never starts a run by itself, so the user can
      * review the question, participants and options before pressing run.
      */
+    /* ------------------------------------------------------------------ *
+     * Floating run status — `conversation.input.overlay`
+     * ------------------------------------------------------------------ */
+
+    let reactDom = null
+    try {
+      reactDom = require('react-dom')
+    } catch {
+      reactDom = null
+    }
+
+    /** The slot contract says a fixed overlay must portal to the document body. */
+    function canPortal() {
+      return reactDom !== null && reactDom !== undefined
+        && typeof reactDom.createPortal === 'function'
+        && typeof document !== 'undefined'
+        && document !== null
+        && document.body !== null
+        && document.body !== undefined
+    }
+
+    /**
+     * Floating council run-status card.
+     *
+     * Lives in the same seat as the shipped command popup, slash menu, and
+     * feedback dialog. Without a portal a `position: fixed` card is contained
+     * by the docked composer card, so the portal is not cosmetic.
+     *
+     * The card is display-only: it never writes run state and never delivers a
+     * conclusion. Delivery stays with the leader's stream/poll path.
+     */
+    function CouncilStatusOverlay(props) {
+      const t = typeof props.t === 'function' ? props.t : tr
+      const state = useStore((snapshot) => ({
+        run: snapshot.run,
+        running: snapshot.running,
+        runId: snapshot.runId,
+      }))
+      const [hidden, setHidden] = React.useState(false)
+
+      React.useEffect(() => {
+        /* An agent-issued `council_review` starts a Host run that nothing else
+           tells this tab about, so the card would stay empty without this. */
+        void adoptRunningRun()
+        scheduleRunDiscovery()
+        return () => stopRunDiscovery()
+      }, [])
+
+      /* A new run must un-hide a card the user dismissed for the previous one. */
+      React.useEffect(() => {
+        setHidden(false)
+      }, [state.runId])
+
+      const run = state.run
+      if (hidden === true || (run === null && state.running !== true)) return null
+
+      const answers = run !== null && Array.isArray(run.answers) ? run.answers : []
+      const finished = answers.filter((answer) => answer !== null && typeof answer === 'object' && answer.done === true).length
+      const stageNames = {
+        answers: t('stage.answers'),
+        reviews: t('stage.reviews'),
+        chairman: t('stage.chairman'),
+        done: t('stage.done'),
+      }
+      const stage = run !== null && stageNames[run.stage] !== undefined ? stageNames[run.stage] : stageNames.answers
+      const statusText = run === null
+        ? t('overlay.starting')
+        : run.status === 'error'
+          ? t('status.error')
+          : run.status === 'done' ? t('status.done') : t('overlay.running')
+
+      const card = h('div', {
+        className: 'dsc-float',
+        role: 'status',
+        'aria-live': 'polite',
+      },
+        h('div', { className: 'dsc-float-head' },
+          h('span', { className: 'dsc-float-title' }, t('overlay.title')),
+          h('span', { className: 'dsc-float-stage' }, `${statusText} · ${stage}`),
+          h('span', { className: 'dsc-float-count' }, `${finished}/${answers.length}`),
+          h('button', {
+            type: 'button',
+            className: 'dsc-float-btn',
+            title: t('overlay.hide'),
+            'aria-label': t('overlay.hide'),
+            onClick: () => setHidden(true),
+          }, '×'),
+        ),
+        run !== null && typeof run.question === 'string' && run.question !== ''
+          ? h('div', { className: 'dsc-float-q', title: run.question }, run.question)
+          : null,
+        answers.length > 0
+          ? h('div', { className: 'dsc-float-seats' },
+            answers.map((answer) => {
+              const failed = typeof answer.error === 'string' && answer.error !== ''
+              const tone = failed ? ' is-error' : answer.done === true ? ' is-done' : ' is-live'
+              return h('div', { className: 'dsc-float-seat', key: answer.key },
+                h('span', { className: 'dsc-float-dot' + tone }),
+                h('span', { className: 'dsc-float-name', title: answer.model }, answer.name),
+                h('span', { className: 'dsc-float-state' },
+                  failed ? t('status.error')
+                    : answer.done === true ? t('status.done') : seatStatusText(answer.seat)),
+              )
+            }),
+          )
+          : null,
+        run !== null && typeof run.error === 'string' && run.error !== ''
+          ? h('div', { className: 'dsc-float-error' }, run.error)
+          : null,
+      )
+
+      if (!canPortal()) return card
+      return reactDom.createPortal(card, document.body)
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Settings page — `settings.section`
+     * ------------------------------------------------------------------ */
+
+    /* Bound Host configuration form for entry `council`; null when the Host or
+       the settings layer is unavailable, in which case the page says so
+       instead of pretending the switches work. */
+    let settingsForm = null
+
+    /** `<provider>/<model>` — the stored shape of a default route. */
+    function routeKeyOf(entry) {
+      if (entry === null || typeof entry !== 'object') return ''
+      if (typeof entry.provider !== 'string' || typeof entry.model !== 'string') return ''
+      if (entry.provider === '' || entry.model === '') return ''
+      return `${entry.provider}/${entry.model}`
+    }
+
+    /** Parse a stored `provider/model` route; a malformed entry is dropped. */
+    function parseRouteKey(key) {
+      if (typeof key !== 'string') return null
+      const slash = key.indexOf('/')
+      if (slash <= 0 || slash === key.length - 1) return null
+      const provider = key.slice(0, slash)
+      const model = key.slice(slash + 1)
+      if (provider === '' || model === '') return null
+      return { provider, model }
+    }
+
+    /** Accepted value of the bound configuration entry, or {} when unbound. */
+    function acceptedSettings() {
+      const form = settingsForm
+      if (form === null || typeof form.getSnapshot !== 'function') return {}
+      const snapshot = form.getSnapshot()
+      return snapshot !== null && typeof snapshot === 'object'
+        && snapshot.value !== null && typeof snapshot.value === 'object' ? snapshot.value : {}
+    }
+
+    /** Stored default routes, filtered to the string shape the schema expects. */
+    function acceptedDefaultModels() {
+      const value = acceptedSettings().defaultModels
+      return Array.isArray(value) ? value.filter((key) => typeof key === 'string') : []
+    }
+
+    /**
+     * Settings page for the council tool.
+     *
+     * Model choices come from `store.state.catalog` — the Host route
+     * `/council/models` that `loadModels()` keeps in sync with the live
+     * provider catalog. The picker therefore never offers a model the Host no
+     * longer serves, and a stored key that vanished is surfaced as unavailable
+     * instead of being silently rewritten.
+     */
+    function CouncilSettingsSection(props) {
+      const t = typeof props.t === 'function' ? props.t : tr
+      const state = useStore((snapshot) => ({
+        catalog: snapshot.catalog,
+        loading: snapshot.loading,
+        loadError: snapshot.loadError,
+      }))
+      /* Seeded from the accepted Host value during render, not from an effect:
+         the draft must already equal what the Host holds on the first paint,
+         or a reader who saves immediately would write an empty selection. */
+      const [draftEnabled, setDraftEnabled] = React.useState(() => acceptedSettings().enabled !== false)
+      const [draftModels, setDraftModels] = React.useState(() => acceptedDefaultModels())
+      const [draftChairman, setDraftChairman] = React.useState(() => {
+        const value = acceptedSettings().defaultChairman
+        return typeof value === 'string' ? value : ''
+      })
+      const [ready, setReady] = React.useState(() => settingsForm !== null)
+      const [saving, setSaving] = React.useState(false)
+      const [notice, setNotice] = React.useState('')
+
+      React.useEffect(() => {
+        if (state.catalog.length === 0 && state.loading !== true) void loadModels()
+      }, [state.catalog.length, state.loading])
+
+      React.useEffect(() => {
+        const form = settingsForm
+        if (form === null) return undefined
+        const sync = () => {
+          setDraftEnabled(acceptedSettings().enabled !== false)
+          setDraftModels(acceptedDefaultModels())
+          const chairman = acceptedSettings().defaultChairman
+          setDraftChairman(typeof chairman === 'string' ? chairman : '')
+          setReady(true)
+        }
+        sync()
+        const unsubscribe = typeof form.subscribe === 'function' ? form.subscribe(sync) : null
+        return () => {
+          if (typeof unsubscribe === 'function') unsubscribe()
+        }
+      }, [ready])
+
+
+      const catalogKeys = new Set(state.catalog.map((row) => `${row.provider}/${row.model}`))
+      const missing = draftModels.filter((key) => !catalogKeys.has(key) && parseRouteKey(key) !== null)
+      const groups = []
+      for (const row of state.catalog) {
+        let group = groups.find((candidate) => candidate.provider === row.provider)
+        if (group === undefined) {
+          group = { provider: row.provider, name: row.providerName, rows: [] }
+          groups.push(group)
+        }
+        group.rows.push(row)
+      }
+
+      function toggleModel(key) {
+        setDraftModels((current) => current.includes(key)
+          ? current.filter((candidate) => candidate !== key)
+          : current.concat([key]))
+      }
+
+      async function save() {
+        const form = settingsForm
+        if (form === null) return
+        const snapshot = typeof form.getSnapshot === 'function' ? form.getSnapshot() : null
+        const revision = snapshot !== null && typeof snapshot === 'object' ? snapshot.revision : undefined
+        setSaving(true)
+        setNotice('')
+        try {
+          await form.mutate([
+            { op: 'set', path: ['enabled'], value: draftEnabled },
+            { op: 'set', path: ['defaultModels'], value: draftModels },
+            { op: 'set', path: ['defaultChairman'], value: draftChairman },
+          ], revision)
+          setNotice(t('settings.saved'))
+        } catch {
+          setNotice(t('settings.saveFailed'))
+        }
+        setSaving(false)
+      }
+
+      if (settingsForm === null) {
+        return h('div', { className: 'dsc-settings' },
+          h('div', { className: 'dsc-section-title' }, t('settings.title')),
+          h('div', { className: 'dsc-warn' }, t('settings.noForm')),
+        )
+      }
+
+      return h('div', { className: 'dsc-settings' },
+        h('div', { className: 'dsc-section-title' }, t('settings.title')),
+        h('label', { className: 'dsc-settings-row' },
+          h('input', {
+            type: 'checkbox',
+            checked: draftEnabled === true,
+            onChange: (event) => setDraftEnabled(event.target.checked === true),
+          }),
+          h('span', null, t('settings.enabled')),
+        ),
+        h('div', { className: 'dsc-settings-hint' }, t('settings.enabledHint')),
+
+        h('div', { className: 'dsc-settings-label' }, t('settings.models')),
+        h('div', { className: 'dsc-settings-hint' }, t('settings.modelsHint')),
+        state.loading === true && state.catalog.length === 0
+          ? h('div', { className: 'dsc-settings-hint' }, t('bar.loading'))
+          : null,
+        state.loadError !== '' ? h('div', { className: 'dsc-warn' }, state.loadError) : null,
+        groups.length === 0 && state.loading !== true
+          ? h('div', { className: 'dsc-settings-hint' }, t('bar.empty'))
+          : null,
+        groups.map((group) => h('div', { className: 'dsc-settings-group', key: group.provider },
+          h('div', { className: 'dsc-settings-group-name' }, group.name),
+          h('div', { className: 'dsc-settings-grid' },
+            group.rows.map((row) => {
+              const key = `${row.provider}/${row.model}`
+              return h('label', { className: 'dsc-settings-cell', key, title: row.model },
+                h('input', {
+                  type: 'checkbox',
+                  checked: draftModels.includes(key),
+                  onChange: () => toggleModel(key),
+                }),
+                h('span', null, row.name),
+              )
+            }),
+          ),
+        )),
+        missing.length > 0
+          ? h('div', { className: 'dsc-warn' }, t('settings.unavailable', { list: missing.join('、') }))
+          : null,
+
+        h('div', { className: 'dsc-settings-label' }, t('settings.chairman')),
+        h('select', {
+          className: 'dsc-settings-select',
+          value: draftChairman,
+          onChange: (event) => setDraftChairman(event.target.value),
+        },
+          h('option', { value: '' }, t('settings.chairmanAuto')),
+          state.catalog.map((row) => {
+            const key = `${row.provider}/${row.model}`
+            return h('option', { value: key, key }, `${row.providerName} · ${row.name}`)
+          }),
+          missing.includes(draftChairman) ? h('option', { value: draftChairman }, draftChairman) : null,
+        ),
+
+        h('div', { className: 'dsc-settings-actions' },
+          h('button', {
+            type: 'button',
+            className: 'dsc-btn',
+            disabled: saving === true || ready !== true,
+            onClick: () => { void save() },
+          }, saving === true ? t('settings.saving') : t('settings.save')),
+          notice !== '' ? h('span', { className: 'dsc-settings-hint' }, notice) : null,
+        ),
+      )
+    }
+
     async function openCouncilTab(request) {
       const asked = request !== null && request !== undefined && typeof request.question === 'string' ? request.question.trim() : ''
       /* Publish the question AFTER the session switch below: publishing first
@@ -1669,6 +2101,45 @@ window.__ModuleLoader__.load({
             if (created) tag.remove()
           }
         }, 'council: styles'))
+
+        /* The settings page is written against the Host-backed form for this
+           plugin's own cordis entry. `configForms` is absent on a client that
+           did not compose the settings layer, so this is feature-detected
+           rather than injected: the page then renders an explanation instead
+           of failing the whole plugin. */
+        track(ctx.effect(() => {
+          const forms = service('configForms')
+          if (forms === undefined || forms === null || typeof forms.get !== 'function') return undefined
+          let bound = null
+          try {
+            bound = forms.get(CONFIG_ENTRY_ID)
+          } catch {
+            bound = null
+          }
+          if (bound === null || bound === undefined) return undefined
+          settingsForm = bound
+          return () => {
+            if (settingsForm === bound) settingsForm = null
+          }
+        }, 'council: settings form binding'))
+
+        track(ctx.slots.inject('settings.section', () =>
+          ctx.slots.register({
+            name: 'settings.section',
+            id: CONFIG_ENTRY_ID,
+            order: 60,
+            label: () => tr('settings.title'),
+            locale: NS,
+          }, CouncilSettingsSection)))
+
+        track(ctx.slots.inject('conversation.input.overlay', () =>
+          ctx.slots.register({
+            name: 'conversation.input.overlay',
+            id: 'council-status',
+            order: 120,
+            label: () => tr('overlay.title'),
+            locale: NS,
+          }, CouncilStatusOverlay)))
 
         track(ctx.slots.inject('conversation.composer.dock', () =>
           ctx.slots.register({

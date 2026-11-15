@@ -177,8 +177,22 @@ const fakeDocument = {
   },
   querySelector() { return null },
   head: { appendChild(node) { styleTags.push(node) } },
+  /* `conversation.input.overlay` requires a fixed overlay to portal to the
+     body; without a body the card would silently take the inline path and the
+     portal branch would never be exercised. */
+  body: { appendChild() {}, removeChild() {} },
   addEventListener() {},
   removeEventListener() {},
+}
+
+/* Fake react-dom: records portals so the overlay test can prove it took the
+   documented body-portal path instead of rendering inline. */
+const portalCalls = []
+const ReactDom = {
+  createPortal(node, container) {
+    portalCalls.push(container)
+    return node
+  },
 }
 
 /* Minimal effect scheduler: enough to prove side effects actually run.
@@ -243,6 +257,7 @@ if (loadArgument.id !== PACKAGE_NAME) throw new Error(`unexpected module id: ${l
 
 const plugin = loadArgument.factory((specifier) => {
   if (specifier === 'react') return React
+  if (specifier === 'react-dom') return ReactDom
   throw new Error(`unexpected require("${specifier}")`)
 })
 if (typeof plugin.apply !== 'function') throw new Error('factory did not return { apply }')
@@ -257,6 +272,35 @@ const cleanups = []
 
 const tabRegistry = { register(definition) { tabTypes.push(definition); return () => {} } }
 const interactionDefs = []
+/* Host-backed configuration form stub for the plugin's own cordis entry.
+   Tracks the requested entry id so a wrong id cannot pass silently. */
+const configEntryRequests = []
+const configWrites = []
+const configListeners = new Set()
+const configForm = {
+  value: { enabled: true, defaultModels: [], defaultChairman: '' },
+  revision: 7,
+  getSnapshot() { return { revision: this.revision, value: Object.assign({}, this.value) } },
+  subscribe(listener) {
+    configListeners.add(listener)
+    return () => configListeners.delete(listener)
+  },
+  async mutate(ops, revision) {
+    configWrites.push({ ops, revision })
+    for (const op of ops) {
+      if (op.op === 'set') this.value[op.path[0]] = op.value
+    }
+    this.revision += 1
+    for (const listener of Array.from(configListeners)) listener()
+  },
+}
+const configFormsService = {
+  get(entryId) {
+    configEntryRequests.push(entryId)
+    return entryId === 'council' ? configForm : null
+  },
+}
+
 const services = {
   layout: { openRightbar() {} },
   sidebarRight: { openTab(kind) { openedTabs.push(kind) } },
@@ -269,6 +313,7 @@ const services = {
       },
     },
   },
+  configForms: configFormsService,
 }
 
 function fakeGet(name) { return services[name] }
@@ -451,6 +496,92 @@ if (!filesHtml.includes('已附带 1 个路径')) throw new Error('path-attachme
 if (!filesHtml.includes('席位：1 个只读 subagent + 1 个快速')) throw new Error('hybrid seat note is missing after the run')
 if (!filesHtml.includes('已附带源码 4 个文件')) throw new Error('source-pack note is missing after the run')
 if (!filesHtml.includes('首字 0.9s')) throw new Error('per-seat TTFT metric is missing after the run')
+
+/* ---- Floating run status: conversation.input.overlay ---- */
+const overlayReg = registrations.find((entry) => entry.key === 'conversation.input.overlay')
+if (overlayReg === undefined) throw new Error('council did not register the floating run-status overlay')
+if (overlayReg.options.id !== 'council-status') {
+  throw new Error(`overlay must own its own cell id, got "${overlayReg.options.id}"`)
+}
+/* A finished run is still a run: the card must have something to show here. */
+const overlayHtml = render(React.createElement(overlayReg.component, { t }))
+if (!overlayHtml.includes('理事会运行')) {
+  throw new Error(`overlay missing its title: ${overlayHtml.slice(0, 300)}`)
+}
+if (!overlayHtml.includes('Model One')) {
+  throw new Error(`overlay did not render a seat row: ${overlayHtml.slice(0, 400)}`)
+}
+if (!overlayHtml.includes('测试问题')) {
+  throw new Error(`overlay did not show the question: ${overlayHtml.slice(0, 400)}`)
+}
+if (!/\d+\/\d+/.test(overlayHtml)) {
+  throw new Error(`overlay did not show seat progress: ${overlayHtml.slice(0, 400)}`)
+}
+/* The slot contract: a fixed overlay must portal to the document body,
+   because the docked composer card contains an in-place fixed element. */
+if (portalCalls.length === 0) throw new Error('overlay rendered inline instead of portaling')
+for (const container of portalCalls) {
+  if (container !== fakeDocument.body) throw new Error('overlay portaled somewhere other than the document body')
+}
+
+/* The card is display-only: rendering it must not deliver or cancel a run. */
+const resumeBeforeOverlay = resumeCalls.length
+const cancelBeforeOverlay = fetchCalls.filter((call) => /\/cancel$/.test(call.url)).length
+render(React.createElement(overlayReg.component, { t }))
+if (resumeCalls.length !== resumeBeforeOverlay) {
+  throw new Error('rendering the overlay must not deliver a conclusion')
+}
+if (fetchCalls.filter((call) => /\/cancel$/.test(call.url)).length !== cancelBeforeOverlay) {
+  throw new Error('rendering the overlay must not cancel the run')
+}
+/* Discovery must stay a leader duty, exactly like the poll schedulers. */
+for (const name of ['scheduleRunDiscovery']) {
+  const at = source.indexOf('function ' + name + '(')
+  if (at === -1) throw new Error(name + ' not found')
+  const head = source.slice(at, at + 400)
+  if (!/isPollLeader\(\) !== true/.test(head)) {
+    throw new Error(name + ' must refuse to arm for a non-leader')
+  }
+}
+
+/* ---- Settings page: settings.section over the Host configuration form ---- */
+const sectionReg = registrations.find((entry) => entry.key === 'settings.section')
+if (sectionReg === undefined) throw new Error('council did not register a settings section')
+if (sectionReg.options.id !== 'council') {
+  throw new Error(`settings section must use the cordis entry id, got "${sectionReg.options.id}"`)
+}
+if (!configEntryRequests.includes('council')) {
+  throw new Error(`settings form bound the wrong entry: ${JSON.stringify(configEntryRequests)}`)
+}
+configForm.value.defaultModels = ['providerA/modelC']
+const settingsTree = build(React.createElement(sectionReg.component, { t }))
+const settingsHtml = render(React.createElement(sectionReg.component, { t }))
+for (const expected of ['默认模型', '默认主席', '启用 council_review 工具']) {
+  if (!settingsHtml.includes(expected)) throw new Error(`settings page missing "${expected}": ${settingsHtml.slice(0, 400)}`)
+}
+const saveButton = findButtonByText(settingsTree, '保存')
+if (saveButton === undefined) throw new Error('settings page has no save button')
+saveButton.props.onClick()
+await new Promise((resolve) => setTimeout(resolve, 60))
+if (configWrites.length === 0) throw new Error('save did not write the configuration form')
+const write = configWrites[configWrites.length - 1]
+const written = new Map(write.ops.map((op) => [op.path[0], op.value]))
+if (!written.has('enabled') || !written.has('defaultModels') || !written.has('defaultChairman')) {
+  throw new Error(`save must write all three fields atomically, got ${JSON.stringify(write.ops)}`)
+}
+if (JSON.stringify(written.get('defaultModels')) !== JSON.stringify(['providerA/modelC'])) {
+  throw new Error(`save wrote the wrong default models: ${JSON.stringify(written.get('defaultModels'))}`)
+}
+/* A stored route the catalog no longer serves must be surfaced, not dropped. */
+if (!/7|revision/.test(String(write.revision))) {
+  throw new Error('save must be fenced by the revision read before editing')
+}
+configForm.value.defaultModels = ['retired/gone-model']
+const missingHtml = render(React.createElement(sectionReg.component, { t }))
+if (!missingHtml.includes('retired/gone-model')) {
+  throw new Error(`a saved but unavailable model must be reported: ${missingHtml.slice(0, 400)}`)
+}
+configForm.value.defaultModels = []
 
 /* Selection context menu: right-click a passage offers the council review item. */
 if (typeof command.icon !== 'function') throw new Error('command has no slash-menu icon')

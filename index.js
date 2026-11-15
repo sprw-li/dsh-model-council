@@ -25,6 +25,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { lstat, readdir, readFile, stat } from 'node:fs/promises'
 import { extname, isAbsolute, join, relative, sep } from 'node:path'
+import z from '@deepseek-ai/schemastery'
 
 export const inject = ['webServer', 'llm', 'agents', 'subagents', 'tools']
 
@@ -176,6 +177,31 @@ function errorText(error) {
   return error instanceof Error ? error.message : String(error)
 }
 
+/**
+ * Entry config for the `council` row (`cordis.patch.yml`). The Settings page
+ * writes these fields, so the three tool settings are declared `.volatile()`:
+ * cordis commits a volatile-only write into the SAME live source instead of
+ * restarting the plugin (`equalExceptVolatile` gate at cordis-plugin-loader
+ * lib/index.js:513, `_commitVolatile`/`updateVolatile` at :526-558),
+ * and {@link readSetting} observes the new value on the next tool call.
+ * Editing a non-volatile key keeps the historical behaviour: the row's ordinary
+ * update restarts the plugin so `apply` rebuilds its state.
+ */
+export const Config = z.object({
+  /** Master switch; false makes `council_review` refuse with a clear reason. */
+  enabled: z.boolean().default(true).volatile().description('是否启用 council_review 工具'),
+  /** Default participants as "<provider>/<model>"; empty keeps the auto-pick. */
+  defaultModels: z.array(z.string()).default([]).volatile()
+    .description('默认参与模型，每项 "<provider>/<model>"；留空则自动挑选'),
+  /** Default chairman as "<provider>/<model>"; empty elects the first participant. */
+  defaultChairman: z.string().default('').volatile().description('默认主席 "<provider>/<model>"；留空则自动'),
+  contextMaxChars: z.number().default(6000).description('会话上下文预算（字符）'),
+  filesMaxChars: z.number().default(ATTACH_MAX_CHARS).description('路径附件预算（字符）'),
+  codeMaxChars: z.number().default(CODE_MAX_CHARS).description('源码包预算（字符）'),
+  skillDirs: z.array(z.string()).default([]).description('席位额外只读 skill 根目录'),
+  attachRoots: z.array(z.string()).default([]).description('附件允许的根目录（空 = 本地路径不受限）'),
+})
+
 /** Auto-pick heterogeneous routes from a catalog: one provider and one model name each. */
 export function defaultRoutesFromCatalog(cat) {
   const routes = []
@@ -193,6 +219,141 @@ export function defaultRoutesFromCatalog(cat) {
     })
   }
   return routes
+}
+
+/**
+ * Read one config field. A field declared `.volatile()` reaches the plugin as a
+ * `{ get() }` source that the loader rewrites in place, so a plain read would
+ * compare a function object; unwrap any nesting and fall back when the field is
+ * absent or the source throws.
+ */
+export function readSetting(field, fallback) {
+  let value = field
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (value === undefined || value === null) return fallback
+    if (typeof value === 'object' && typeof value.get === 'function') {
+      try {
+        value = value.get()
+        continue
+      } catch {
+        return fallback
+      }
+    }
+    break
+  }
+  return value === undefined || value === null ? fallback : value
+}
+
+/** `enabled` ships true; only an explicit false turns the tool off. */
+export function councilEnabled(config) {
+  const raw = config !== null && typeof config === 'object' ? config.enabled : undefined
+  return readSetting(raw, true) !== false
+}
+
+/** Parse one `"<provider>/<model>"` setting; malformed input yields undefined. */
+export function parseRouteSpec(spec) {
+  if (typeof spec !== 'string') return undefined
+  const text = spec.trim()
+  if (text === '') return undefined
+  const slash = text.indexOf('/')
+  if (slash <= 0 || slash === text.length - 1) return undefined
+  const provider = text.slice(0, slash).trim()
+  const model = text.slice(slash + 1).trim()
+  if (provider === '' || model === '') return undefined
+  return { provider, model }
+}
+
+/** Resolve one provider/model pair against a catalog. */
+export function findCatalogRoute(cat, providerId, modelId) {
+  for (const provider of cat.providers) {
+    if (provider.id !== providerId) continue
+    for (const model of provider.models) {
+      if (model.id !== modelId) continue
+      return {
+        key: `${provider.id}|${model.id}`,
+        provider: provider.id,
+        providerName: provider.name,
+        model: model.id,
+        name: model.name,
+      }
+    }
+  }
+  return undefined
+}
+
+/**
+ * Resolve `defaultModels` against the live catalog, so a setting can never point
+ * at a model that no longer exists. Entries that do not parse or are absent from
+ * the catalog are reported and dropped; the caller decides whether an empty
+ * result falls back (setting empty) or refuses (setting present but unusable).
+ */
+export function resolveConfiguredRoutes(cat, specs) {
+  const routes = []
+  const problems = []
+  const list = Array.isArray(specs) ? specs : []
+  for (const spec of list) {
+    const parsed = parseRouteSpec(spec)
+    if (parsed === undefined) {
+      problems.push(`无法解析的默认模型：${JSON.stringify(spec)}（应为 "<provider>/<model>"）`)
+      continue
+    }
+    const route = findCatalogRoute(cat, parsed.provider, parsed.model)
+    if (route === undefined) {
+      problems.push(`默认模型不在当前模型目录中：${spec}`)
+      continue
+    }
+    if (routes.some((row) => row.key === route.key)) continue
+    routes.push(route)
+  }
+  return { routes, problems }
+}
+
+/**
+ * Participant selection for `council_review`, in one place: explicit `models`
+ * args win, then a non-empty `defaultModels`, then the heterogeneous auto-pick.
+ * `source` names the branch that ran, so the tool and its tests agree.
+ */
+export function selectCouncilRoutes(cat, requested, defaultSpecs) {
+  const problems = []
+  const routes = []
+  if (Array.isArray(requested) && requested.length > 0) {
+    for (const item of requested.slice(0, MAX_MODELS)) {
+      if (item === null || typeof item !== 'object') continue
+      const route = findCatalogRoute(cat, String(item.provider || ''), String(item.model || ''))
+      if (route === undefined) {
+        problems.push(`unknown model: ${String(item.provider)}/${String(item.model)}`)
+        continue
+      }
+      if (!routes.some((row) => row.key === route.key)) routes.push(route)
+    }
+    return { routes, source: 'explicit', problems }
+  }
+  const configured = resolveConfiguredRoutes(cat, defaultSpecs)
+  if (configured.routes.length > 0) {
+    return { routes: configured.routes.slice(0, MAX_MODELS), source: 'default', problems: configured.problems }
+  }
+  if (Array.isArray(defaultSpecs) && defaultSpecs.length > 0) {
+    /* A configured-but-unusable default fails loudly instead of silently
+       auto-picking: "不静默回退" is this plugin's documented stance. */
+    return { routes: [], source: 'default', problems: configured.problems }
+  }
+  return { routes: defaultRoutesFromCatalog(cat), source: 'auto', problems: configured.problems }
+}
+
+/**
+ * Chairman route: the configured `defaultChairman` when it resolves AND is one of
+ * the participants; otherwise the first participant (the historical election).
+ * A chairman outside the roster is refused because a run only carries routes for
+ * participating seats.
+ */
+export function pickChairmanRoute(cat, selected, spec) {
+  const fallback = Array.isArray(selected) ? selected[0] : undefined
+  const parsed = parseRouteSpec(spec)
+  if (parsed === undefined) return fallback
+  const route = findCatalogRoute(cat, parsed.provider, parsed.model)
+  if (route === undefined) return fallback
+  const participant = selected.find((row) => row.key === route.key)
+  return participant === undefined ? fallback : participant
 }
 
 /** Clip one answer before it enters another prompt. */
@@ -905,6 +1066,13 @@ export function apply(ctx, config) {
   const attachRoots = config !== null && typeof config === 'object' && Array.isArray(config.attachRoots)
     ? config.attachRoots.filter((dir) => typeof dir === 'string' && dir !== '')
     : []
+  /**
+   * The live entry config. `enabled`/`defaultModels`/`defaultChairman` are
+   * declared `.volatile()`, so their values are read per tool call through
+   * {@link readSetting}: a Settings-page write rewrites the same source and is
+   * visible immediately, without re-running `apply`.
+   */
+  const liveConfig = config !== null && typeof config === 'object' ? config : {}
   const defaultAgentsHome = process.env.DSH_AGENTS_HOME || join(process.env.USERPROFILE || '', '.agents')
   const defaultSkillStore = process.env.AGLIB_STORE || 'D:\\agent-library'
   const autoSkillDirs = [join(defaultSkillStore, 'catalog')].filter((dir) => existsSync(dir))
@@ -1271,22 +1439,7 @@ export function apply(ctx, config) {
   }
 
   /** Resolve one requested route against the catalog. */
-  function findRoute(cat, providerId, modelId) {
-    for (const provider of cat.providers) {
-      if (provider.id !== providerId) continue
-      for (const model of provider.models) {
-        if (model.id !== modelId) continue
-        return {
-          key: `${provider.id}|${model.id}`,
-          provider: provider.id,
-          providerName: provider.name,
-          model: model.id,
-          name: model.name,
-        }
-      }
-    }
-    return undefined
-  }
+  const findRoute = findCatalogRoute
 
   /** Global per-provider slot so tabs/chats cannot multiply provider concurrency. */
   const providerActive = new Map()
@@ -1853,11 +2006,6 @@ export function apply(ctx, config) {
    * review programmatically and read back the synthesized conclusion.   *
    * ------------------------------------------------------------------ */
 
-  /** Default cross-provider routes when the caller does not name models. */
-  function defaultRoutes(cat) {
-    return defaultRoutesFromCatalog(cat)
-  }
-
   /** Conclusion text returned to the calling agent. */
   function toolConclusion(run) {
     const usable = run.answers.filter((answer) => answer.text !== '')
@@ -1897,7 +2045,8 @@ export function apply(ctx, config) {
         },
         models: {
           type: 'array',
-          description: 'Explicit participants as {provider, model}. Omit to auto-pick up to 3 cross-provider defaults.',
+          description: 'Explicit participants as {provider, model}. Omit to use the configured default models, '
+            + 'or the auto-picked cross-provider defaults when none are configured.',
           items: {
             type: 'object',
             properties: {
@@ -1948,25 +2097,25 @@ export function apply(ctx, config) {
     timeoutMs: RUN_TIMEOUT_MS + 30000,
     isConcurrencySafe: () => false,
     async execute(args, exec) {
+      /* The Settings page owns this switch, so it is read live — a disabled tool
+         must answer with a reason instead of vanishing from the surface. */
+      if (!councilEnabled(liveConfig)) {
+        throw new Error('council_review 已在设置中关闭（设置 → dsh-model-council → enabled = false）')
+      }
       const input = args === null || typeof args !== 'object' ? {} : args
       const question = typeof input.question === 'string' ? input.question.trim() : ''
       if (question === '') throw new Error('question is required')
       if (question.length > MAX_QUESTION) throw new Error('question is too long')
       const cat = await catalog()
-      const selected = []
-      if (Array.isArray(input.models) && input.models.length > 0) {
-        for (const item of input.models.slice(0, MAX_MODELS)) {
-          if (item === null || typeof item !== 'object') continue
-          const route = findRoute(cat, String(item.provider || ''), String(item.model || ''))
-          if (route === undefined) throw new Error(`unknown model: ${String(item.provider)}/${String(item.model)}`)
-          if (!selected.some((row) => row.key === route.key)) selected.push(route)
-        }
-      } else {
-        for (const route of defaultRoutes(cat)) selected.push(route)
+      const selection = selectCouncilRoutes(cat, input.models, readSetting(liveConfig.defaultModels, []))
+      if (selection.source === 'explicit' && selection.problems.length > 0) throw new Error(selection.problems[0])
+      if (selection.source === 'default' && selection.routes.length === 0 && selection.problems.length > 0) {
+        throw new Error(`defaultModels 中没有可用模型：${selection.problems.join('；')}`)
       }
+      const selected = selection.routes
       if (selected.length === 0) throw new Error('no models available for the council')
       const useChairman = input.chairman !== false
-      const chairman = selected[0]
+      const chairman = pickChairmanRoute(cat, selected, readSetting(liveConfig.defaultChairman, ''))
       /* The calling agent owns the workspace and the cancellation signal. */
       const caller = exec !== null && typeof exec === 'object' ? exec.agent : undefined
       const callerId = caller !== undefined && caller !== null && typeof caller.id === 'string' ? caller.id : ''
@@ -2001,6 +2150,9 @@ export function apply(ctx, config) {
         createdAt: Date.now(),
         sessionId: callerId,
         useChairman,
+        /* Which branch picked the roster, and what it had to drop. */
+        modelSource: selection.source,
+        defaultModelProblems: selection.problems,
         seatMode: 'llm',
         subagentSeats: 0,
         cwd: workspace.cwd,
@@ -2129,7 +2281,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v56', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v57', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -2138,7 +2290,7 @@ export function apply(ctx, config) {
           return
         }
         if (req.method === 'GET' && path === '/') {
-          sendJson(res, 200, { ok: true, build: 'v56' })
+          sendJson(res, 200, { ok: true, build: 'v57' })
           return
         }
         if (req.method === 'POST' && path === '/run') {

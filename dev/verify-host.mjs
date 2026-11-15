@@ -9,7 +9,12 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { readFileSync } from 'node:fs'
-import { TRANSIENT_FAILURE, SEAT_RESULT_TIMEOUT_MS, SEAT_START_TIMEOUT_MS, PROVIDER_CONCURRENCY, MAX_FALLBACKS_PER_RUN, RUN_TIMEOUT_MS, defaultRoutesFromCatalog, candidatePaths, collectCodeContext, collectPathContext, isPathInside, readTextFile, runLimited, withTimeout } from '../index.js'
+/* index.js imports @deepseek-ai/schemastery for the `council` entry Config, so this
+   harness needs it resolvable from this package (gitignored node_modules/), e.g.
+   `npm install --no-save --no-package-lock @deepseek-ai/schemastery` — the DSH
+   installation also routes a linked plugin's declared peerDependencies, but a plain
+   `node dev/verify-host.mjs` has no such router. */
+import { TRANSIENT_FAILURE, SEAT_RESULT_TIMEOUT_MS, SEAT_START_TIMEOUT_MS, PROVIDER_CONCURRENCY, MAX_FALLBACKS_PER_RUN, RUN_TIMEOUT_MS, defaultRoutesFromCatalog, candidatePaths, collectCodeContext, collectPathContext, isPathInside, readTextFile, runLimited, withTimeout, apply, Config, councilEnabled, parseRouteSpec, resolveConfiguredRoutes, selectCouncilRoutes, pickChairmanRoute, readSetting } from '../index.js'
 
 const root = await mkdtemp(join(tmpdir(), 'council-host-'))
 try {
@@ -271,7 +276,228 @@ try {
   })
   assert.ok(peak >= 2 && peak <= 3, `concurrency window: ${peak}`)
 
-  console.log('host half: OK (paths, traversal, secrets, timeout, scheduler)')
+  /* ------------------------------------------------------------------ *
+   * Settings contract: the `council` entry config, the council_review    *
+   * default models, and the live (volatile) path the Settings page uses. *
+   * ------------------------------------------------------------------ */
+
+  /* `Config` keeps the three tool settings live: a `.volatile()` field reaches
+     the plugin as a `{ get() }` source the loader rewrites in place
+     (cordis-plugin-loader lib/index.js:513 gate, :526-558 commit), which is what
+     makes a Settings-page write take effect without restarting the plugin. */
+  {
+    const defaults = Config(undefined)
+    assert.equal(typeof defaults.enabled.get, 'function', 'enabled must be a live source (volatile)')
+    assert.equal(defaults.enabled.get(), true, 'enabled must default to true')
+    assert.deepEqual(defaults.defaultModels.get(), [], 'defaultModels must default to []')
+    assert.equal(defaults.defaultChairman.get(), '', 'defaultChairman must default to ""')
+    for (const name of ['enabled', 'defaultModels', 'defaultChairman']) {
+      assert.equal(Config.dict[name].meta.volatile, true, `${name} must be declared .volatile()`)
+    }
+    /* The historical plugin-config keys stay ordinary: they may restart the
+       plugin, but the schema must still declare and default them. */
+    for (const name of ['contextMaxChars', 'filesMaxChars', 'codeMaxChars', 'skillDirs', 'attachRoots']) {
+      assert.ok(Object.hasOwn(Config.dict, name), `Config must declare ${name}`)
+      assert.notEqual(readSetting(defaults[name], undefined), undefined, `${name} must resolve`)
+    }
+    assert.equal(defaults.contextMaxChars, 6000, 'contextMaxChars keeps its documented default')
+    assert.throws(() => Config({ enabled: 'yes' }), 'enabled must reject a non-boolean')
+    assert.throws(() => Config({ defaultModels: 'deepseek/pro' }), 'defaultModels must reject a non-array')
+    assert.throws(() => Config({ defaultChairman: 7 }), 'defaultChairman must reject a non-string')
+  }
+
+  /* `"<provider>/<model>"` parsing: legal specs resolve, malformed ones are
+     refused with a defined result (undefined) rather than silently accepted. */
+  {
+    assert.deepEqual(parseRouteSpec('deepseek/pro'), { provider: 'deepseek', model: 'pro' })
+    assert.deepEqual(parseRouteSpec('  providerA / modelB '), { provider: 'providerA', model: 'modelB' })
+    assert.deepEqual(parseRouteSpec('openrouter/meta/llama'), { provider: 'openrouter', model: 'meta/llama' },
+      'a model id may contain "/"')
+    for (const bad of ['', '   ', 'no-slash', '/model', 'provider/', '/', ' / ']) {
+      assert.equal(parseRouteSpec(bad), undefined, `malformed spec must be refused: ${JSON.stringify(bad)}`)
+    }
+    for (const bad of [undefined, null, 42, ['p', 'm'], { provider: 'p' }]) {
+      assert.equal(parseRouteSpec(bad), undefined, `non-string spec must be refused: ${JSON.stringify(bad)}`)
+    }
+  }
+
+  const settingsCatalog = {
+    providers: [
+      { id: 'deepseek', name: 'DeepSeek', models: [
+        { id: 'pro', name: 'DeepSeek-V4-Pro' },
+        { id: 'flash', name: 'DeepSeek-V4.1-Flash' },
+      ] },
+      { id: 'providerA', name: 'providerA', models: [
+        { id: 'glm', name: 'modelB' },
+        { id: 'modelA', name: 'modelA' },
+      ] },
+    ],
+  }
+
+  /* defaultModels is synced against the live catalog: unknown/unparsable entries
+     are reported and dropped, duplicates collapse, order is preserved. */
+  {
+    const resolved = resolveConfiguredRoutes(settingsCatalog, ['deepseek/pro', 'providerA/glm', 'ghost/x', 'deepseek/pro'])
+    assert.deepEqual(resolved.routes.map((route) => route.key), ['deepseek|pro', 'providerA|glm'],
+      'catalog-synced specs resolve once each')
+    assert.equal(resolved.problems.length, 1, 'the unknown spec is reported')
+    assert.ok(resolved.problems[0].includes('ghost/x'), 'the report names the offending spec')
+
+    const malformed = resolveConfiguredRoutes(settingsCatalog, ['providerA', '/glm', 'glm/'])
+    assert.equal(malformed.routes.length, 0, 'malformed specs resolve to nothing')
+    assert.equal(malformed.problems.length, 3, 'each malformed spec is reported')
+  }
+
+  /* Selection precedence: explicit args, then defaultModels, then the
+     heterogeneous auto-pick. */
+  {
+    const configured = selectCouncilRoutes(settingsCatalog, undefined, ['providerA/glm', 'deepseek/flash'])
+    assert.equal(configured.source, 'default', 'a non-empty defaultModels selects the default branch')
+    assert.deepEqual(configured.routes.map((route) => route.key), ['providerA|glm', 'deepseek|flash'],
+      'defaultModels order is used verbatim, not re-picked')
+
+    const empty = selectCouncilRoutes(settingsCatalog, undefined, [])
+    assert.equal(empty.source, 'auto', 'an empty defaultModels keeps the auto-pick')
+    const autoProviders = new Set(empty.routes.map((route) => route.provider))
+    const autoNames = new Set(empty.routes.map((route) => route.name))
+    assert.ok(empty.routes.length >= 2 && empty.routes.length <= 3, `auto-pick size: ${empty.routes.length}`)
+    assert.equal(autoProviders.size, empty.routes.length, 'auto-pick must not repeat a provider')
+    assert.equal(autoNames.size, empty.routes.length, 'auto-pick must not repeat a model name')
+
+    const explicit = selectCouncilRoutes(settingsCatalog, [{ provider: 'deepseek', model: 'pro' }], ['providerA/glm'])
+    assert.equal(explicit.source, 'explicit', 'explicit models select the explicit branch')
+    assert.deepEqual(explicit.routes.map((route) => route.key), ['deepseek|pro'], 'explicit models win over defaultModels')
+
+    const unknown = selectCouncilRoutes(settingsCatalog, [{ provider: 'nope', model: 'x' }], [])
+    assert.equal(unknown.source, 'explicit')
+    assert.deepEqual(unknown.problems, ['unknown model: nope/x'], 'an unknown explicit model is named')
+
+    const unusable = selectCouncilRoutes(settingsCatalog, undefined, ['nope/x'])
+    assert.equal(unusable.source, 'default', 'a set-but-unusable defaultModels stays on the default branch')
+    assert.equal(unusable.routes.length, 0, 'nothing resolves, so nothing is selected silently')
+
+    const capped = selectCouncilRoutes(settingsCatalog, undefined, ['deepseek/pro', 'deepseek/flash', 'providerA/glm', 'providerA/modelA'])
+    assert.ok(capped.routes.length <= 6, `MAX_MODELS cap: ${capped.routes.length}`)
+  }
+
+  /* defaultChairman: honoured only when it is one of the participants. */
+  {
+    const selected = resolveConfiguredRoutes(settingsCatalog, ['deepseek/pro', 'providerA/glm']).routes
+    assert.equal(pickChairmanRoute(settingsCatalog, selected, '').key, 'deepseek|pro',
+      'an empty defaultChairman elects the first participant')
+    assert.equal(pickChairmanRoute(settingsCatalog, selected, 'providerA/glm').key, 'providerA|glm',
+      'a configured chairman inside the roster is honoured')
+    assert.equal(pickChairmanRoute(settingsCatalog, selected, 'nope/x').key, 'deepseek|pro',
+      'a chairman absent from the catalog falls back')
+    assert.equal(pickChairmanRoute(settingsCatalog, selected, 'providerA/modelA').key, 'deepseek|pro',
+      'a chairman outside the roster falls back')
+    assert.equal(pickChairmanRoute(settingsCatalog, selected, 'providerA').key, 'deepseek|pro',
+      'a malformed chairman falls back')
+  }
+
+  /* The reader behind `enabled`: plain values and live sources behave alike, and
+     an in-place write to a live source is observed without re-reading the row. */
+  {
+    const write = Symbol.for('cosmokit.volatile.write')
+    const live = (value) => { let current = value; return { get: () => current, [write]: (next) => { current = next } } }
+    assert.equal(councilEnabled({}), true, 'enabled defaults to true when unset')
+    assert.equal(councilEnabled({ enabled: true }), true)
+    assert.equal(councilEnabled({ enabled: false }), false)
+    assert.equal(councilEnabled(undefined), true)
+    assert.equal(councilEnabled({ enabled: 'no' }), true, 'only an explicit false disables the tool')
+    const source = live(true)
+    assert.equal(councilEnabled({ enabled: source }), true)
+    source[write](false)
+    assert.equal(councilEnabled({ enabled: source }), false, 'a live source is observed after an in-place write')
+  }
+
+  /* Drive the real `apply` through a fake cordis context: the tool is registered,
+     the council is started, and every model call fails at once — the roster the
+     tool selected is the contract under test, not a provider round-trip. */
+  {
+    const previousHome = process.env.DSH_HOME
+    process.env.DSH_HOME = join(root, 'dsh-home')
+    await mkdir(process.env.DSH_HOME, { recursive: true })
+    const providers = [{ id: 'deepseek', name: 'DeepSeek' }, { id: 'providerA', name: 'providerA' }]
+    const models = {
+      deepseek: [{ id: 'pro', name: 'DeepSeek-V4-Pro' }, { id: 'flash', name: 'DeepSeek-V4.1-Flash' }],
+      providerA: [{ id: 'glm', name: 'modelB' }, { id: 'modelA', name: 'modelA' }],
+    }
+    const fakeHost = (config) => {
+      const state = { tool: undefined, server: undefined }
+      const ctx = {
+        effect: (fn) => { fn(); return () => {} },
+        on: () => {},
+        get: () => undefined,
+        agents: { get: () => undefined, list: () => [] },
+        subagents: {},
+        tools: { register: (tool) => { state.tool = tool; return () => {} } },
+        webServer: { register: (registration) => { state.server = registration; return () => {} } },
+        llm: {
+          listProviders: () => providers,
+          listModels: async (id) => models[id] ?? [],
+          stream: () => { throw new Error('fake provider down') },
+        },
+      }
+      apply(ctx, config)
+      return state
+    }
+    const roster = async (state) => (await state.tool.execute({ question: 'roster probe', attachFiles: false }, {})).models
+
+    try {
+      /* A configured list is used verbatim; the auto-pick would give
+         deepseek/pro + providerA/glm instead. */
+      const configured = fakeHost(Config({ defaultModels: ['providerA/glm', 'deepseek/flash'] }))
+      assert.deepEqual(await roster(configured), ['providerA/glm', 'deepseek/flash'],
+        'council_review must use defaultModels instead of the auto-pick')
+
+      /* No configured list keeps the heterogeneous auto-pick. */
+      const auto = fakeHost(Config({}))
+      const autoRoster = await roster(auto)
+      assert.equal(new Set(autoRoster.map((row) => row.split('/')[0])).size, autoRoster.length,
+        `auto roster must stay heterogeneous: ${JSON.stringify(autoRoster)}`)
+
+      /* A Settings-page write reaches an already-registered tool: the loader
+         rewrites the same live source, so `apply` is not re-run. */
+      const liveConfig = Config({})
+      const hot = fakeHost(liveConfig)
+      liveConfig.defaultModels[Symbol.for('cosmokit.volatile.write')](['providerA/glm'])
+      assert.deepEqual(await roster(hot), ['providerA/glm'],
+        'a settings write must change the roster without a plugin restart')
+
+      /* enabled=false refuses with a reason, before any catalog or run work. */
+      const off = fakeHost(Config({ enabled: false }))
+      await assert.rejects(off.tool.execute({ question: 'x', attachFiles: false }, {}), /已在设置中关闭/,
+        'a disabled tool must refuse with a reason')
+
+      /* The same refusal after a live write, on an already-registered tool. */
+      const liveOn = Config({ enabled: true })
+      const hotOff = fakeHost(liveOn)
+      liveOn.enabled[Symbol.for('cosmokit.volatile.write')](false)
+      await assert.rejects(hotOff.tool.execute({ question: 'x', attachFiles: false }, {}), /已在设置中关闭/,
+        'a live disable must reach an already-registered tool')
+
+      /* A set-but-unusable defaultModels refuses loudly instead of silently
+         auto-picking. */
+      const typo = fakeHost(Config({ defaultModels: ['providerA'] }))
+      await assert.rejects(typo.tool.execute({ question: 'x', attachFiles: false }, {}),
+        /defaultModels 中没有可用模型/, 'an unparsable defaultModels must fail loudly')
+
+      /* defaultChairman is recorded on the run and served to the panel. */
+      const chaired = fakeHost(Config({ defaultModels: ['deepseek/pro', 'providerA/glm'], defaultChairman: 'providerA/glm' }))
+      await roster(chaired)
+      const res = { statusCode: 0, body: '', setHeader() {}, end(text) { this.body = text } }
+      await chaired.server.handler({ method: 'GET', url: '/council/runs?sessionId=' }, res)
+      const run = JSON.parse(res.body).runs[0]
+      assert.equal(run.chairman.key, 'providerA|glm', 'defaultChairman must become the chairman')
+      assert.equal(run.structure.roles.arbiter, 'providerA|glm', 'the arbiter role must follow the chairman')
+    } finally {
+      if (previousHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previousHome
+    }
+  }
+
+  console.log('host half: OK (paths, traversal, secrets, timeout, scheduler, settings, council tool)')
 } finally {
   await rm(root, { recursive: true, force: true })
 }

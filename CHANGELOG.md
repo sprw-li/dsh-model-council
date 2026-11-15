@@ -1,3 +1,65 @@
+# 0.2.27
+
+用户提的两件事：运行状态浮窗，以及把 `council_review` 放进设置里管理（含默认 models）。
+
+## 1. 运行状态浮窗（client）
+
+调用 `council_review` 或从面板发起时，对话区右下角出现浮动状态卡：阶段、已完成席位比例、
+每席位（模型名 + 运行/完成/失败/错误）、问题摘要。
+
+- 注册进 **`conversation.input.overlay`** —— 官方命令弹窗、斜杠菜单、反馈对话框用的是同一个位。
+  按该 slot 契约 **portal 到 `document.body`**（slot 自己的说明写着"fixed overlay 必须 portal，
+  否则会被 docked composer 卡片containment 住"），没有 `react-dom` 时退化为内联渲染。
+- **只读**：不写运行状态、不投递结论、不取消运行。
+- **自动发现**（真实缺口）：agent 发起的 `council_review` 只创建 Host 侧运行，客户端原本只在
+  用户手动打开侧栏 tab 时才 `adoptRunningRun()`。现在浮窗挂载即发现并 **leader 门控**地每 4 秒重查
+  `GET /council/runs`。**follower 不排定时器**——那正是 0.2.16 修掉的空转缺陷，这里不放开。
+
+## 2. 设置页 + 默认 models（host + client）
+
+设置 → **理事会**，三个字段：
+
+| 字段 | 行为 |
+|---|---|
+| `enabled` | `false` 时 `council_review` 抛出「已在设置中关闭」并说明原因（面板入口不受影响） |
+| `defaultModels` | 未显式传 `models` 时用它；**选项来自实时模型目录**，下线模型标为"已保存但当前不可用" |
+| `defaultChairman` | 未显式传时作为默认主席；须同时在参与者名单内，否则回退首位 |
+
+挑选优先级：显式 `models` > 非空 `defaultModels` > 自动挑选。`defaultModels` 配置了却**全部不可用**时
+**不静默回退**，而是抛出「defaultModels 中没有可用模型」——静默回退会让设置看起来生效了实际没生效。
+run 记录新增 `modelSource` / `defaultModelProblems` 便于诊断。
+
+**关键技术事实（原本会做错）**：函数式插件 `export function apply(ctx, config)` 拿到的 `config` 是
+**激活时的快照**，直接读 `config.defaultModels` 不会随设置变化。必须逐字段声明 `.volatile()` 并当
+`{ get() }` 源读。依据（asar `app.asar`）：
+
+- `cordis-plugin-loader/lib/index.js:513` 判 `volatileOnly`、`:526 _commitVolatile()`、**`:546 updateVolatile(ref, source)`** —— 写回**同一个 ref**，不重启插件
+- `cosmokit/lib/index.js` 的 `createVolatile` / `updateVolatile`
+- `schemastery` 校验期把 volatile 字段换成该 ref
+- 官方文档 `dsh-agent-preset/skills/cordis-plugin-development/references/host-plugin.md`：函数式 `apply` + `export const Config` 合法；普通字段改动重启插件，`.volatile()` 原地更新
+- 设置页侧只挑 `meta.volatile` 字段（`dsh-settings/lib/index.js`），所以能绑的热字段正好是这三个
+
+设置命名空间的 id 是 `council`（**不带** `include:` 前缀）。已按三个官方同类插件实证：
+`SUBAGENT_NS="subagent"`、`AGENT_LOOP_NS="agent-loop"`，而插件管理器里显示为 `include:subagent` / `include:agent-loop`。
+
+## 3. 打包修正
+
+`@deepseek-ai/schemastery` 加为 **peerDependency `^3.18.5`**（`.volatile()` 自该版本提供）。
+裸导入在本包原本不是零成本成立：linked 插件引用安装包要求祖先 package.json 声明 peerDependencies，
+否则 `dsh-app-boot` 的路由层回落到 native 解析并 `ERR_MODULE_NOT_FOUND`。干净检出 / 发布态必需。
+
+## 4. 测试
+
+- `dev/verify-host.mjs` 新增整节（Config 契约含 `meta.volatile===true`、`provider/model` 解析、
+  目录对齐、挑选优先级、主席回退、`enabled` 用**与 loader 相同的 volatile 写入协议**做活写并断言立即生效）
+- `dev/verify-client.mjs` 补 `react-dom` 假实现（记录 portal 目标）与 `configForms` 桩，新增断言：
+  浮窗注册 id / 渲染席位与问题 / **portal 到 `document.body`** / 渲染不投递不取消 / 发现机制 leader 门控；
+  设置页用 cordis entry id 绑定 / 保存原子写三个字段且带 revision / 已下线的已保存模型被报出
+- 基线对照：改动前后 `npm run verify` 均 exit 0
+
+**未验证**：真实 GUI 里的设置页渲染与写入往返（Web 服务器全部路由需鉴权，命令行取不到客户端模块）。
+Host 侧已实测：热加载后 `GET /council/` 报 `build=v57`、`GET /council/models` 200（3 个 provider）。
+
 # 0.2.26
 
 签发通过后的收尾：把复审遗留的 P2 清掉。

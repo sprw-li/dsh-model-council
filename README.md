@@ -129,15 +129,43 @@ council_review({
 
 ## 配置
 
-在 profile 的插件行上传 `config`（无需构建）：
+两种方式。**推荐用设置页**（改完立即生效，不必重启插件）：
+
+**设置 → 理事会**
+
+| 设置项 | 作用 |
+|---|---|
+| `enabled` | 关闭后模型调用 `council_review` 会被拒绝，并在工具结果里说明原因（面板入口 `/council` 不受影响） |
+| `defaultModels` | 工具未显式传 `models` 时用它。**选项来自 Host 的实时模型目录**（`GET /council/models`），模型下线后会标为"已保存但当前不可用"而不是静默改写 |
+| `defaultChairman` | 未显式传 chairman 时的默认主席；必须同时在参与者名单内，否则回退首位 |
+
+`defaultModels` 只要求"与模型目录同步"（解析成功、去重、≤6 条）；**不强制异构性** —— 同一 provider 的多个模型是用户的显式选择。异构性（单 provider、模型名互不相同、≤3）只在**自动挑选**分支强制。
+
+实现要点：这三个字段在 `Config` 里声明为 `.volatile()`，并由 `ctx.configForms.get('council')` 绑定。函数式插件的 `config` 默认是**激活时的快照**，只有 volatile 字段会原地更新（`cordis-plugin-loader` 的 `_commitVolatile` → `updateVolatile` 写回同一个 ref，不重启插件），所以插件侧必须用 `config.field.get()` 读。
+
+也可以直接在 profile 的插件行传 `config`（静态默认值，改普通字段会重启插件）：
 
 ```yaml
 - id: council
   name: dsh-model-council
   config:
+    enabled: true
+    defaultModels: []
+    defaultChairman: ''
     contextMaxChars: 6000
     filesMaxChars: 20000
 ```
+
+> `@deepseek-ai/schemastery` 是 peerDependency（`^3.18.5`，`.volatile()` 从该版本起提供）。
+
+## 运行状态浮窗
+
+调用 `council_review`（或面板发起）时，对话区右下角会出现一个浮动状态卡：阶段（作答／互评／主席）、已完成席位比例、每个席位（模型名 + 运行/完成/失败）、问题摘要与错误。
+
+- 渲染在 `conversation.input.overlay`（与官方命令弹窗、斜杠菜单、反馈对话框同一个位），并按该 slot 的契约 **portal 到 `document.body`**。
+- **只读**：它不写运行状态、不投递结论、不取消运行；投递仍然只走 leader 的 stream/poll 路径。
+- **发现机制**：agent 发起的 `council_review` 只会创建 Host 侧运行，客户端原本不知道。浮窗挂载时会 `adoptRunningRun()`，并且 **leader 门控**地每 4 秒重查 `GET /council/runs`（follower 排定时器正是之前修掉的空转缺陷，所以这里不放开）。
+- 多标签页下 follower 目前不显示浮窗状态（沿用既有的 follower 缺口，未在本次放开）。
 
 ## 已验证（2026-11-11，本机 DSH 0.2.2-rc.1）
 
