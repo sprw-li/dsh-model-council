@@ -23,7 +23,7 @@
  */
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
-import { lstat, readdir, readFile, stat } from 'node:fs/promises'
+import { lstat, readdir, readFile, realpath, stat } from 'node:fs/promises'
 import { extname, isAbsolute, join, relative, sep } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 
@@ -636,6 +636,14 @@ function questionHints(text) {
 async function collectSourceFiles(root, hints = []) {
   const found = []
   let visited = 0
+  /*
+   * Refuse a link as the root. The recursion already skips links it meets, but
+   * the caller-supplied root was followed — measured: passing a junction that
+   * pointed outside the workspace walked straight into the outside directory,
+   * because `readdir` on the resolved target shows ordinary files.
+   */
+  const rootLink = await lstatSafe(root)
+  if (rootLink === undefined || rootLink.isSymbolicLink()) return found
   async function walk(dir, depth) {
     if (depth > 4 || visited >= CODE_WALK_ENTRIES) return
     let entries
@@ -985,6 +993,28 @@ function looksLikeDeliberatePath(token) {
   return /\.[A-Za-z0-9]{1,8}$/.test(rest)                 // has an extension
 }
 
+/**
+ * Real path, or undefined when it cannot be resolved (missing, permission).
+ *
+ * Needed because a symlink or Windows junction *inside* an allowed root resolves
+ * somewhere else entirely; comparing the written path is not enough.
+ */
+async function realPathOf(target) {
+  try {
+    return await realpath(target)
+  } catch {
+    return undefined
+  }
+}
+
+async function lstatSafe(target) {
+  try {
+    return await lstat(target)
+  } catch {
+    return undefined
+  }
+}
+
 /** Directory tree plus key-file text for every path the question mentions, or the session workspace. */
 async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars, allowCode = true, attachRoots = [], callerCwd, allowExternalPaths = false) {
   const hints = questionHints(question)
@@ -1022,6 +1052,30 @@ async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars
       namedButRefused = true
       break
     }
+  }
+  /*
+   * Second gate, in resolved space.
+   *
+   * `permitted` compares the *written* path, but a junction or symlink placed
+   * inside an allowed root resolves outside it. Measured: naming `ws/link-out`
+   * (a junction to an outside directory) leaked that directory's files — the
+   * walkers only rejected links they met *within* a tree, never one used as the
+   * tree's own root, and `statSafe` follows links while `readdir` then shows
+   * ordinary files.
+   */
+  const realAllowedRoots = (await Promise.all([workspaceCwd, callerCwd, ...attachRoots]
+    .filter((dir) => typeof dir === 'string' && dir !== '')
+    .map(async (dir) => (await realPathOf(dir)) || dir)))
+  async function permittedResolved(candidate) {
+    if (allowExternalPaths === true) return true
+    const link = await lstatSafe(candidate)
+    if (link === undefined) return false
+    /* Refuse a link as the root outright: the walkers already refuse links they
+       meet inside a tree, and following one here is the escape this closes. */
+    if (link.isSymbolicLink()) return false
+    const real = await realPathOf(candidate)
+    if (real === undefined) return false
+    return realAllowedRoots.some((root) => real === root || isPathInside(real, root))
   }
   /* A NAMED project directory beats the caller's own directory: when the caller
      sits at the workspace root and the question says "dsh-council", attaching
@@ -1082,6 +1136,9 @@ async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars
   for (const candidate of candidates) {
     const info = await statSafe(candidate)
     if (info === undefined) continue
+    /* Resolve before accepting: a link as the root escapes the allowlist even
+       though its written path sits inside one. */
+    if (!await permittedResolved(candidate)) continue
     valid.push(candidate)
     if (info.isDirectory()) {
       dirs.push(candidate)
@@ -1723,6 +1780,8 @@ export function apply(ctx, config) {
       filesChars: run.filesChars === undefined ? 0 : run.filesChars,
       /* Outbound redaction record: which files had suspected secrets masked. */
       filesRedactions: run.filesRedactions === undefined ? [] : run.filesRedactions,
+      /* Did a human confirm the outbound file list before it was sent? */
+      manifestConfirmed: run.manifestConfirmed === true,
       codeState: run.codeState === undefined ? 'off' : run.codeState,
       codeFiles: run.codeFiles === undefined ? 0 : run.codeFiles,
       codeChars: run.codeChars === undefined ? 0 : run.codeChars,
@@ -2432,7 +2491,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v59', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v60', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -2445,9 +2504,85 @@ export function apply(ctx, config) {
              human or the client can see which side is off. */
           sendJson(res, 200, {
             ok: true,
-            build: 'v59',
+            build: 'v60',
             toolEnabled: toolEnabled(liveConfig),
             panelEnabled: panelEnabled(liveConfig),
+          })
+          return
+        }
+        /*
+         * Outbound manifest preview: what WOULD be attached, without starting a
+         * run. Read-only, so it stays available while `panelEnabled` is off.
+         *
+         * Why it exists: the attachment goes to a third-party provider, and the
+         * pack is assembled from free-text paths in the question. A person should
+         * be able to see the file list before it leaves. The client shows this and
+         * requires a confirmation; the run records whether one happened.
+         */
+        if (req.method === 'POST' && path === '/preview') {
+          let body
+          try {
+            body = JSON.parse((await readBody(req)) || '{}')
+          } catch {
+            sendJson(res, 400, { error: 'invalid JSON body' })
+            return
+          }
+          const input = body !== null && typeof body === 'object' ? body : {}
+          const question = typeof input.question === 'string' ? input.question.trim() : ''
+          if (question === '') {
+            sendJson(res, 400, { error: '问题不能为空' })
+            return
+          }
+          if (question.length > MAX_QUESTION) {
+            sendJson(res, 400, { error: '问题过长' })
+            return
+          }
+          const callerId = typeof input.sessionId === 'string' ? input.sessionId : ''
+          const workspace = resolveWorkspace(callerId)
+          const attachFiles = input.attachFiles !== false
+          let filesState = 'off'
+          let filesPaths = []
+          let filesChars = 0
+          let codeState = 'off'
+          let codeFiles = 0
+          let codeChars = 0
+          let codeDiscovered = 0
+          let codeTruncated = 0
+          let redactions = []
+          if (attachFiles) {
+            const files = await collectPathContext(
+              question, filesMaxChars, workspace.cwd, codeMaxChars, true, attachRoots, workspace.cwd,
+              externalPathsAllowed(),
+            )
+            filesState = files.state
+            filesPaths = files.paths
+            filesChars = files.chars
+            codeState = files.codeState
+            codeFiles = files.codeFiles
+            codeChars = files.codeChars
+            codeDiscovered = files.codeDiscovered === undefined ? 0 : files.codeDiscovered
+            codeTruncated = files.codeTruncated === undefined ? 0 : files.codeTruncated
+            redactions = Array.isArray(files.redactions) ? files.redactions : []
+          }
+          sendJson(res, 200, {
+            question,
+            attachFiles,
+            workspace,
+            filesState,
+            filesPaths,
+            filesChars,
+            codeState,
+            codeFiles,
+            codeChars,
+            codeDiscovered,
+            codeTruncated,
+            /* Same name the run snapshot uses, so a client reads one field for
+               the outbound-redaction record in both places. */
+            filesRedactions: redactions,
+            totalChars: filesChars,
+            /* What the reviewer will be told about coverage; the same figures the
+               run snapshot carries, so the preview cannot overstate the pack. */
+            note: '抽样初审，不是全项目审查',
           })
           return
         }
@@ -2606,6 +2741,11 @@ export function apply(ctx, config) {
             filesPaths,
             filesChars,
             filesRedactions,
+            /* Whether a human saw the outbound list before it left. The panel sets
+               this after its preview; the tool path cannot, so it stays false —
+               the point is to make the difference auditable, not to pretend a
+               confirmation happened. */
+            manifestConfirmed: body.manifestConfirmed === true,
             codeState,
             codeFiles,
             codeChars,

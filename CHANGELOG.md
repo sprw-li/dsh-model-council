@@ -1,3 +1,70 @@
+# 0.2.29
+
+外部审查报告遗留的最后两项：出站清单确认、reparse point 专项测试。
+
+## 1. reparse point（junction）——修掉一个真漏洞
+
+**发现的是真问题，不是补测试而已。** 走查处处都拒绝符号链接，但**根节点**没有守卫：
+
+- `statSafe` 用的是 `stat`（**跟随**链接），所以把 `ws/link-out`（指向工作区外的 junction）
+  写进问题里当候选，它就被当成目录 root；
+- 之后 `listdir`/`keyFiles`/`collectSourceFiles` 在该 root 下看到的全是"普通文件"，
+  而它们内部的 `entry.isSymbolicLink()` 守卫只作用于子树。
+
+实测：canary 内容**直接进了附件**（`codeFiles: 1`）。比绝对路径那条更危险——**路径就在工作区内**，
+allowlist 会放行，只有 reparse point 逃出去。Windows 上创建 junction 不需要管理员权限，所以可达。
+
+修法（两层）：
+
+- `collectPathContext` 新增 `permittedResolved()`：接受候选前先 `lstat` 拒绝链接根，
+  再 `realpath` 解析并在**真实路径空间**里复核包含关系（允许根也取 realpath，
+  这样工作区本身经由 junction 到达时仍然正确）。
+- `collectSourceFiles` 拒绝链接作为自己的 root（纵深防御；它是导出函数）。
+
+验证矩阵（`_work/council-audit/probe_junction_matrix.mjs`）：直接 junction、嵌套 junction、
+链式 junction（a → link-dir → outside）**全部挡住**；整目录评审不再跟进任何链接，
+普通文件仍正常附带；显式授权真实目录仍可用。
+
+**硬链接不挡，且这是正确的**：它没有 reparse point，是同一份数据的第二个真实目录项，
+`lstat` 就是普通文件。要创建它就必须已经能访问目标，因此它不提供额外能力——不是漏洞，
+但已在 README 里写明这个边界。
+
+## 2. 出站清单确认
+
+附件会送到第三方 provider，而清单是从问题里的自由文本路径拼出来的。发起前应当能看到文件列表。
+
+- **Host** `POST /council/preview`：与 `/run` 同形的请求，返回**将要**附带的清单
+  （`filesPaths` / `filesChars` / 源码包 `codeFiles`+`codeDiscovered`+`codeTruncated` /
+  `filesRedactions` / `note`），**不创建运行**。只读，因此不受 `panelEnabled` 门控。
+- **Host** `/run` 接受 `manifestConfirmed: true` 并记进快照（默认 `false`）。
+  **默认 false 是有意的**：让"没人看过清单"与"有人确认过"可区分——工具路径（agent 发起）本来就
+  没有人在回路，不该假装有。
+- **Client** 面板新增「预览附件」按钮 + 清单渲染（文件数/路径/源码包/红色脱敏框/复述"抽样初审"）。
+  **确认门是 fail-closed 的**：确认态由 `sessionId\0question` 派生，
+  预览失败、预览中、无清单、**换问题或换会话**都立即失效；`attachFiles === false` 时不渲染也不确认。
+  运行成功后确认被消费（一次性授权）。
+
+### 2.1 我独立做的变异测试
+
+不采信自测：把 `isManifestConfirmed()` 改成"恒真" → client harness **exit 1**，
+报 `changing the question must invalidate the confirmation`。还原后 exit 0。
+即该断言确实在守门，不是空转。
+
+### 2.2 顺手统一的两处命名/文案
+
+teammate 如实报告的（非缺陷）：`/preview` 原用 `redactions` 而快照用 `filesRedactions` →
+**wire 上统一为 `filesRedactions`**（内部 `collectPathContext` 的返回名保持 `redactions`）；
+`/preview` 空问题的错误文案原为英文 → 与 `/run` 统一为 `问题不能为空` / `问题过长`。
+
+## 3. 测试
+
+- `dev/verify-host.mjs`：reparse point 段（3 种 junction 变体 + 整目录 + 真实授权对照）、
+  `/preview` 契约段（字段齐全、覆盖率声明、panel 关闭时仍可用、缺 question/非法 JSON → 400）、
+  `manifestConfirmed` 默认 false / 显式 true。
+- `dev/verify-client.mjs`：7 组新断言（预览调用、清单渲染、未预览不带 true、确认后带 true、
+  换问题失效、换会话失效、预览失败 fail-closed、`attachFiles=false` 走原路径）。
+- 全套 `npm run verify` exit 0。
+
 # 0.2.28
 
 外部审查报告（`dsh-council-review.md`）遗留的第 2、4 条。

@@ -6,6 +6,7 @@
 
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { readFileSync } from 'node:fs'
@@ -14,7 +15,7 @@ import { readFileSync } from 'node:fs'
    `npm install --no-save --no-package-lock @deepseek-ai/schemastery` — the DSH
    installation also routes a linked plugin's declared peerDependencies, but a plain
    `node dev/verify-host.mjs` has no such router. */
-import { TRANSIENT_FAILURE, SEAT_RESULT_TIMEOUT_MS, SEAT_START_TIMEOUT_MS, PROVIDER_CONCURRENCY, MAX_FALLBACKS_PER_RUN, RUN_TIMEOUT_MS, CODE_FILE_CHARS, CODE_MAX_CHARS, CODE_WALK_ENTRIES, looksLikeDeliberatePath, defaultRoutesFromCatalog, candidatePaths, collectCodeContext, collectPathContext, isPathInside, readTextFile, runLimited, withTimeout, apply, Config, toolEnabled, panelEnabled, parseRouteSpec, resolveConfiguredRoutes, selectCouncilRoutes, pickChairmanRoute, readSetting } from '../index.js'
+import { TRANSIENT_FAILURE, SEAT_RESULT_TIMEOUT_MS, SEAT_START_TIMEOUT_MS, PROVIDER_CONCURRENCY, MAX_FALLBACKS_PER_RUN, RUN_TIMEOUT_MS, CODE_FILE_CHARS, CODE_MAX_CHARS, CODE_WALK_ENTRIES, looksLikeDeliberatePath, collectSourceFiles, defaultRoutesFromCatalog, candidatePaths, collectCodeContext, collectPathContext, isPathInside, readTextFile, runLimited, withTimeout, apply, Config, toolEnabled, panelEnabled, parseRouteSpec, resolveConfiguredRoutes, selectCouncilRoutes, pickChairmanRoute, readSetting } from '../index.js'
 
 const root = await mkdtemp(join(tmpdir(), 'council-host-'))
 try {
@@ -231,6 +232,69 @@ try {
     )
     assert.equal(granted.text.includes(CANARY), true,
       'an allowlisted outside directory must be readable')
+  }
+
+  /* Reparse points. A link placed INSIDE an allowed root resolves outside it, so
+     comparing the written path is not enough. The walkers always rejected links
+     they met within a tree, but a link used as the tree's own ROOT was followed —
+     measured: naming `ws/link-dir` (a junction to an outside directory) shipped
+     that directory's files. Windows junctions need no admin rights, so this was
+     reachable. */
+  {
+    const linkRoot = join(root, 'links')
+    const linkOutside = join(linkRoot, 'outside')
+    const linkWs = join(linkRoot, 'ws')
+    await mkdir(join(linkOutside, 'deep'), { recursive: true })
+    await mkdir(join(linkWs, 'sub'), { recursive: true })
+    const LINK_CANARY = 'REPARSE_CANARY_4a17'
+    await writeFile(join(linkOutside, 'leak.js'), `export const leak = "${LINK_CANARY}"\n`, 'utf8')
+    await writeFile(join(linkOutside, 'deep', 'deeper.js'), `export const d = "${LINK_CANARY}"\n`, 'utf8')
+    await writeFile(join(linkWs, 'ok.js'), 'export const ok = 1\n', 'utf8')
+
+    /* Junctions need no elevation on Windows; a file symlink would. */
+    const made = []
+    const tryLink = (target, path) => {
+      try {
+        symlinkSync(target, path, 'junction')
+        made.push(path)
+      } catch { /* filesystem without junction support: skip that variant */ }
+    }
+    const direct = join(linkWs, 'link-dir')
+    const nested = join(linkWs, 'sub', 'nested-link')
+    const chain = join(linkWs, 'chain')
+    tryLink(linkOutside, direct)
+    tryLink(linkOutside, nested)
+    tryLink(direct, chain)
+
+    assert.ok(made.length >= 1, 'this platform must support directory junctions for this test')
+
+    for (const target of made) {
+      const pack = await collectPathContext(
+        `评审 ${target}`, 4000, linkWs, 4000, true, [linkRoot], linkWs, false,
+      )
+      assert.equal(pack.text.includes(LINK_CANARY), false,
+        `naming a junction (${target.split(/[\\/]/).pop()}) must not read outside the workspace`)
+      assert.equal(pack.paths.includes(target), false,
+        'a refused junction must not be listed as an attached path')
+      const walked = await collectSourceFiles(target, ['leak', 'deep'])
+      assert.equal(walked.length, 0, 'collectSourceFiles must refuse a link as its root')
+    }
+
+    /* The whole-directory review must not follow those links either. */
+    const dirPack = await collectPathContext(
+      `评审整个工作区 ${linkWs}`, 6000, linkWs, 6000, true, [linkRoot], linkWs, false,
+    )
+    assert.equal(dirPack.text.includes(LINK_CANARY), false,
+      'walking the workspace must not follow a junction out of it')
+    assert.equal(dirPack.text.includes('ok.js'), true,
+      'the ordinary file must still be attached — the guard must not disable attachments')
+
+    /* An explicitly granted real directory is still readable. */
+    const realGrant = await collectPathContext(
+      `评审这个文件 ${join(linkOutside, 'leak.js')}`, 4000, linkWs, 4000, true, [linkOutside], linkWs, false,
+    )
+    assert.equal(realGrant.text.includes(LINK_CANARY), true,
+      'granting the real target directory must still work')
   }
 
   /* Content-level secret scan. `SECRET_NAME` only catches self-announcing file
@@ -680,6 +744,58 @@ try {
       const panelOnlyOff = fakeHost(Config({ panelEnabled: false, defaultModels: ['providerA/glm'] }))
       assert.deepEqual(await roster(panelOnlyOff), ['providerA/glm'],
         'panelEnabled=false must not mute the council_review tool')
+
+      /* Outbound manifest preview. It assembles the same pack the run would send
+         but starts nothing — it is the list a person confirms before their files
+         leave for a provider. */
+      const previewHost = fakeHost(Config({}))
+      const preview = await http(previewHost, 'POST', '/preview',
+        JSON.stringify({ question: 'review the workspace', sessionId: '' }))
+      assert.equal(preview.status, 200, `POST /council/preview must answer 200; body=${JSON.stringify(preview.json)}`)
+      for (const field of ['filesState', 'filesPaths', 'filesChars', 'codeState', 'codeFiles',
+        'codeChars', 'codeDiscovered', 'codeTruncated', 'filesRedactions', 'note', 'attachFiles']) {
+        assert.ok(Object.hasOwn(preview.json, field), `preview response must carry "${field}"`)
+      }
+      assert.ok(Array.isArray(preview.json.filesPaths), 'preview.filesPaths must be an array')
+      assert.ok(Array.isArray(preview.json.filesRedactions), 'preview.filesRedactions must be an array')
+      /* The preview must not overstate coverage. */
+      assert.equal(/不是全项目审查/.test(preview.json.note), true,
+        `preview.note must say it is a sample review, got ${JSON.stringify(preview.json.note)}`)
+
+      /* Reading is not intervening: the preview stays available with the panel off. */
+      const previewOff = fakeHost(Config({ panelEnabled: false }))
+      const previewWhileOff = await http(previewOff, 'POST', '/preview',
+        JSON.stringify({ question: 'review the workspace' }))
+      assert.equal(previewWhileOff.status, 200,
+        'POST /council/preview must stay available while panelEnabled=false (read-only)')
+
+      /* A missing question is a usage error, not an empty manifest. */
+      assert.equal((await http(previewHost, 'POST', '/preview', '{}')).status, 400,
+        'preview must reject a missing question')
+      assert.equal((await http(previewHost, 'POST', '/preview', 'not json')).status, 400,
+        'preview must reject a malformed body')
+
+      /* Confirmation is recorded, and defaults to false so "no human saw the
+         list" is distinguishable from "someone confirmed it". */
+      const unconfirmed = await http(previewHost, 'POST', '/council/run', JSON.stringify({
+        question: 'panel probe',
+        models: [{ provider: 'deepseek', model: 'pro' }, { provider: 'providerA', model: 'glm' }],
+        attachFiles: false,
+      }))
+      assert.equal(unconfirmed.status, 200, 'run must start')
+      const unconfirmedView = await http(previewHost, 'GET', `/council/run/${unconfirmed.json.runId}`)
+      assert.equal(unconfirmedView.json.manifestConfirmed, false,
+        'a run without an explicit confirmation must record manifestConfirmed=false')
+
+      const confirmed = await http(previewHost, 'POST', '/council/run', JSON.stringify({
+        question: 'panel probe confirmed',
+        models: [{ provider: 'deepseek', model: 'pro' }, { provider: 'providerA', model: 'glm' }],
+        attachFiles: false,
+        manifestConfirmed: true,
+      }))
+      const confirmedView = await http(previewHost, 'GET', `/council/run/${confirmed.json.runId}`)
+      assert.equal(confirmedView.json.manifestConfirmed, true,
+        'an explicitly confirmed run must record manifestConfirmed=true')
     } finally {
       if (previousHome === undefined) delete process.env.DSH_HOME
       else process.env.DSH_HOME = previousHome

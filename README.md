@@ -2,7 +2,7 @@
 
 > 仓库：<https://github.com/sprw-li/dsh-model-council>
 >
-> **Status: alpha** — 接口与行为仍可能变化，正式版等外部反馈后再定。已发布到 npm 的只有 `0.1.0`；仓库源码为 `0.2.28`（见文末「版本与发布」）。
+> **Status: alpha** — 接口与行为仍可能变化，正式版等外部反馈后再定。已发布到 npm 的只有 `0.1.0`；仓库源码为 `0.2.29`（见文末「版本与发布」）。
 
 DeepSeek Harness 的多模型理事会插件：一个入口把问题交给多个模型并行作答、匿名互评，可选主席汇总，并可把结论回投主聊天。结果常驻右侧栏 tab。
 
@@ -198,7 +198,18 @@ council_review({
     > 收紧前实测：默认配置下，问题里写一个工作区外的绝对路径，其内容**真的进入附件**（canary 命中）。原因是 `permitted` 写成 `attachRoots.length === 0 || ...` —— 空 allowlist 等于不做限制。对 agent 生成的问题，这是一条无需要用户有意的间接外发通道。
   - **内容级密钥扫描（0.2.28）**：文件名规则（`SECRET_NAME`）只挡名字自曝的文件，挡不住粘在 README / notebook 里的密钥。出站前按 `sk-` / `ghp_` / `github_pat_` / `AKIA` / `xox[baprs]-` / `AIza` / `-----BEGIN … PRIVATE KEY` / `token=「长字面量」` 扫描并**脱敏**为 `[已脱敏:<模式>]`，附件头部与快照 `filesRedactions` 如实报出被脱敏的文件与模式。
     > 选择脱敏而非拒读：整份丢弃会破坏"只是记录密钥格式"的合法评审，且被拒文件对评审者同样不可见。但脱敏**不静默** —— 评审者会知道哪一处不可见。
-  - **仍缺**：出站清单确认（发起前列出将附带的文件让人确认）、junction / reparse point 专项测试。
+  - **reparse point（junction/符号链接）**：工作区内的 junction 指向工作区外时**不会被跟进**。
+    走查向来拒绝树内的链接，但**根节点**曾经没有守卫——`statSafe` 用 `stat`（跟随），
+    于是把 `ws/link-out` 这类路径写进问题就会被当成 root，其中的"普通文件"随即被读取。
+    实测该路径会真的把工作区外文件送进附件（Windows 建 junction 不需要管理员权限）。
+    现在接受候选前会 `lstat` 拒绝链接根并在 `realpath` 解析后的真实路径空间复核包含关系。
+    > **硬链接不在此列**（也不该）：它没有 reparse point，是同一份数据的第二个真实目录项，
+    > `lstat` 就是普通文件；要创建它就必须已经能访问目标，因此不提供额外能力。
+  - **出站清单确认**：面板里的「预览附件」调用 `POST /council/preview`（只读、不受 `panelEnabled` 影响），
+    列出**将要**附带哪些文件、字符数、源码包覆盖情况、以及被脱敏的位置。确认后才启动，
+    运行记录 `manifestConfirmed`。**确认是 fail-closed 的一次性授权**：预览失败/无清单/换问题/换会话都会失效。
+    工具路径（agent 发起）没有人可以确认，因此恒为 `false` —— 不假装有。
+  - **仍缺**：多卷/网络驱动器上的 reparse point 行为未测（junction 不能跨卷，理论影响面有限）。
 - **自动化回归**：`npm run verify` 现在同时跑 host 与 client harness（路径修复/穿越拒绝/密钥跳过/超时语义/并发窗口）。
 
 ## 已知限制
@@ -218,7 +229,7 @@ council_review({
 
 ## 安装
 
-npm 上的发布版本为 **0.1.0**（dist-tags `latest` / `alpha`）；本仓库源码版本 **0.2.28**，尚未发布到 npm——发布 0.2.x 需要新的 granular token（旧的已吊销）。
+npm 上的发布版本为 **0.1.0**（dist-tags `latest` / `alpha`）；本仓库源码版本 **0.2.29**，尚未发布到 npm——发布 0.2.x 需要新的 granular token（旧的已吊销）。
 
 ```sh
 # 从 npm
@@ -299,6 +310,6 @@ node <workspace>\tmp\push-council.mjs <本目录> sprw-li/dsh-model-council main
 ## 发布记录与后续
 
 - GitHub：<https://github.com/sprw-li/dsh-model-council>，release 有 `v0.1.0-alpha` 与 `v0.2.0`（pre-release）。
-- npm：<https://www.npmjs.com/package/dsh-model-council>（已发布 `0.1.0`；仓库源码 `0.2.28` **尚未发布**——`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
+- npm：<https://www.npmjs.com/package/dsh-model-council>（已发布 `0.1.0`；仓库源码 `0.2.29` **尚未发布**——`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
 
 发新版本：更新 `CHANGELOG.md` 与 `package.json` 版本 → `npm run verify` → commit/tag → `npm publish --tag alpha`（npm 新包首次发布会进入 staged 审核，通常几分钟内变为可安装）→ `npm pack` + `gh release create vX.Y.Z --prerelease --notes-file CHANGELOG.md <tarball>`。

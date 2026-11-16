@@ -45,6 +45,21 @@ window.__ModuleLoader__.load({
       'panel.workspace': '当前会话工作区：{path}',
       'panel.filesAttached': '已附带 {count} 个路径的文件内容（{chars} 字）',
       'panel.codeAttached': '已附带源码 {count} 个文件（{chars} 字）',
+      'panel.preview': '预览附件',
+      'panel.previewing': '正在预览…',
+      'panel.previewTitle': '出站清单（以下内容会发送给所选模型提供商）',
+      'panel.previewWorkspace': '工作区：{name}',
+      'panel.previewFiles': '将附带 {count} 个文件（{chars} 字）',
+      'panel.previewFilesNone': '没有要附带的问题路径，也不使用工作区路径：本次不附带文件',
+      'panel.previewFilesPaths': '文件：',
+      'panel.previewCode': '源码包：附带 {files} 个文件（{chars} 字）；发现 {discovered} 个，截断 {truncated} 个',
+      'panel.previewCodeOff': '源码包：本次不附带',
+      'panel.previewRedactions': '已脱敏 {count} 处，这些位置对本次评审不可见：',
+      'panel.previewRedaction': '{path}（{patterns}）',
+      'panel.previewNote': '说明：{note}',
+      'panel.previewFailed': '预览失败：{message}',
+      'panel.previewStale': '问题或会话已改动，确认已失效，请重新预览',
+      'panel.confirmRun': '确认并开始评审',
       'panel.optFeedback': '结果回投主聊天',
       'panel.optChairman': '主席汇总（关闭=无主）',
       'panel.feedbackSent': '已回投主聊天',
@@ -153,6 +168,21 @@ window.__ModuleLoader__.load({
       'panel.workspace': 'Session workspace: {path}',
       'panel.filesAttached': 'Attached {count} path(s), {chars} characters',
       'panel.codeAttached': 'Attached {count} source file(s), {chars} characters',
+      'panel.preview': 'Preview attachments',
+      'panel.previewing': 'Previewing…',
+      'panel.previewTitle': 'Outbound manifest (this is what is sent to the selected providers)',
+      'panel.previewWorkspace': 'Workspace: {name}',
+      'panel.previewFiles': 'Attaches {count} file(s) ({chars} chars)',
+      'panel.previewFilesNone': 'No question paths and no workspace paths: no files are attached',
+      'panel.previewFilesPaths': 'Files:',
+      'panel.previewCode': 'Source pack: {files} file(s) ({chars} chars); {discovered} discovered, {truncated} truncated',
+      'panel.previewCodeOff': 'Source pack: not attached',
+      'panel.previewRedactions': '{count} redaction(s); these locations are invisible to this review:',
+      'panel.previewRedaction': '{path} ({patterns})',
+      'panel.previewNote': 'Note: {note}',
+      'panel.previewFailed': 'Preview failed: {message}',
+      'panel.previewStale': 'The question or session changed; the confirmation expired — preview again',
+      'panel.confirmRun': 'Confirm and run',
       'panel.optFeedback': 'Post the result back to the chat',
       'panel.optChairman': 'Chairman synthesis (off = no chair)',
       'panel.feedbackSent': 'Posted back to the chat',
@@ -293,6 +323,12 @@ const RUN_DISCOVERY_MS = 4000
 .dsc-textarea{box-sizing:border-box;width:100%;min-height:82px;resize:vertical;padding:8px 10px;border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;line-height:1.55;outline:none}
 .dsc-textarea:focus{border-color:var(--dsw-alias-brand-primary)}
 .dsc-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.dsc-manifest{display:flex;flex-direction:column;gap:6px;padding:9px 10px;border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-1);font-size:12px;line-height:1.55;color:var(--dsw-alias-label-primary)}
+.dsc-manifest-title{font-weight:600;color:var(--dsw-alias-label-secondary)}
+.dsc-manifest-list{margin:0;padding-left:18px;font-size:11px;word-break:break-all;color:var(--dsw-alias-label-secondary)}
+.dsc-manifest-redact{padding:6px 8px;border:1px solid var(--dsw-alias-state-error-primary);border-radius:var(--dsw-radius-sm);color:var(--dsw-alias-state-error-primary);font-size:11px;line-height:1.6;word-break:break-all}
+.dsc-manifest-note{font-size:11px;font-style:italic;color:var(--dsw-alias-label-tertiary)}
+.dsc-manifest-stale{font-size:11px;color:var(--dsw-alias-state-error-primary)}
 .dsc-primary{height:30px;padding:0 14px;border:1px solid var(--dsw-alias-brand-primary);border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-brand-primary);color:#fff;font:inherit;font-size:12px;cursor:pointer}
 .dsc-primary:disabled{opacity:.55;cursor:default}
 .dsc-secondary{height:30px;padding:0 12px;border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;cursor:pointer}
@@ -391,6 +427,14 @@ const RUN_DISCOVERY_MS = 4000
         run: null,
         running: false,
         error: '',
+        /* Outbound manifest preview. `previewKey` names the exact
+           (session, question) the preview was taken for, so a changed question
+           or session silently drops the confirmation (fail closed) instead of
+           degrading into a permanent one-time grant. */
+        preview: null,
+        previewKey: '',
+        previewError: '',
+        previewLoading: false,
       },
       subscribe(listener) {
         listeners.add(listener)
@@ -1039,6 +1083,64 @@ const RUN_DISCOVERY_MS = 4000
       }
     }
 
+    /** Session id resolution shared by preview and run, so both name the same session. */
+    function currentSessionId() {
+      return store.state.sessionId !== ''
+        ? store.state.sessionId
+        : typeof draftBridge.sessionId === 'string' ? draftBridge.sessionId : ''
+    }
+
+    /** Identity of the exact (session, question) pair a confirmation authorises. */
+    function manifestKey(question) {
+      return `${currentSessionId()}\u0000${question}`
+    }
+
+    /**
+     * True only while a successful preview covers the current question AND
+     * session AND files are actually attached. Any failed/in-flight preview
+     * leaves the stored preview empty, so the gate cannot open on a guess.
+     */
+    function isManifestConfirmed() {
+      if (store.state.attachFiles === false) return false
+      if (store.state.previewLoading === true) return false
+      if (store.state.previewError !== '') return false
+      const preview = store.state.preview
+      if (preview === null || typeof preview !== 'object') return false
+      return store.state.previewKey === manifestKey(String(store.state.question || '').trim())
+    }
+
+    /**
+     * Read-only dry run of the outbound manifest (`POST /council/preview`).
+     * Fail closed: any transport/HTTP error clears the preview, so a failed
+     * preview can never be mistaken for a confirmation.
+     */
+    async function previewManifest() {
+      const question = String(store.state.question || '').trim()
+      if (question === '') {
+        store.publish({ error: tr('error.empty'), previewError: '' })
+        return
+      }
+      const key = manifestKey(question)
+      store.publish({ previewLoading: true, preview: null, previewKey: '', previewError: '' })
+      try {
+        const data = await fetchJson('/council/preview', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            question,
+            sessionId: currentSessionId(),
+            attachFiles: store.state.attachFiles !== false,
+          }),
+        })
+        /* Store the preview under the key it was requested for: if the
+           question or session moved while the request was in flight, the
+           response must not inherit a confirmation it was not asked for. */
+        store.publish({ previewLoading: false, preview: data, previewKey: key, previewError: '' })
+      } catch (error) {
+        store.publish({ previewLoading: false, preview: null, previewKey: '', previewError: messageOf(error) })
+      }
+    }
+
     async function startRun() {
       if (store.state.running === true) return
       const question = String(store.state.question || '').trim()
@@ -1056,9 +1158,10 @@ const RUN_DISCOVERY_MS = 4000
       const chairman = useChairman && chairmanRow !== undefined
         ? { provider: chairmanRow.provider, model: chairmanRow.model }
         : undefined
-      const sessionId = store.state.sessionId !== ''
-        ? store.state.sessionId
-        : typeof draftBridge.sessionId === 'string' ? draftBridge.sessionId : ''
+      const sessionId = currentSessionId()
+      /* Read the gate at the moment of the send: an edit between preview and
+         click has already invalidated the key by then. */
+      const manifestConfirmed = isManifestConfirmed()
       const payload = {
         question,
         models,
@@ -1074,6 +1177,9 @@ const RUN_DISCOVERY_MS = 4000
         useChairman,
         sessionId,
       }
+      /* Omitted entirely when unconfirmed, so an unconfirmed run cannot look
+         confirmed on the wire (the Host defaults the field to false). */
+      if (manifestConfirmed) payload.manifestConfirmed = true
       stopPolling()
       /* Failure/stall counters are per-run: a previous run that died after 8
          failed polls must not make the next run fail on its first blip. */
@@ -1088,6 +1194,10 @@ const RUN_DISCOVERY_MS = 4000
         })
         if (typeof data.runId !== 'string' || data.runId === '') throw new Error('missing runId')
         store.publish({ runId: data.runId })
+        if (manifestConfirmed) {
+          /* One-shot authorisation: the next run needs its own preview. */
+          store.publish({ preview: null, previewKey: '', previewError: '' })
+        }
         watchRun(data.runId)
       } catch (error) {
         store.publish({ running: false, error: String(error && error.message ? error.message : error) })
@@ -1823,6 +1933,76 @@ const RUN_DISCOVERY_MS = 4000
         h('span', null, t(label)),
       )
 
+      /* Confirmation is derived, never stored: `isManifestConfirmed()` already
+         returned false once the question/session no longer matches the preview. */
+      const confirmed = isManifestConfirmed()
+      const preview = state.preview !== null && typeof state.preview === 'object' ? state.preview : null
+
+      /** The outbound manifest: what exactly leaves the machine, in plain sight. */
+      function manifestPanel() {
+        if (state.attachFiles === false) return null
+        if (state.previewLoading === true) {
+          return h('div', { className: 'dsc-manifest' }, t('panel.previewing'))
+        }
+        if (state.previewError !== '') {
+          return h('div', { className: 'dsc-manifest' },
+            h('div', { className: 'dsc-manifest-title' }, t('panel.previewFailed', { message: state.previewError })),
+          )
+        }
+        if (preview === null) return null
+        const filesPaths = Array.isArray(preview.filesPaths)
+          ? preview.filesPaths.filter((path) => typeof path === 'string')
+          : []
+        const filesLine = preview.filesState === 'ok' && filesPaths.length > 0
+          ? t('panel.previewFiles', {
+              count: filesPaths.length,
+              chars: typeof preview.filesChars === 'number' ? preview.filesChars : 0,
+            })
+          : t('panel.previewFilesNone')
+        const codeLine = preview.codeState === 'ok' && typeof preview.codeFiles === 'number' && preview.codeFiles > 0
+          ? t('panel.previewCode', {
+              files: preview.codeFiles,
+              chars: typeof preview.codeChars === 'number' ? preview.codeChars : 0,
+              discovered: typeof preview.codeDiscovered === 'number' ? preview.codeDiscovered : 0,
+              truncated: typeof preview.codeTruncated === 'number' ? preview.codeTruncated : 0,
+            })
+          : t('panel.previewCodeOff')
+        const redactions = Array.isArray(preview.filesRedactions) ? preview.filesRedactions : []
+        const workspace = preview.workspace !== null && typeof preview.workspace === 'object' ? preview.workspace : {}
+        return h('div', { className: 'dsc-manifest' },
+          h('div', { className: 'dsc-manifest-title' }, t('panel.previewTitle')),
+          h('div', null, t('panel.previewWorkspace', {
+            name: typeof workspace.name === 'string' && workspace.name !== '' ? workspace.name : String(workspace.cwd || '?'),
+          })),
+          h('div', null, filesLine),
+          filesPaths.length > 0
+            ? h('div', null,
+                h('span', null, t('panel.previewFilesPaths')),
+                h('ul', { className: 'dsc-manifest-list' }, filesPaths.map((path) => h('li', { key: path }, path))),
+              )
+            : null,
+          h('div', null, codeLine),
+          redactions.length > 0
+            ? h('div', { className: 'dsc-manifest-redact' },
+                h('div', null, t('panel.previewRedactions', { count: redactions.length })),
+                h('ul', { className: 'dsc-manifest-list' }, redactions.map((item, index) => {
+                  const row = item !== null && typeof item === 'object' ? item : {}
+                  return h('li', { key: `${index}` }, t('panel.previewRedaction', {
+                    path: String(row.path || ''),
+                    patterns: Array.isArray(row.patterns) ? row.patterns.join(', ') : '',
+                  }))
+                })),
+              )
+            : null,
+          typeof preview.note === 'string' && preview.note !== ''
+            ? h('div', { className: 'dsc-manifest-note' }, t('panel.previewNote', { note: preview.note }))
+            : null,
+          confirmed !== true
+            ? h('div', { className: 'dsc-manifest-stale' }, t('panel.previewStale'))
+            : null,
+        )
+      }
+
       return h('div', { className: 'dsc-tab' },
         h('div', { className: 'dsc-tab-inner' },
           h('div', { className: 'dsc-tab-head' },
@@ -1913,6 +2093,7 @@ const RUN_DISCOVERY_MS = 4000
             state.error !== ''
               ? h('div', { className: 'dsc-error-box' }, state.error)
               : null,
+            manifestPanel(),
             h('div', { className: 'dsc-actions' },
               h('span', { className: 'dsc-hint' }, t('panel.cost', { count: estimatedCalls })),
               h('button', {
@@ -1920,7 +2101,15 @@ const RUN_DISCOVERY_MS = 4000
                 className: 'dsc-primary',
                 disabled: state.running,
                 onClick: () => void startRun(),
-              }, state.running ? t('panel.running') : t('panel.run')),
+              }, state.running ? t('panel.running') : confirmed ? t('panel.confirmRun') : t('panel.run')),
+              state.attachFiles !== false
+                ? h('button', {
+                    type: 'button',
+                    className: 'dsc-secondary',
+                    disabled: state.running || state.previewLoading === true,
+                    onClick: () => void previewManifest(),
+                  }, state.previewLoading === true ? t('panel.previewing') : t('panel.preview'))
+                : null,
               state.running === true || (run !== null && run.status === 'running')
                 ? h('button', {
                     type: 'button',

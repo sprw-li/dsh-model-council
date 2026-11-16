@@ -46,6 +46,26 @@ const resumeCalls = []
 /* Fault injection for the resilience cases below. */
 let failNextResumeWith409 = null
 let failNextRunPolls = 0
+/* Fault injection for the outbound-manifest preview (fail-closed cases). */
+let failNextPreview = null
+
+/* A full `POST /council/preview` 200 body, in the documented shape. */
+const PREVIEW_RESPONSE = {
+  question: '外发清单测试问题',
+  attachFiles: true,
+  workspace: { cwd: 'D:\\demo', source: 'session-header', workspaceId: 'ws1', name: 'demo' },
+  filesState: 'ok',
+  filesPaths: ['D:\\demo\\a.md', 'D:\\demo\\b.md'],
+  filesChars: 1234,
+  codeState: 'ok',
+  codeFiles: 3,
+  codeChars: 4567,
+  codeDiscovered: 10,
+  codeTruncated: 2,
+  filesRedactions: [{ path: 'D:\\demo\\secret.env', patterns: ['openai-key'] }],
+  totalChars: 1234,
+  note: '抽样初审，不是全项目审查',
+}
 
 /* "Wake the chat agent" enabled before the bundle loads. */
 storage.set(LS_KEY, JSON.stringify({ feedbackMode: 'wake', useContext: true, useChairman: true }))
@@ -114,7 +134,11 @@ const fakeWindow = {
     setItem(key, value) { storage.set(key, String(value)) },
   },
   fetch: async (url, options) => {
-    fetchCalls.push({ url, method: options === undefined || options === null || options.method === undefined ? 'GET' : options.method })
+    fetchCalls.push({
+      url,
+      method: options === undefined || options === null || options.method === undefined ? 'GET' : options.method,
+      body: options !== undefined && options !== null && options.body !== undefined ? String(options.body) : '',
+    })
     if (url === '/council/models') {
       return {
         ok: true,
@@ -130,6 +154,14 @@ const fakeWindow = {
     }
     if (String(url).indexOf('/council/workspace') === 0) {
       return { ok: true, json: async () => ({ cwd: 'D:\\demo', source: 'session-header', workspaceId: 'ws1', name: 'demo' }) }
+    }
+    if (url === '/council/preview') {
+      if (failNextPreview !== null) {
+        const message = failNextPreview
+        failNextPreview = null
+        return { ok: false, status: 500, json: async () => ({ error: message }) }
+      }
+      return { ok: true, json: async () => (Object.assign({}, PREVIEW_RESPONSE)) }
     }
     if (url === '/council/run') {
       postCount += 1
@@ -863,6 +895,223 @@ if (!silentHtml.includes('已静默放进上下文')) throw new Error('silent de
   if (!/sameSelection\(next, box\.current\.selected\)/.test(storeBlock)) {
     throw new Error('useStore must compare before forcing a re-render')
   }
+}
+
+/* ---- Outbound manifest: POST /council/preview + explicit confirmation gate ---- */
+function setQuestion(value) {
+  const tree = build(tabBody({ t }))
+  const box = findNode(tree, (node) => node.type === 'textarea')
+  if (box === undefined) throw new Error('question textarea is missing')
+  box.props.onChange({ target: { value } })
+}
+
+function previewCallCount() {
+  return fetchCalls.filter((call) => call.url === '/council/preview').length
+}
+
+function lastRunBody() {
+  const calls = fetchCalls.filter((call) => call.url === '/council/run' && call.method === 'POST')
+  if (calls.length === 0) throw new Error('no POST /council/run was recorded')
+  return JSON.parse(calls[calls.length - 1].body)
+}
+
+function previewButtonNode(tree) {
+  return findNode(tree === undefined ? build(tabBody({ t })) : tree,
+    (node) => node.type === 'button' && textOf(node.children).includes('预览附件'))
+}
+
+function runButtonNode() {
+  return findRunButton(build(tabBody({ t })))
+}
+
+function clickRun() {
+  const button = runButtonNode()
+  if (button === undefined) throw new Error('run button is missing')
+  button.props.onClick()
+}
+
+function checkboxByLabel(text) {
+  const label = findNode(build(tabBody({ t })), (node) => node.type === 'label' && textOf(node.children).includes(text))
+  if (label === undefined) return undefined
+  return findNode(label.children, (node) => node.type === 'input')
+}
+
+/* 1. "预览附件" posts /council/preview and renders the manifest in full. */
+{
+  setQuestion('外发清单测试问题')
+  const before = previewCallCount()
+  const button = previewButtonNode()
+  if (button === undefined) throw new Error('preview button is missing next to the run button')
+  button.props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  const calls = fetchCalls.filter((call) => call.url === '/council/preview')
+  if (calls.length !== before + 1) {
+    throw new Error(`preview button did not POST /council/preview (delta=${calls.length - before})`)
+  }
+  if (calls[calls.length - 1].method !== 'POST') throw new Error('preview must be sent as a POST')
+  const sent = JSON.parse(calls[calls.length - 1].body)
+  if (sent.question !== '外发清单测试问题') throw new Error(`preview sent the wrong question: ${sent.question}`)
+  if (sent.attachFiles !== true) throw new Error('preview must report the attachFiles flag')
+  if (sent.sessionId !== 'session-test') throw new Error(`preview sent the wrong session: ${sent.sessionId}`)
+
+  const html = render(React.createElement(tabBody, { t }))
+  for (const expected of [
+    '出站清单（以下内容会发送给所选模型提供商）',
+    '将附带 2 个文件（1234 字）',
+    'D:\\demo\\a.md',
+    'D:\\demo\\b.md',
+    '源码包：附带 3 个文件（4567 字）；发现 10 个，截断 2 个',
+    '已脱敏 1 处，这些位置对本次评审不可见：',
+    'D:\\demo\\secret.env（openai-key）',
+    '说明：抽样初审，不是全项目审查',
+    '确认并开始评审',
+  ]) {
+    if (!html.includes(expected)) throw new Error(`manifest is missing "${expected}": ${html.slice(0, 600)}`)
+  }
+}
+
+/* 2. Preview + confirmed start carries manifestConfirmed:true, then consumes it. */
+{
+  setQuestion('确认后开始的问题')
+  const button = previewButtonNode()
+  if (button === undefined) throw new Error('preview button is missing before the confirm case')
+  button.props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  if (!render(React.createElement(tabBody, { t })).includes('确认并开始评审')) {
+    throw new Error('a successful preview must switch the run button to its confirm state')
+  }
+  const before = postCount
+  clickRun()
+  await new Promise((resolve) => setTimeout(resolve, 1800))
+  if (postCount - before !== 1) throw new Error('a confirmed start did not POST /council/run')
+  const body = lastRunBody()
+  if (body.manifestConfirmed !== true) {
+    throw new Error(`a confirmed run must carry manifestConfirmed:true, got ${JSON.stringify(body.manifestConfirmed)}`)
+  }
+  if (render(React.createElement(tabBody, { t })).includes('确认并开始评审')) {
+    throw new Error('a run must consume the confirmation (one-shot authorisation)')
+  }
+}
+
+/* 3. Without a preview the same button must NOT claim a confirmation. */
+{
+  setQuestion('未预览就点开始')
+  if (render(React.createElement(tabBody, { t })).includes('确认并开始评审')) {
+    throw new Error('a fresh question must not start in the confirm state')
+  }
+  const before = postCount
+  clickRun()
+  await new Promise((resolve) => setTimeout(resolve, 1800))
+  if (postCount - before !== 1) throw new Error('an unconfirmed start did not run')
+  if (lastRunBody().manifestConfirmed === true) {
+    throw new Error('starting without a preview must not send manifestConfirmed:true')
+  }
+}
+
+/* 4. Editing the question after a preview invalidates the confirmation. */
+{
+  setQuestion('换问题前')
+  const button = previewButtonNode()
+  if (button === undefined) throw new Error('preview button is missing before the question swap')
+  button.props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  if (!render(React.createElement(tabBody, { t })).includes('确认并开始评审')) {
+    throw new Error('preview before the question swap did not confirm')
+  }
+  setQuestion('换问题后')
+  const html = render(React.createElement(tabBody, { t }))
+  if (html.includes('确认并开始评审')) {
+    throw new Error('changing the question must invalidate the confirmation')
+  }
+  if (!html.includes('确认已失效')) throw new Error('the stale-manifest hint is missing after a question edit')
+  const before = postCount
+  clickRun()
+  await new Promise((resolve) => setTimeout(resolve, 1800))
+  if (postCount - before !== 1) throw new Error('the run after a question swap did not start')
+  if (lastRunBody().manifestConfirmed === true) {
+    throw new Error('a rewritten question must not reuse the old confirmation')
+  }
+}
+
+/* 5. Switching sessions after a preview invalidates the confirmation too. */
+{
+  setQuestion('换会话前')
+  const button = previewButtonNode()
+  if (button === undefined) throw new Error('preview button is missing before the session switch')
+  button.props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  if (!render(React.createElement(tabBody, { t })).includes('确认并开始评审')) {
+    throw new Error('preview before the session switch did not confirm')
+  }
+  command.ui.run({ sessionId: 'session-other' })
+  await new Promise((resolve) => setTimeout(resolve, 400))
+  setQuestion('换会话前')
+  if (render(React.createElement(tabBody, { t })).includes('确认并开始评审')) {
+    throw new Error('switching sessions must invalidate the confirmation')
+  }
+  const before = postCount
+  clickRun()
+  await new Promise((resolve) => setTimeout(resolve, 1800))
+  if (postCount - before !== 1) throw new Error('the run after a session switch did not start')
+  if (lastRunBody().manifestConfirmed === true) {
+    throw new Error('a new session must not reuse the confirmation of the old one')
+  }
+}
+
+/* 6. A failed preview fails closed: it must also revoke a confirmation for the
+      SAME question, otherwise a stale manifest would ride along silently. */
+{
+  setQuestion('预览失败的问题')
+  const okButton = previewButtonNode()
+  if (okButton === undefined) throw new Error('preview button is missing before the failure case')
+  okButton.props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  if (!render(React.createElement(tabBody, { t })).includes('确认并开始评审')) {
+    throw new Error('the successful preview before the failure case did not confirm')
+  }
+  failNextPreview = 'preview service down'
+  const button = previewButtonNode()
+  if (button === undefined) throw new Error('preview button vanished before the retry')
+  button.props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  const html = render(React.createElement(tabBody, { t }))
+  if (!html.includes('预览失败：preview service down')) {
+    throw new Error(`a failed preview must show its error: ${html.slice(0, 600)}`)
+  }
+  if (html.includes('确认并开始评审')) {
+    throw new Error('a failed preview must revoke the confirmation (fail closed)')
+  }
+  const before = postCount
+  clickRun()
+  await new Promise((resolve) => setTimeout(resolve, 1800))
+  if (postCount - before !== 1) throw new Error('a failed preview must not block the original run path')
+  if (lastRunBody().manifestConfirmed === true) {
+    throw new Error('a failed preview must never authorise manifestConfirmed:true')
+  }
+}
+
+/* 7. attachFiles=false: no preview surface, no confirmation, unchanged run path. */
+{
+  const toggle = checkboxByLabel('自动附带问题里的本地路径')
+  if (toggle === undefined) throw new Error('the attachFiles toggle is missing')
+  toggle.props.onChange()
+  setQuestion('不附带文件的问题')
+  if (render(React.createElement(tabBody, { t })).includes('预览附件')) {
+    throw new Error('attachFiles=false must hide the preview button')
+  }
+  if (render(React.createElement(tabBody, { t })).includes('确认并开始评审')) {
+    throw new Error('attachFiles=false must never show a confirmation state')
+  }
+  const before = postCount
+  clickRun()
+  await new Promise((resolve) => setTimeout(resolve, 1800))
+  if (postCount - before !== 1) throw new Error('attachFiles=false must keep the original run path')
+  const body = lastRunBody()
+  if (body.attachFiles !== false) throw new Error(`attachFiles=false must be sent as false, got ${JSON.stringify(body.attachFiles)}`)
+  if (body.manifestConfirmed === true) throw new Error('attachFiles=false must never confirm a manifest')
+  const restore = checkboxByLabel('自动附带问题里的本地路径')
+  if (restore === undefined) throw new Error('the attachFiles toggle vanished')
+  restore.props.onChange()
 }
 
 for (const cleanup of cleanups.reverse()) {
