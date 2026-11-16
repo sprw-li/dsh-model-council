@@ -1,3 +1,44 @@
+# 0.2.31
+
+## CI 正式启用（并更正一个我给错的结论）
+
+`0.2.30` 里我写"CI 卡在凭据上、需要人工授权"——**那是错的**。错因是排查只覆盖了 OAuth 系路径：
+
+| 推 `.github/workflows/*` 的路径 | 结果 |
+|---|---|
+| `git push` over **HTTPS**（OAuth App token / `gh` 登录态） | ✗ `refusing to allow an OAuth App ... without 'workflow' scope` |
+| REST（`POST /git/trees` 带该路径） | ✗ **404** |
+| `git push` over **SSH** | ✓ **成功** |
+
+**该限制只针对 OAuth App；SSH 密钥不受限。** 所以既不需要 `gh auth refresh`，也不需要 fine-grained PAT。
+
+用探针分支实证了整条链：SSH 推上去 → GitHub 接受 workflow → 自动运行并全绿：
+
+```
+run 43903527781   verify   completed / success   ubuntu-latest   49s
+```
+
+这同时把"无法在 Linux 验证"这件事解决了——**四套 harness 真的在 ubuntu-latest 上全过**。
+
+### 顺带查清的两件事
+
+1. **推送失败与仓库无关。** 同一时刻采样：`github.com:443`（git over HTTPS）
+   **8/8 全超时**（~10.6 s），而 `api.github.com` 8/8 正常（669–975 ms）、
+   `git@github.com`（SSH）正常、`example.com` 8/8 正常，且 `github.com` 的 TCP 22/443 都通。
+   即"git over HTTPS 这条应用层路径被卡住"，不是整体断网，也不是这个仓库的问题。
+   `origin` 已改为 SSH（实测 push 4.9 s、fetch 正常）。
+2. **同一个陷阱我又踩了一次**：在探针分支上文件是被跟踪的，切回 main 时（main 上它仍被
+   `.gitignore` 忽略）git 把文件从工作树移除，随后删除分支让它变成游离对象，文件再次消失。
+   已从游离提交恢复。这也说明当时"把它提交进仓库"是消除此类风险的唯一稳当做法 —— 现在已启用。
+
+## 变更
+
+- `.gitignore` 删除 `.github/workflows/` 一行；`.github/workflows/verify.yml` 进入版本控制。
+- README「CI」一节改为"已启用"，并保留排查记录（为什么曾经以为开不了）。
+- `dev/verify-host.mjs` 的 workflow 守卫从"文件存在才检查"改为**必须存在**：
+  CI 已启用，文件丢失就等于门禁静默失效，所以这条断言不能是机会性的。
+- 版本 0.2.31 / build v62。
+
 # 0.2.30
 
 为"启用 CI"做的准备：修掉两处会让 CI **一开就红**的问题，并把它变成可照做的流程。

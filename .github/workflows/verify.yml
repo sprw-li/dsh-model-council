@@ -1,0 +1,31 @@
+name: verify
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  harnesses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # index.js imports @deepseek-ai/schemastery (it declares the plugin Config);
+      # the harnesses run in plain node, so the peer must be installed first.
+      # Without this step dev/verify-host.mjs fails with ERR_MODULE_NOT_FOUND.
+      - name: Install peer dependency for the plain-node harnesses
+        run: npm install --no-save --no-package-lock
+      - name: Syntax check
+        run: |
+          node --check index.js
+          node --check client.js
+      - name: Client harness (entries, toggles, delivery, bridges)
+        run: node dev/verify-client.mjs
+      - name: Host harness (paths, secrets, doc/constant contracts)
+        run: node dev/verify-host.mjs
+      - name: Runtime harness (real callModel retry, fail-fast, round-trip)
+        run: node dev/verify-runtime.mjs
+      - name: Sampler coverage (all deadline identifiers in the pack)
+        run: node dev/tune-sampler.mjs

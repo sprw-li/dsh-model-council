@@ -2491,7 +2491,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v61', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v62', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -2504,7 +2504,7 @@ export function apply(ctx, config) {
              human or the client can see which side is off. */
           sendJson(res, 200, {
             ok: true,
-            build: 'v61',
+            build: 'v62',
             toolEnabled: toolEnabled(liveConfig),
             panelEnabled: panelEnabled(liveConfig),
           })

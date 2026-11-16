@@ -828,15 +828,19 @@ try {
       'tune-sampler must derive ROOT from import.meta.url')
   }
 
-  /* The CI workflow itself. It is gitignored (the token lacks `workflow` scope,
-     so it never reached the remote), which is exactly why a broken workflow
-     survived unnoticed: nothing ever parsed it. Found on inspection —
-     `- name: Runtime harness (real callModel: retry, ...)` contains an unquoted
-     `": "` inside a plain scalar, which YAML reads as a nested mapping. GitHub
-     would have rejected the whole workflow on the first push. */
+  /* The CI workflow itself. Two real defects lived here and both survived because
+     nothing ever parsed the file:
+       * `- name: Runtime harness (real callModel: retry, ...)` — an unquoted
+         `": "` inside a plain scalar, which YAML reads as a nested mapping.
+         GitHub would have rejected the whole workflow on the first push.
+       * the file was gitignored for weeks (the OAuth `workflow` scope obstacle,
+         which turned out NOT to apply to SSH pushes), so CI never ran at all.
+     It is committed now, so this guard is permanent rather than opportunistic. */
   {
     const workflow = new URL('../.github/workflows/verify.yml', import.meta.url)
-    if (existsSync(fileURLToPath(workflow))) {
+    assert.ok(existsSync(fileURLToPath(workflow)),
+      'the CI workflow must be committed — CI is enabled, so losing the file silently disables the gate')
+    {
       const text = readFileSync(workflow, 'utf8')
       for (const [index, line] of text.split(/\r?\n/).entries()) {
         const match = /^\s*-\s*name:\s*(.+?)\s*$/.exec(line)

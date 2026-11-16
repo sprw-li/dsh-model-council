@@ -2,7 +2,7 @@
 
 > 仓库：<https://github.com/sprw-li/dsh-model-council>
 >
-> **Status: alpha** — 接口与行为仍可能变化，正式版等外部反馈后再定。已发布到 npm 的只有 `0.1.0`；仓库源码为 `0.2.30`（见文末「版本与发布」）。
+> **Status: alpha** — 接口与行为仍可能变化，正式版等外部反馈后再定。已发布到 npm 的只有 `0.1.0`；仓库源码为 `0.2.31`（见文末「版本与发布」）。
 
 DeepSeek Harness 的多模型理事会插件：一个入口把问题交给多个模型并行作答、匿名互评，可选主席汇总，并可把结论回投主聊天。结果常驻右侧栏 tab。
 
@@ -229,7 +229,7 @@ council_review({
 
 ## 安装
 
-npm 上的发布版本为 **0.1.0**（dist-tags `latest` / `alpha`）；本仓库源码版本 **0.2.30**，尚未发布到 npm——发布 0.2.x 需要新的 granular token（旧的已吊销）。
+npm 上的发布版本为 **0.1.0**（dist-tags `latest` / `alpha`）；本仓库源码版本 **0.2.31**，尚未发布到 npm——发布 0.2.x 需要新的 granular token（旧的已吊销）。
 
 ```sh
 # 从 npm
@@ -255,40 +255,42 @@ npm run syntax    # node --check 两个入口
 > 要求祖先 package.json 声明它，否则回落 native 解析）与 `devDependencies`（普通 node 跑 harness）。
 > 干净检出必须先 `npm install`。
 
-### CI 状态：已验证可用，当前**未在 main 上启用**（2026-11-17）
+### CI：已启用
 
-`verify` workflow 已被 GitHub 接受并**成功跑过一次**：
+`.github/workflows/verify.yml` 已进入版本控制，每个 push / PR 自动跑：
 
 ```
-run 43903527781   verify   completed / success   ubuntu-latest   49s
-https://github.com/sprw-li/dsh-model-council/actions/runs/43903527781
+ubuntu-latest / node 22
+  1 actions/checkout@v4
+  2 actions/setup-node@v4
+  3 npm install --no-save --no-package-lock     ← 没有它 verify-host 会 ERR_MODULE_NOT_FOUND
+  4 node --check index.js && node --check client.js
+  5 node dev/verify-client.mjs
+  6 node dev/verify-host.mjs
+  7 node dev/verify-runtime.mjs
+  8 node dev/tune-sampler.mjs
 ```
 
-即：8 个步骤（install + syntax + 四套 harness）**在 Linux runner 上全绿**，
-这也顺带验证了 harness 的可移植性。
+首次运行（探针分支）：**run 43903527781，49 秒，全绿**。
+查看：<https://github.com/sprw-li/dsh-model-council/actions>
 
-**先前"CI 卡在你的凭据上"的结论是错的**，原因是排查方式有漏：
+本地等价检查：`npm run verify`（一条命令跑完四套 harness）。
 
-| 路径 | 结果 |
+#### 排查记录：为什么曾经以为"开不了"
+
+先前写下"CI 卡在凭据上、需要你授权"是**错的**。错因是排查只覆盖了 OAuth 系路径：
+
+| 推 workflow 文件的路径 | 结果 |
 |---|---|
-| `git push` over **HTTPS** | ✗ `refusing to allow an OAuth App ... without workflow scope` |
-| `POST /git/trees`（REST，OAuth） | ✗ 404 |
-| `git push` over **SSH** | ✓ **成功**（`workflow` scope 限制只针对 OAuth App，SSH 密钥不受限） |
+| `git push` over **HTTPS**（OAuth App token / `gh` 登录态） | ✗ `refusing to allow an OAuth App ... without 'workflow' scope` |
+| REST（`POST /git/trees` 带该路径） | ✗ **404**（scope 不足时 GitHub 用 404 而非 403） |
+| `git push` over **SSH** | ✓ **成功** |
 
-同时实测 `github.com:443`（git over HTTPS）**8/8 全超时**，而 `api.github.com` 8/8 正常、
-`git@github.com`（SSH）正常 —— 所以之前那种"推不上去"的现象是**传输层**问题，与本仓库无关。
+**该限制只针对 OAuth App，SSH 密钥不受限** —— 所以不需要 `gh auth refresh`，也不需要 fine-grained PAT。
 
-**启用（一条命令，不需要浏览器授权）**：
-
-```powershell
-# 只需让 workflow 文件进版本控制并推上 main；SSH 推送不受 workflow scope 限制
-git add -f .github/workflows/verify.yml
-git commit -m "ci: enable the verify workflow"
-git push origin main
-```
-
-**当前不启用的理由**：暂无（技术障碍已排除）。若确实不要 CI，保持现状即可 ——
-workflow 文件在本地且被 `.gitignore` 忽略，权威检查是 `npm run verify`（一条命令跑完四套 harness）。
+同一时期还实测到 git over **HTTPS** 到 `github.com:443` 会整段超时
+（8/8 失败、~10.6 s），而 `api.github.com` 8/8 正常、SSH 正常、对照站正常。
+所以 `origin` 已改为 SSH（`git@github.com:sprw-li/dsh-model-council.git`）。
 
 ## 推送到 GitHub（本机沙箱的可用路径）
 
@@ -320,6 +322,6 @@ node <workspace>\tmp\push-council.mjs <本目录> sprw-li/dsh-model-council main
 ## 发布记录与后续
 
 - GitHub：<https://github.com/sprw-li/dsh-model-council>，release 有 `v0.1.0-alpha` 与 `v0.2.0`（pre-release）。
-- npm：<https://www.npmjs.com/package/dsh-model-council>（已发布 `0.1.0`；仓库源码 `0.2.30` **尚未发布**——`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
+- npm：<https://www.npmjs.com/package/dsh-model-council>（已发布 `0.1.0`；仓库源码 `0.2.31` **尚未发布**——`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
 
 发新版本：更新 `CHANGELOG.md` 与 `package.json` 版本 → `npm run verify` → commit/tag → `npm publish --tag alpha`（npm 新包首次发布会进入 staged 审核，通常几分钟内变为可安装）→ `npm pack` + `gh release create vX.Y.Z --prerelease --notes-file CHANGELOG.md <tarball>`。

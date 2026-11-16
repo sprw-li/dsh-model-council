@@ -1,22 +1,3 @@
 node_modules/
 *.tgz
 .DS_Store
-
-# Kept out of version control only because CI is not enabled on main yet.
-#
-# 2026-11-17 correction: the "workflow scope" obstacle applies to OAuth App
-# tokens ONLY. Verified on this machine:
-#   git push over HTTPS  -> "refusing to allow an OAuth App to create or update
-#                           workflow ... without `workflow` scope"
-#   POST /git/trees      -> 404 (REST under OAuth)
-#   git push over SSH    -> SUCCESS  (git@github.com:sprw-li/dsh-model-council)
-# SSH keys are not OAuth Apps, so they can push workflow files. The `verify`
-# workflow was accepted by GitHub and ran green on ubuntu-latest in 49s:
-#   https://github.com/sprw-li/dsh-model-council/actions/runs/43903527781
-#
-# To enable CI (no browser authorization needed):
-#   git add -f .github/workflows/verify.yml
-#   git commit -m "ci: enable the verify workflow" && git push origin main
-#   (then delete this .gitignore line)
-# Until then `npm run verify` is the authoritative gate.
-.github/workflows/
