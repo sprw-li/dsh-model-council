@@ -7,9 +7,13 @@
  *
  * Usage: node dev/tune-sampler.mjs   (exit 0 = fully covered)
  */
+import { fileURLToPath } from 'node:url'
+import { dirname } from 'node:path'
 import { collectCodeContext } from '../index.js'
 
-const ROOT = '<repo-root>'
+/* Derived from this file's own location, not hardcoded: an absolute Windows
+   path made this gate fail on any other machine (and in CI on Linux). */
+const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
 const HINTS = ['deadline', 'callmodel', 'attempttimeout', 'callseatsubagent', 'deadlinewall', 'rundeadlineof']
 
 const MUST = {

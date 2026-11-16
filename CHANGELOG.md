@@ -1,3 +1,55 @@
+# 0.2.30
+
+为"启用 CI"做的准备：修掉两处会让 CI **一开就红**的问题，并把它变成可照做的流程。
+
+## 1. CI workflow 本身是坏的 YAML（一直没人发现）
+
+```
+- name: Runtime harness (real callModel: retry, fail-fast, round-trip)
+                                      ^^ 未加引号的 ": "
+```
+YAML 把这个 `": "` 当成嵌套映射的起始，`yaml.safe_load` 直接 `ScannerError:
+mapping values are not allowed here (line 28, column 46)`。**GitHub 会在首次推送时拒绝整个 workflow。**
+
+之所以长期没暴露：文件被 `.gitignore` 忽略、从未推送，因此没有任何东西解析过它。
+修法是把内层冒号去掉。现在 `dev/verify-host.mjs` 里有一道守卫：
+每个 step name 不得含未引号的 `": "`、四套 harness 必须都被 `run`、
+必须有 `npm install` 与 `runs-on: ubuntu-latest`。
+
+## 2. `tune-sampler.mjs` 硬编码了 Windows 路径（Linux CI 必失败）
+
+```js
+const ROOT = '<repo-root>'   // 改为：
+const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
+```
+CI 跑在 `ubuntu-latest`，那个路径不存在 → 覆盖率闸门会因"找不到文件"而失败，
+而不是因为真的没覆盖。同一道守卫会静态检查所有 `dev/*.mjs` 不得把仓库根写成绝对路径字面量
+（Windows 盘符或前导 `/`），并断言 sampler 确实从 `import.meta.url` 推导。
+
+**两处守卫都做了变异测试**：把硬编码路径改回去 → harness exit 1 并指名该文件；还原后 exit 0。
+
+## 3. 逐条复跑 CI 的 8 个步骤（本机等价）
+
+```
+[1] npm install --no-save --no-package-lock      → up to date
+[2] node --check index.js && node --check client.js  → exit 0
+[3] node dev/verify-client.mjs                   → exit 0
+    node dev/verify-host.mjs                     → exit 0
+    node dev/verify-runtime.mjs                  → exit 0
+    node dev/tune-sampler.mjs                    → exit 0
+```
+
+**诚实边界**：本机**没有 WSL 也没有 Docker**，所以无法真在 Linux 上执行这套步骤。
+已做的是静态消除平台假设（上面两道守卫）＋ 把 junction 测试写成
+`symlinkSync(..., 'junction')`（POSIX 忽略 type 参数、创建普通符号链接，因此该用例在 Linux 上
+依然成立且有同等意义）。**首次 CI 运行仍可能需要一轮修正**，不要预先宣称它一定绿。
+
+## 4. 启用流程
+
+写进了 README 的「CI 状态」一节与 `.gitignore` 注释：`gh auth refresh -h github.com -s workflow`
+→ 在浏览器输入一次性码 → 删 `.gitignore` 那一行 → `git add -f` → commit/push。
+**这一步无法由 agent 代劳**：OAuth 设备码的设计就是让人授权；若 agent 能自己扩权，scope 就形同虚设。
+
 # 0.2.29
 
 外部审查报告遗留的最后两项：出站清单确认、reparse point 专项测试。

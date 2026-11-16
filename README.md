@@ -2,7 +2,7 @@
 
 > 仓库：<https://github.com/sprw-li/dsh-model-council>
 >
-> **Status: alpha** — 接口与行为仍可能变化，正式版等外部反馈后再定。已发布到 npm 的只有 `0.1.0`；仓库源码为 `0.2.29`（见文末「版本与发布」）。
+> **Status: alpha** — 接口与行为仍可能变化，正式版等外部反馈后再定。已发布到 npm 的只有 `0.1.0`；仓库源码为 `0.2.30`（见文末「版本与发布」）。
 
 DeepSeek Harness 的多模型理事会插件：一个入口把问题交给多个模型并行作答、匿名互评，可选主席汇总，并可把结论回投主聊天。结果常驻右侧栏 tab。
 
@@ -229,7 +229,7 @@ council_review({
 
 ## 安装
 
-npm 上的发布版本为 **0.1.0**（dist-tags `latest` / `alpha`）；本仓库源码版本 **0.2.29**，尚未发布到 npm——发布 0.2.x 需要新的 granular token（旧的已吊销）。
+npm 上的发布版本为 **0.1.0**（dist-tags `latest` / `alpha`）；本仓库源码版本 **0.2.30**，尚未发布到 npm——发布 0.2.x 需要新的 granular token（旧的已吊销）。
 
 ```sh
 # 从 npm
@@ -255,28 +255,53 @@ npm run syntax    # node --check 两个入口
 > 要求祖先 package.json 声明它，否则回落 native 解析）与 `devDependencies`（普通 node 跑 harness）。
 > 干净检出必须先 `npm install`。
 
-### CI 状态：**当前没有 CI**
+### CI 状态：**当前没有 CI**（文件已修好且校验通过，等一次授权）
 
-`.github/workflows/verify.yml` 在本地是完整的（`npm install` + 四套 harness，全套约 17.5 s），
-但它**没有进入仓库**，GitHub Actions 一次都没跑过。`.gitignore` 忽略了 `.github/workflows/`。
+`.github/workflows/verify.yml` 在本地是完整的：`ubuntu-latest` + `actions/checkout@v4` +
+`actions/setup-node@v4`(node 22) + `npm install --no-save --no-package-lock` +
+syntax + 四套 harness（全套约 18 秒）。**这 8 个步骤已在 2026-11-16 逐条本机复跑通过。**
 
-2026-11-16 实测两条推送路径都被拒：
+但它**没有进入仓库**（`.gitignore` 忽略 `.github/workflows/`），Actions 一次都没跑过。
 
-```
-git push        → refusing to allow an OAuth App to create or update workflow
-                  `.github/workflows/verify.yml` without `workflow` scope
-REST /git/trees → 404（GitHub 对 scope 不足的写入用 404 而不是 403）
-```
-
-`gh` 的 token 与 Git Credential Manager 的凭据**都缺 `workflow` scope**，所以在会话内无法修复。
-
-**启用步骤**（需要你操作，我不能替你扩权）：
+**启用 CI 的操作流程**
 
 ```powershell
-gh auth refresh -s workflow         # 交互式；或签发带 Workflows 权限的 fine-grained PAT
-# 然后删掉 .gitignore 里的 .github/workflows/ 那一行
-git add -f .github/workflows/verify.yml && git push
+# 1) 给凭据加 workflow scope（会话内做不到：设备码必须由人授权）
+gh auth refresh -h github.com -s workflow
+#    它会打印一个一次性码并打开 https://github.com/login/device —— 在浏览器里输入该码
+
+# 2) 确认 scope 已生效（应出现在 Token scopes 里）
+gh auth status
+
+# 3) 让 workflow 文件进入版本控制
+#    删除 .gitignore 中 ".github/workflows/" 这一行（连同上面的注释）
+git add -f .github/workflows/verify.yml
+
+# 4) 提交并推送
+git commit -m "ci: enable the verify workflow"
+git push origin main
 ```
+
+推送成功后到 **Actions** 页签应出现 `verify` 工作流，每个 push / PR 自动跑。
+
+**排查：如果第 3 步或第 4 步被拒**
+
+```
+refusing to allow an OAuth App to create or update workflow ... without `workflow` scope
+```
+
+说明 scope 没加上，回到第 1 步。实测两条路径都会被拒，且 GitHub 对 REST 用 **404**（不是 403）：
+
+```
+git push        → 上面的原文
+POST /git/trees → 404（scope 不足时的表现）
+```
+
+**已知的坑（已修，留作记录）**：这个 workflow 原先是**坏的 YAML** ——
+`- name: Runtime harness (real callModel: retry, ...)` 里未加引号的 `": "` 被 YAML 当成嵌套映射，
+GitHub 会在首次推送时直接拒绝整个 workflow。因为文件从未推送，一直没人发现。
+现在 `dev/verify-host.mjs` 里有一道守卫：检查每个 step name 不含未引号的 `": "`、
+四套 harness 都被 `run`、以及有 `npm install` 与 `runs-on`。
 
 在那之前，**权威检查是本地 `npm run verify`**，不要以为 push 会触发门禁。
 
@@ -310,6 +335,6 @@ node <workspace>\tmp\push-council.mjs <本目录> sprw-li/dsh-model-council main
 ## 发布记录与后续
 
 - GitHub：<https://github.com/sprw-li/dsh-model-council>，release 有 `v0.1.0-alpha` 与 `v0.2.0`（pre-release）。
-- npm：<https://www.npmjs.com/package/dsh-model-council>（已发布 `0.1.0`；仓库源码 `0.2.29` **尚未发布**——`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
+- npm：<https://www.npmjs.com/package/dsh-model-council>（已发布 `0.1.0`；仓库源码 `0.2.30` **尚未发布**——`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
 
 发新版本：更新 `CHANGELOG.md` 与 `package.json` 版本 → `npm run verify` → commit/tag → `npm publish --tag alpha`（npm 新包首次发布会进入 staged 审核，通常几分钟内变为可安装）→ `npm pack` + `gh release create vX.Y.Z --prerelease --notes-file CHANGELOG.md <tarball>`。

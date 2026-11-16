@@ -11,11 +11,13 @@ node_modules/
 # 404 (GitHub uses 404 rather than 403 for an insufficient-scope write).
 #
 # BOTH the gh CLI token and the Git Credential Manager credential lack the scope,
-# so this cannot be fixed from inside a session. To enable CI:
-#   1. gh auth refresh -s workflow          (interactive; or issue a fine-grained
-#                                            PAT with Workflows permission)
-#   2. delete the `.github/workflows/` line below
-#   3. git add -f .github/workflows/verify.yml && git push
+# so this cannot be fixed from inside a session: the OAuth device flow requires a
+# human to approve the scope. To enable CI:
+#   1. gh auth refresh -h github.com -s workflow   (approve the one-time code at
+#                                                   https://github.com/login/device)
+#      — or issue a fine-grained PAT with Workflows permission
+#   2. delete this `.github/workflows/` line
+#   3. git add -f .github/workflows/verify.yml && git commit && git push
 # Until then there is NO CI: `.github/workflows/verify.yml` is a local-only file
 # and the authoritative check is `npm run verify`.
 .github/workflows/

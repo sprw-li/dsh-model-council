@@ -5,11 +5,12 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
 import { symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 /* index.js imports @deepseek-ai/schemastery for the `council` entry Config, so this
    harness needs it resolvable from this package (gitignored node_modules/), e.g.
    `npm install --no-save --no-package-lock @deepseek-ai/schemastery` — the DSH
@@ -799,6 +800,61 @@ try {
     } finally {
       if (previousHome === undefined) delete process.env.DSH_HOME
       else process.env.DSH_HOME = previousHome
+    }
+  }
+
+  /* Portability guard. The harnesses must run unchanged on the CI runner
+     (ubuntu-latest). `dev/tune-sampler.mjs` used to hardcode
+     `<repo-root>`, so the sampler looked at a path that does
+     not exist on Linux and the coverage gate failed for the wrong reason.
+     A repo root must be derived from the module URL, never typed as a literal. */
+  {
+    const devDir = fileURLToPath(new URL('.', import.meta.url))
+    const harnesses = (await readdir(devDir)).filter((name) => name.endsWith('.mjs'))
+    assert.ok(harnesses.length >= 4, `expected at least four harnesses, got ${harnesses.join(', ')}`)
+    for (const name of harnesses) {
+      const text = readFileSync(new URL(name, `file://${devDir.replace(/\\/g, '/')}/`), 'utf8')
+      for (const match of text.matchAll(/^\s*const\s+ROOT\s*=\s*['"]([^'"]+)['"]/gm)) {
+        const literal = match[1]
+        assert.equal(/^[A-Za-z]:[\\/]/.test(literal), false,
+          `${name} hardcodes a Windows repo root (${literal}) — derive it from import.meta.url so CI works`)
+        assert.equal(literal.startsWith('/'), false,
+          `${name} hardcodes an absolute repo root (${literal}) — derive it from import.meta.url`)
+      }
+    }
+    /* The sampler is the one that consumes such a root; prove it resolves. */
+    const sampler = readFileSync(new URL('tune-sampler.mjs', `file://${devDir.replace(/\\/g, '/')}/`), 'utf8')
+    assert.equal(/const ROOT = .*import\.meta\.url/.test(sampler), true,
+      'tune-sampler must derive ROOT from import.meta.url')
+  }
+
+  /* The CI workflow itself. It is gitignored (the token lacks `workflow` scope,
+     so it never reached the remote), which is exactly why a broken workflow
+     survived unnoticed: nothing ever parsed it. Found on inspection —
+     `- name: Runtime harness (real callModel: retry, ...)` contains an unquoted
+     `": "` inside a plain scalar, which YAML reads as a nested mapping. GitHub
+     would have rejected the whole workflow on the first push. */
+  {
+    const workflow = new URL('../.github/workflows/verify.yml', import.meta.url)
+    if (existsSync(fileURLToPath(workflow))) {
+      const text = readFileSync(workflow, 'utf8')
+      for (const [index, line] of text.split(/\r?\n/).entries()) {
+        const match = /^\s*-\s*name:\s*(.+?)\s*$/.exec(line)
+        if (match === null) continue
+        /* A plain (unquoted) scalar must not contain ": " — that is the trap. */
+        if (!/^['"]/.test(match[1])) {
+          assert.equal(match[1].includes(': '), false,
+            `workflow line ${index + 1} has an unquoted ": " inside a step name (${match[1]}) — YAML reads it as a mapping`)
+        }
+      }
+      /* Every gate the project promises must actually be wired. */
+      for (const script of ['verify-client.mjs', 'verify-host.mjs', 'verify-runtime.mjs', 'tune-sampler.mjs']) {
+        assert.ok(text.includes(`node dev/${script}`),
+          `the CI workflow must run dev/${script}`)
+      }
+      assert.ok(text.includes('npm install'),
+        'the CI workflow must install the peer dependency before the plain-node harnesses')
+      assert.ok(/runs-on:\s*ubuntu-latest/.test(text), 'the CI workflow must pin a runner')
     }
   }
 
