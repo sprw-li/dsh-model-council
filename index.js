@@ -84,6 +84,37 @@ const TEXT_EXTENSIONS = new Set([
 /** Extension-less files worth reading as text. */
 const TEXT_FILENAMES = /^(Makefile|Dockerfile|LICENSE|NOTICE|Procfile|Gemfile|Rakefile|Justfile)$/
 const SECRET_NAME = /(^|[\\/])(\.env[^\\/]*|id_(rsa|ed25519|ecdsa)[^\\/]*|credentials[^\\/]*|\.npmrc|\.pypirc|\.netrc|\.git-credentials|[^\\/]*\.(pem|key|pfx|p12|kdbx)|secrets?[^\\/]*|passwords?[^\\/]*|\.ssh|\.aws|\.kube)$/i
+const SECRET_CONTENT = [
+  ['openai-key', /\bsk-[A-Za-z0-9_-]{20,}/],
+  ['github-token', /\bgh[pousr]_[A-Za-z0-9]{20,}/],
+  ['github-pat', /\bgithub_pat_[A-Za-z0-9_]{20,}/],
+  ['aws-key-id', /\bAKIA[0-9A-Z]{16}\b/],
+  ['slack-token', /\bxox[baprs]-[A-Za-z0-9-]{10,}/],
+  ['google-api-key', /\bAIza[0-9A-Za-z_-]{30,}/],
+  ['private-key', /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
+  ['assigned-secret', /\b(?:api[_-]?key|secret|passwd|password|access[_-]?token|auth[_-]?token|token)\s*[:=]\s*["']([A-Za-z0-9_\-+/]{24,})["']/i],
+]
+
+/**
+ * Redact content-level secrets before the text leaves for a provider.
+ *
+ * Redaction rather than refusal: dropping the whole file would break legitimate
+ * reviews that merely *document* a key format, while a refused file is also
+ * invisible to the reviewer. The caller records which patterns fired so the
+ * attachment header can say so out loud.
+ */
+function redactSecrets(text) {
+  if (typeof text !== 'string' || text === '') return { text, hits: [] }
+  let out = text
+  const hits = []
+  for (const [name, pattern] of SECRET_CONTENT) {
+    const global = new RegExp(pattern.source, pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`)
+    if (!global.test(out)) continue
+    hits.push(name)
+    out = out.replace(global, (match) => `[已脱敏:${name}]`)
+  }
+  return { text: out, hits }
+}
 /** A question that means the session workspace even without an explicit path. */
 const WORKSPACE_INTENT = /(工作区|项目|仓库|代码库|目录|本仓库|本项目|workspace|repository|repo\b|project|codebase)/i
 /** A question that asks for a review, so the source pack is worth attaching. */
@@ -205,7 +236,19 @@ export const Config = z.object({
   filesMaxChars: z.number().default(ATTACH_MAX_CHARS).description('路径附件预算（字符）'),
   codeMaxChars: z.number().default(CODE_MAX_CHARS).description('源码包预算（字符）'),
   skillDirs: z.array(z.string()).default([]).description('席位额外只读 skill 根目录'),
-  attachRoots: z.array(z.string()).default([]).description('附件允许的根目录（空 = 本地路径不受限）'),
+  attachRoots: z.array(z.string()).default([]).volatile()
+    .description('附件允许的根目录；工作区与调用方目录总是允许，其他位置必须列在这里'),
+  /**
+   * Escape hatch for the pre-0.2.28 behaviour.
+   *
+   * Until then an empty `attachRoots` meant "any absolute path typed into the
+   * question is readable", which shipped files outside the workspace (and, for
+   * an agent-authored question, to a provider) with no explicit grant. The
+   * default is now the workspace + caller directory; set this true to restore
+   * the old unrestricted behaviour when reviewing across directories.
+   */
+  allowExternalPaths: z.boolean().default(false).volatile()
+    .description('允许问题里写出的任意本机路径进入附件（默认 false，仅工作区/调用方目录）'),
 })
 
 /** Auto-pick heterogeneous routes from a catalog: one provider and one model name each. */
@@ -893,6 +936,7 @@ async function collectCodeContext(roots, maxChars, hints = []) {
   let used = 0
   let included = 0
   let truncated = 0
+  const redactions = []
   /* Every selected file gets a reserved slice, so an early big file cannot
      starve the rest into empty "--- path ---" stubs. The file with the most
      hint hits is the review's subject: it gets the lion's share, because its
@@ -906,8 +950,10 @@ async function collectCodeContext(roots, maxChars, hints = []) {
     const segmented = await readCodeSegments(file.path, budget, hints)
     if (segmented === '' || segmented === undefined) continue
     if (segmented.truncated === true) truncated += 1
-    parts.push(`--- ${file.path} ---`, segmented.text)
-    used += segmented.text.length
+    const guarded = redactSecrets(segmented.text)
+    if (guarded.hits.length > 0) redactions.push({ path: file.path, patterns: guarded.hits })
+    parts.push(`--- ${file.path} ---`, guarded.text)
+    used += guarded.text.length
     included += 1
   }
   return {
@@ -916,21 +962,67 @@ async function collectCodeContext(roots, maxChars, hints = []) {
     files: included,
     discovered,
     truncated,
+    redactions,
     state: included === 0 ? 'none' : 'ok',
   }
 }
 
+/**
+ * Does a path-like token read as a deliberate request rather than prose noise?
+ *
+ * `candidatePaths` scans free text, so `无 /cancel` and version strings become
+ * candidates. Suppressing the workspace fallback for those produced zero
+ * attachments (the v0.2.19 defect). A real request carries a drive letter, a
+ * separator beyond the leading slash, or a file extension; a bare `/word` does
+ * not.
+ */
+function looksLikeDeliberatePath(token) {
+  if (typeof token !== 'string' || token === '') return false
+  if (/^[A-Za-z]:[\\/]/.test(token)) return true          // C:\dir or C:/dir
+  if (/^\\\\|^\/\//.test(token)) return true              // UNC or protocol-relative
+  const rest = token.startsWith('/') || token.startsWith('\\') ? token.slice(1) : token
+  if (rest.includes('/') || rest.includes('\\')) return true
+  return /\.[A-Za-z0-9]{1,8}$/.test(rest)                 // has an extension
+}
+
 /** Directory tree plus key-file text for every path the question mentions, or the session workspace. */
-async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars, allowCode = true, attachRoots = [], callerCwd) {
+async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars, allowCode = true, attachRoots = [], callerCwd, allowExternalPaths = false) {
   const hints = questionHints(question)
   const allowedRoots = [workspaceCwd, callerCwd, ...attachRoots].filter((root) => typeof root === 'string' && root !== '')
-  /** With no configured allowlist, an explicitly typed path stays readable (local use). */
-  const permitted = (candidate) => attachRoots.length === 0
+  /*
+   * Fail closed. This used to read `attachRoots.length === 0 || ...`, so with no
+   * configured allowlist ANY absolute path typed into the question was read and
+   * shipped to the provider — measured: a canary file outside the workspace came
+   * back in the attachment. The workspace root and the caller's own directory
+   * are the default grant; anywhere else must be named in `attachRoots`, unless
+   * the operator opts back in with `allowExternalPaths`.
+   */
+  const permitted = (candidate) => allowExternalPaths === true
     || allowedRoots.some((root) => candidate === root || isPathInside(candidate, root))
   const candidates = candidatePaths(question, workspaceCwd).filter(permitted)
-  /* Did the question name a path that the allowlist refused? Then it must NOT
-     silently fall back to the workspace — the caller asked for somewhere else. */
-  const namedButRefused = candidatePaths(question, workspaceCwd).some((candidate) => !permitted(candidate))
+  /*
+   * Did the question name somewhere else that the allowlist refused? Then it must
+   * NOT silently attach the workspace instead — the caller asked for a specific
+   * place.
+   *
+   * Only *deliberately shaped* paths count. Prose is full of path-like tokens
+   * that are not requests: `无 /cancel` and `v0.2.18` produce candidates such as
+   * `/cancel` → `C:\cancel`. Treating those as "refused, so suppress the
+   * fallback" reintroduced the v0.2.19 defect through the new fail-closed door —
+   * a review of `client.js` that mentioned `/cancel` received zero source.
+   *
+   * Shape separates the two: `D:\dev/elsewhere` (drive letter, or a separator
+   * beyond the leading one, or an extension) is a request; a bare `/token` is
+   * prose noise. Measured on both real questions that hit this.
+   */
+  let namedButRefused = false
+  for (const candidate of candidatePaths(question, workspaceCwd)) {
+    if (permitted(candidate)) continue
+    if (looksLikeDeliberatePath(candidate)) {
+      namedButRefused = true
+      break
+    }
+  }
   /* A NAMED project directory beats the caller's own directory: when the caller
      sits at the workspace root and the question says "dsh-council", attaching
      the root buried the plugin under unrelated sibling projects. */
@@ -964,6 +1056,7 @@ async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars
   const sections = []
   const valid = []
   const dirs = []
+  const redactions = []
   let used = 0
   /* Raw path-like tokens that do not exist (a version string such as
      `v0.2.18` looks like one) used to suppress both fallbacks above, leaving
@@ -1006,16 +1099,20 @@ async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars
         if (content.includes('…（已截断）')) {
           content = await readTextFileHeadTail(file, budget)
         }
-        parts.push(`--- ${file} ---`, content)
-        used += content.length
+        const guarded = redactSecrets(content)
+        if (guarded.hits.length > 0) redactions.push({ path: file, patterns: guarded.hits })
+        parts.push(`--- ${file} ---`, guarded.text)
+        used += guarded.text.length
       }
       sections.push(parts.join('\n'))
     } else if (info.isFile()) {
       const budget = Math.min(MAX_FILE_CHARS, maxChars - used)
       const content = await readTextFile(candidate, budget)
       if (content === '') continue
-      sections.push(`【工作区附件：${candidate}】\n${content}`)
-      used += content.length
+      const guarded = redactSecrets(content)
+      if (guarded.hits.length > 0) redactions.push({ path: candidate, patterns: guarded.hits })
+      sections.push(`【工作区附件：${candidate}】\n${guarded.text}`)
+      used += guarded.text.length
     }
     if (used >= maxChars) break
   }
@@ -1033,11 +1130,18 @@ async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars
     codeFiles = code.files
     codeDiscovered = code.discovered === undefined ? 0 : code.discovered
     codeTruncated = code.truncated === undefined ? 0 : code.truncated
+    if (Array.isArray(code.redactions)) redactions.push(...code.redactions)
     if (code.text !== '') sections.push(code.text)
   }
   const text = sections.join('\n\n')
+  /* Say out loud what was masked: a silent redaction would let a reviewer read a
+     truncated contract as complete, and the operator would never learn that a
+     key was about to leave the machine. */
+  const redactionNote = redactions.length === 0 ? '' : `\n\n（出站前已脱敏 ${redactions.length} 个文件中的疑似密钥：${
+    redactions.map((entry) => `${entry.path}[${entry.patterns.join(',')}]`).join('; ')
+  }。这些位置对本次评审不可见，请勿据此判断文件完整性。）`
   return {
-    text: text === '' ? '' : `${text}\n\n（以上为本地文件内容，供评审参考；不要声称可以访问文件系统。评审类结论必须引用具体文件路径，附件未覆盖的内容须标注【推断】。）`,
+    text: text === '' ? '' : `${text}${redactionNote}\n\n（以上为本地文件内容，供评审参考；不要声称可以访问文件系统。评审类结论必须引用具体文件路径，附件未覆盖的内容须标注【推断】。）`,
     state: valid.length === 0 ? 'none' : 'ok',
     paths: valid,
     chars: text.length,
@@ -1046,6 +1150,7 @@ async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars
     codeFiles,
     codeDiscovered,
     codeTruncated,
+    redactions,
   }
 }
 
@@ -1074,13 +1179,16 @@ export function apply(ctx, config) {
     ? config.skillDirs.filter((dir) => typeof dir === 'string' && dir !== '')
     : []
   /**
-   * Optional allowlist for path attachments. Empty (default) keeps the local
-   * single-user behavior: a path the user typed into the question is read.
-   * Non-empty confines every attachment to these roots plus the session
-   * workspace, so a shared deployment cannot be talked into reading elsewhere.
+   * Optional extra roots for path attachments. The session workspace and the
+   * caller's own directory are always allowed; this list adds more. Anything
+   * else is refused unless `allowExternalPaths` restores the old behaviour.
+   *
+   * Read through `readSetting`: the field is `.volatile()`, so `config.attachRoots`
+   * is a live `{ get() }` source, not the array itself.
    */
-  const attachRoots = config !== null && typeof config === 'object' && Array.isArray(config.attachRoots)
-    ? config.attachRoots.filter((dir) => typeof dir === 'string' && dir !== '')
+  const rawAttachRoots = readSetting(config !== null && typeof config === 'object' ? config.attachRoots : undefined, [])
+  const attachRoots = Array.isArray(rawAttachRoots)
+    ? rawAttachRoots.filter((dir) => typeof dir === 'string' && dir !== '')
     : []
   /**
    * The live entry config. `toolEnabled`/`panelEnabled`/`defaultModels`/
@@ -1090,6 +1198,8 @@ export function apply(ctx, config) {
    * `apply`.
    */
   const liveConfig = config !== null && typeof config === 'object' ? config : {}
+  /** Escape hatch: read `attachRoots` as the only grant and restore pre-0.2.28 behaviour. */
+  const externalPathsAllowed = () => readSetting(liveConfig.allowExternalPaths, false) === true
   const defaultAgentsHome = process.env.DSH_AGENTS_HOME || join(process.env.USERPROFILE || '', '.agents')
   const defaultSkillStore = process.env.AGLIB_STORE || 'D:\\agent-library'
   const autoSkillDirs = [join(defaultSkillStore, 'catalog')].filter((dir) => existsSync(dir))
@@ -1611,6 +1721,8 @@ export function apply(ctx, config) {
       filesState: run.filesState === undefined ? 'off' : run.filesState,
       filesPaths: run.filesPaths === undefined ? [] : run.filesPaths,
       filesChars: run.filesChars === undefined ? 0 : run.filesChars,
+      /* Outbound redaction record: which files had suspected secrets masked. */
+      filesRedactions: run.filesRedactions === undefined ? [] : run.filesRedactions,
       codeState: run.codeState === undefined ? 'off' : run.codeState,
       codeFiles: run.codeFiles === undefined ? 0 : run.codeFiles,
       codeChars: run.codeChars === undefined ? 0 : run.codeChars,
@@ -2147,9 +2259,11 @@ export function apply(ctx, config) {
       let codeChars = 0
       let codeDiscovered = 0
       let codeTruncated = 0
+      let filesRedactions = []
       if (input.attachFiles !== false) {
         const files = await collectPathContext(
           question, filesMaxChars, workspace.cwd, codeMaxChars, true, attachRoots, workspace.cwd,
+          externalPathsAllowed(),
         )
         filesState = files.state
         filesPaths = files.paths
@@ -2159,6 +2273,7 @@ export function apply(ctx, config) {
         codeChars = files.codeChars
         codeDiscovered = files.codeDiscovered === undefined ? 0 : files.codeDiscovered
         codeTruncated = files.codeTruncated === undefined ? 0 : files.codeTruncated
+        filesRedactions = Array.isArray(files.redactions) ? files.redactions : []
         if (files.text !== '') contextParts.push(files.text)
       }
       const routes = {}
@@ -2178,6 +2293,7 @@ export function apply(ctx, config) {
         filesState,
         filesPaths,
         filesChars,
+        filesRedactions,
         codeState,
         codeFiles,
         codeChars,
@@ -2316,7 +2432,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v58', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v59', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -2329,7 +2445,7 @@ export function apply(ctx, config) {
              human or the client can see which side is off. */
           sendJson(res, 200, {
             ok: true,
-            build: 'v58',
+            build: 'v59',
             toolEnabled: toolEnabled(liveConfig),
             panelEnabled: panelEnabled(liveConfig),
           })
@@ -2444,9 +2560,11 @@ export function apply(ctx, config) {
             || (typeof requestedSeats === 'number' && requestedSeats < selected.length)
           let codeDiscovered = 0
           let codeTruncated = 0
+          let filesRedactions = []
           if (body.attachFiles !== false) {
             const files = await collectPathContext(
               question, filesMaxChars, workspace.cwd, codeMaxChars, allowCode, attachRoots, workspace.cwd,
+              externalPathsAllowed(),
             )
             filesState = files.state
             filesPaths = files.paths
@@ -2456,6 +2574,7 @@ export function apply(ctx, config) {
             codeChars = files.codeChars
             codeDiscovered = files.codeDiscovered === undefined ? 0 : files.codeDiscovered
             codeTruncated = files.codeTruncated === undefined ? 0 : files.codeTruncated
+            filesRedactions = Array.isArray(files.redactions) ? files.redactions : []
             if (files.text !== '') contextParts.push(files.text)
           }
           const structure = {
@@ -2486,6 +2605,7 @@ export function apply(ctx, config) {
             filesState,
             filesPaths,
             filesChars,
+            filesRedactions,
             codeState,
             codeFiles,
             codeChars,
@@ -2703,6 +2823,7 @@ export {
   collectPathContext,
   collectSourceFiles,
   isPathInside,
+  looksLikeDeliberatePath,
   readTextFile,
   runLimited,
   withTimeout,

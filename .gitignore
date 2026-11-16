@@ -2,7 +2,20 @@ node_modules/
 *.tgz
 .DS_Store
 
-# GitHub rejects workflow files from OAuth tokens without the "workflow" scope.
-# Remove the next line (and `git add .github/workflows/verify.yml`) after
-# `gh auth refresh -s workflow`.
+# GitHub refuses workflow files from an OAuth App token without the "workflow"
+# scope. Measured 2026-11-16: `git push` of `.github/workflows/verify.yml` is
+# rejected with
+#   "refusing to allow an OAuth App to create or update workflow ... without
+#    `workflow` scope"
+# and the REST path is refused too — POST /git/trees carrying that path returns
+# 404 (GitHub uses 404 rather than 403 for an insufficient-scope write).
+#
+# BOTH the gh CLI token and the Git Credential Manager credential lack the scope,
+# so this cannot be fixed from inside a session. To enable CI:
+#   1. gh auth refresh -s workflow          (interactive; or issue a fine-grained
+#                                            PAT with Workflows permission)
+#   2. delete the `.github/workflows/` line below
+#   3. git add -f .github/workflows/verify.yml && git push
+# Until then there is NO CI: `.github/workflows/verify.yml` is a local-only file
+# and the authoritative check is `npm run verify`.
 .github/workflows/

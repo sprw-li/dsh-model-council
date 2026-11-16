@@ -14,7 +14,7 @@ import { readFileSync } from 'node:fs'
    `npm install --no-save --no-package-lock @deepseek-ai/schemastery` — the DSH
    installation also routes a linked plugin's declared peerDependencies, but a plain
    `node dev/verify-host.mjs` has no such router. */
-import { TRANSIENT_FAILURE, SEAT_RESULT_TIMEOUT_MS, SEAT_START_TIMEOUT_MS, PROVIDER_CONCURRENCY, MAX_FALLBACKS_PER_RUN, RUN_TIMEOUT_MS, CODE_FILE_CHARS, CODE_MAX_CHARS, CODE_WALK_ENTRIES, defaultRoutesFromCatalog, candidatePaths, collectCodeContext, collectPathContext, isPathInside, readTextFile, runLimited, withTimeout, apply, Config, toolEnabled, panelEnabled, parseRouteSpec, resolveConfiguredRoutes, selectCouncilRoutes, pickChairmanRoute, readSetting } from '../index.js'
+import { TRANSIENT_FAILURE, SEAT_RESULT_TIMEOUT_MS, SEAT_START_TIMEOUT_MS, PROVIDER_CONCURRENCY, MAX_FALLBACKS_PER_RUN, RUN_TIMEOUT_MS, CODE_FILE_CHARS, CODE_MAX_CHARS, CODE_WALK_ENTRIES, looksLikeDeliberatePath, defaultRoutesFromCatalog, candidatePaths, collectCodeContext, collectPathContext, isPathInside, readTextFile, runLimited, withTimeout, apply, Config, toolEnabled, panelEnabled, parseRouteSpec, resolveConfiguredRoutes, selectCouncilRoutes, pickChairmanRoute, readSetting } from '../index.js'
 
 const root = await mkdtemp(join(tmpdir(), 'council-host-'))
 try {
@@ -197,6 +197,78 @@ try {
   assert.equal(confined.paths.length, 0, `allowlist must refuse outside paths: ${JSON.stringify(confined.paths)}`)
   const allowed = await collectPathContext('review the workspace', 2000, workspace, 0, false, [workspace])
   assert.equal(allowed.paths.length, 1, 'allowlist keeps the workspace itself')
+
+  /* Fail closed by default (2026-11-16). The old rule was
+     `attachRoots.length === 0 || ...`, so with no allowlist ANY absolute path
+     typed into the question was read and shipped to the provider. Measured with
+     a canary file outside the workspace: its content came back in the pack. */
+  {
+    const outsideDir = join(root, 'outside')
+    await mkdir(outsideDir, { recursive: true })
+    const canary = join(outsideDir, 'canary.txt')
+    const CANARY = 'OUTSIDE_CANARY_9f3a'
+    await writeFile(canary, `line1\n${CANARY}\nline3\n`, 'utf8')
+
+    /* Default: outside path refused, even though no allowlist is configured. */
+    const refused = await collectPathContext(
+      `评审这个文件 ${canary}`, 4000, workspace, 0, false, [], undefined, false,
+    )
+    assert.equal(refused.text.includes(CANARY), false,
+      'default must NOT read a path outside the workspace')
+    assert.equal(refused.paths.some((p) => p === canary), false,
+      'the outside file must not appear in attached paths')
+
+    /* Opt back in: the escape hatch restores the pre-0.2.28 behaviour. */
+    const restored = await collectPathContext(
+      `评审这个文件 ${canary}`, 4000, workspace, 0, false, [], undefined, true,
+    )
+    assert.equal(restored.text.includes(CANARY), true,
+      'allowExternalPaths=true must restore reading an explicit outside path')
+
+    /* Explicit grant: naming the directory in attachRoots is the intended path. */
+    const granted = await collectPathContext(
+      `评审这个文件 ${canary}`, 4000, workspace, 0, false, [outsideDir], workspace, false,
+    )
+    assert.equal(granted.text.includes(CANARY), true,
+      'an allowlisted outside directory must be readable')
+  }
+
+  /* Content-level secret scan. `SECRET_NAME` only catches self-announcing file
+     names, which misses a key pasted into a README — the exact case that ships
+     a credential to a third-party provider. */
+  {
+    const secretDir = join(root, 'secretish')
+    await mkdir(secretDir, { recursive: true })
+    const readme = join(secretDir, 'NOTES.md')
+    const KEY = 'sk-abcdefghijklmnopqrstuvwxyz0123456789'
+    await writeFile(readme, `# notes\n\nkey = "${KEY}"\n`, 'utf8')
+
+    const packed = await collectPathContext(
+      `评审 ${readme}`, 4000, workspace, 0, false, [secretDir], workspace, false,
+    )
+    assert.equal(packed.text.includes(KEY), false,
+      'a key pasted into an ordinary file must not reach the provider')
+    assert.equal(packed.text.includes('已脱敏'), true,
+      'the redaction must be visible in the pack, not silent')
+    assert.ok(Array.isArray(packed.redactions) && packed.redactions.length >= 1,
+      'the run must record which file was redacted')
+    assert.ok(packed.redactions.some((r) => r.patterns.includes('openai-key')),
+      `expected the openai-key pattern to fire, got ${JSON.stringify(packed.redactions)}`)
+  }
+
+  /* The path-shape rule that keeps prose from suppressing the workspace fallback
+     must itself be anchored: `/cancel` is noise, a drive path is a request. */
+  for (const [token, expected, why] of [
+    ['/cancel', false, 'a bare /token is prose noise, not a path request'],
+    ['/resume', false, 'same for /resume'],
+    ['D:\\dev/elsewhere', true, 'a drive-letter path is a deliberate request'],
+    ['C:/Users/x/notes.md', true, 'drive + separators is deliberate'],
+    ['/etc/passwd', true, 'a real multi-segment absolute path is deliberate'],
+    ['notes.md', true, 'a bare filename with an extension is deliberate'],
+  ]) {
+    const got = looksLikeDeliberatePath(token)
+    assert.equal(got, expected, `${token} -> ${why} (got ${got})`)
+  }
 
   /* Documentation must quote the constants it describes; drift is a test failure. */
   const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8')
@@ -584,7 +656,7 @@ try {
         question: 'panel probe',
         models: [{ provider: 'deepseek', model: 'pro' }, { provider: 'providerA', model: 'glm' }],
       }))
-      assert.equal(created.status, 200, 'POST /council/run must work while panelEnabled=true')
+      assert.equal(created.status, 200, `POST /council/run must work while panelEnabled=true; body=${JSON.stringify(created.json)} text=${String(created.text).slice(0, 300)}`)
       assert.equal(typeof created.json.runId, 'string', 'POST /council/run must return a runId')
       livePanel.panelEnabled[write](false)
       assert.equal((await http(hotPanel, 'GET', `/council/run/${created.json.runId}`)).status, 200,

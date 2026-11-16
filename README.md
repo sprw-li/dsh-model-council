@@ -2,7 +2,7 @@
 
 > 仓库：<https://github.com/sprw-li/dsh-model-council>
 >
-> **Status: alpha** — 接口与行为仍可能变化，正式版等外部反馈后再定。已发布到 npm 的只有 `0.1.0`；仓库源码为 `0.2.27`（见文末「版本与发布」）。
+> **Status: alpha** — 接口与行为仍可能变化，正式版等外部反馈后再定。已发布到 npm 的只有 `0.1.0`；仓库源码为 `0.2.28`（见文末「版本与发布」）。
 
 DeepSeek Harness 的多模型理事会插件：一个入口把问题交给多个模型并行作答、匿名互评，可选主席汇总，并可把结论回投主聊天。结果常驻右侧栏 tab。
 
@@ -160,6 +160,9 @@ council_review({
     defaultChairman: ''
     contextMaxChars: 6000
     filesMaxChars: 20000
+    # 附件许可：默认只允许会话工作区 + 调用方目录。
+    attachRoots: []              # 额外允许的根目录，例如 ["D:\\dev\\Project6"]
+    allowExternalPaths: false    # 逃生舱：true = 恢复"问题里任意本机路径可读"（0.2.27 前行为）
 ```
 
 > `@deepseek-ai/schemastery` 是 peerDependency（`^3.18.5`，`.volatile()` 从该版本起提供）。
@@ -176,6 +179,7 @@ council_review({
 ## 已验证（2026-11-11，本机 DSH 0.2.2-rc.1）
 
 - **路径附件**：问题写 `D/dev/Project6-skill-Opt_of_Cpndition`（原样 typo）跑通，`filesState=ok`、`filesChars=23614`，模型回答里出现只有读到文件才知道的 `condopt` 架构 / 18 算法 / 18 门禁细节。
+  > **2026-11-16 起需注意**：那是**工作区之外**的路径。默认已收紧为 fail-closed（只允许工作区与调用方目录），复现这条需要先把该目录加进 `attachRoots`，或临时置 `allowExternalPaths: true`。见下方「附件安全」。
 - **工作区识别**：问题不写路径、只说「总览当前工作区项目」，`GET /council/workspace` 从 `SessionHeader.cwd` 解析出 `workspaceId`，自动附带当前工作区（`filesChars=20182`），模型正确说出工作区里的真实内容；快照 `structure` 输出 `roles.answerers/reviewers/arbiter` 与 `stages=['answers','reviews']`。
 - **只读 subagent 席位**：`seatMode='subagent'` 实测 `status=done`，两个席位都真的用工具读了工作区的 `README.md`、`grep`、`glob` 后才作答（不是靠注入文本）。
 - **断线修复**：此前在 6 模型评审中因 max-tokens/超时失败的 `providerA/modelA`（modelA）与 `providerA/modelD`（modelD），现在纯模型模式各返回 239 / 238 字有效答案。
@@ -190,6 +194,11 @@ council_review({
 - **运行注册表持久化**：写入 `${DSH_HOME:-~/.dsh}/council-runs.json`（最多 20 条，500ms 防抖）；Host 重启后仍能查到历史运行，重启前仍在跑的被标注为「Host 重启，运行中断」。
 - **源码包（评审必读）**：问题含 `评审/审查/review/audit` 等意图时，除目录树与关键文档外，还会自动打包**真实源码**：单文件 ≤ `CODE_FILE_CHARS`（12000 字）、总预算 `codeMaxChars`（默认 120000 字，即 `CODE_MAX_CHARS`），遍历条目上限 `CODE_WALK_ENTRIES`（2000）；主文件拿 80% 预算，大文件按问题关键词锚定采样（完整函数体 → 命名符号窗口 → 关键词簇），路径全部标注；提示词要求结论必须引用具体文件、附件未覆盖的内容标注【推断】。快照新增 `codeState/codeFiles/codeChars` 与**覆盖率** `codeDiscovered/codeTruncated`（发现数 vs 附带数、截断数），UI 显示「已附带源码 N 个文件（X 字）」——**这是抽样初审，不是全项目审查**；附件头部自带覆盖率声明。
 - **附件安全**：`@mention` 只解析到工作区内（拒绝 `..` 穿越）；路径附件拒绝符号链接、密钥类文件（`.env`/`.pem`/`.key`/`.ssh`/`.aws`/`.kube`/`id_rsa` 等）、二进制与 >1MB 文件；skill 只读加载、脚本不执行。
+  - **fail-closed 路径许可（0.2.28）**：默认只允许**会话工作区**与**调用方目录**。问题里写出的其他绝对路径会被拒绝，除非列在 `attachRoots` 里，或置 `allowExternalPaths: true`（逃生舱，恢复 0.2.27 之前"任意本机路径可读"的行为）。
+    > 收紧前实测：默认配置下，问题里写一个工作区外的绝对路径，其内容**真的进入附件**（canary 命中）。原因是 `permitted` 写成 `attachRoots.length === 0 || ...` —— 空 allowlist 等于不做限制。对 agent 生成的问题，这是一条无需要用户有意的间接外发通道。
+  - **内容级密钥扫描（0.2.28）**：文件名规则（`SECRET_NAME`）只挡名字自曝的文件，挡不住粘在 README / notebook 里的密钥。出站前按 `sk-` / `ghp_` / `github_pat_` / `AKIA` / `xox[baprs]-` / `AIza` / `-----BEGIN … PRIVATE KEY` / `token=「长字面量」` 扫描并**脱敏**为 `[已脱敏:<模式>]`，附件头部与快照 `filesRedactions` 如实报出被脱敏的文件与模式。
+    > 选择脱敏而非拒读：整份丢弃会破坏"只是记录密钥格式"的合法评审，且被拒文件对评审者同样不可见。但脱敏**不静默** —— 评审者会知道哪一处不可见。
+  - **仍缺**：出站清单确认（发起前列出将附带的文件让人确认）、junction / reparse point 专项测试。
 - **自动化回归**：`npm run verify` 现在同时跑 host 与 client harness（路径修复/穿越拒绝/密钥跳过/超时语义/并发窗口）。
 
 ## 已知限制
@@ -209,7 +218,7 @@ council_review({
 
 ## 安装
 
-npm 上的发布版本为 **0.1.0**（dist-tags `latest` / `alpha`）；本仓库源码版本 **0.2.27**，尚未发布到 npm——发布 0.2.x 需要新的 granular token（旧的已吊销）。
+npm 上的发布版本为 **0.1.0**（dist-tags `latest` / `alpha`）；本仓库源码版本 **0.2.28**，尚未发布到 npm——发布 0.2.x 需要新的 granular token（旧的已吊销）。
 
 ```sh
 # 从 npm
@@ -233,9 +242,32 @@ npm run syntax    # node --check 两个入口
 
 > `@deepseek-ai/schemastery` 同时声明为 `peerDependencies`（运行期：DSH 给 linked 插件装的路由层
 > 要求祖先 package.json 声明它，否则回落 native 解析）与 `devDependencies`（普通 node 跑 harness）。
-> 干净检出必须先 `npm install`。CI 的安装步骤已写进 `.github/workflows/verify.yml`。
+> 干净检出必须先 `npm install`。
 
-CI：`.github/workflows/verify.yml`（文件已随目录保留；当前仓库 token 无 `workflow` scope 时 GitHub 会拒绝推送该文件，执行 `gh auth refresh -s workflow` 后 `git add .github/workflows/verify.yml && git push` 即可补上。本地等价的检查是 `npm run verify`）。
+### CI 状态：**当前没有 CI**
+
+`.github/workflows/verify.yml` 在本地是完整的（`npm install` + 四套 harness，全套约 17.5 s），
+但它**没有进入仓库**，GitHub Actions 一次都没跑过。`.gitignore` 忽略了 `.github/workflows/`。
+
+2026-11-16 实测两条推送路径都被拒：
+
+```
+git push        → refusing to allow an OAuth App to create or update workflow
+                  `.github/workflows/verify.yml` without `workflow` scope
+REST /git/trees → 404（GitHub 对 scope 不足的写入用 404 而不是 403）
+```
+
+`gh` 的 token 与 Git Credential Manager 的凭据**都缺 `workflow` scope**，所以在会话内无法修复。
+
+**启用步骤**（需要你操作，我不能替你扩权）：
+
+```powershell
+gh auth refresh -s workflow         # 交互式；或签发带 Workflows 权限的 fine-grained PAT
+# 然后删掉 .gitignore 里的 .github/workflows/ 那一行
+git add -f .github/workflows/verify.yml && git push
+```
+
+在那之前，**权威检查是本地 `npm run verify`**，不要以为 push 会触发门禁。
 
 ## 推送到 GitHub（本机沙箱的可用路径）
 
@@ -267,6 +299,6 @@ node <workspace>\tmp\push-council.mjs <本目录> sprw-li/dsh-model-council main
 ## 发布记录与后续
 
 - GitHub：<https://github.com/sprw-li/dsh-model-council>，release 有 `v0.1.0-alpha` 与 `v0.2.0`（pre-release）。
-- npm：<https://www.npmjs.com/package/dsh-model-council>（已发布 `0.1.0`；仓库源码 `0.2.27` **尚未发布**——`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
+- npm：<https://www.npmjs.com/package/dsh-model-council>（已发布 `0.1.0`；仓库源码 `0.2.28` **尚未发布**——`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
 
 发新版本：更新 `CHANGELOG.md` 与 `package.json` 版本 → `npm run verify` → commit/tag → `npm publish --tag alpha`（npm 新包首次发布会进入 staged 审核，通常几分钟内变为可安装）→ `npm pack` + `gh release create vX.Y.Z --prerelease --notes-file CHANGELOG.md <tarball>`。

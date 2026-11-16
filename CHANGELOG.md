@@ -1,3 +1,70 @@
+# 0.2.28
+
+外部审查报告（`dsh-council-review.md`）遗留的第 2、4 条。
+
+## 1. 附件默认 fail-closed（安全性行为变更）
+
+**这是破坏性变更。** `attachRoots` 为空时，原来"问题里写出的任意本机绝对路径都可读"，
+现在只允许**会话工作区**与**调用方目录**；其他位置必须列进 `attachRoots`，
+或用新逃生舱 `allowExternalPaths: true` 恢复旧行为。
+
+- 实测复现（修复前）：问题里写一个工作区外的绝对路径，canary 内容**真的进了附件**。
+  代码依据是 `permitted = attachRoots.length === 0 || ...` —— 空 allowlist 等于不做限制。
+  对 agent 生成的问题，这是一条无需用户有意的间接外发通道。
+- `attachRoots` 改为 `.volatile()`（设置/配置改动无需重启），读取改走 `readSetting`
+  —— 否则 `.volatile()` 之后 `config.attachRoots` 变成 `{ get() }` 引用而不再是数组，会被静默当成空。
+- 独立验证脚本：`_work/council-audit/probe_attach.mjs`（四项断言：默认挡住 / 只授权工作区也挡住 /
+  逃生舱可恢复 / 显式授权可用）。
+
+### 1.1 顺手修掉一个由它引出的回归
+
+收紧后，散文里的假路径会**抑制工作区兜底**：`无 /cancel` 被解析成候选 `C:\cancel`，
+落在允许范围外 → `namedButRefused = true` → 兜底被跳过 → 评审拿到**零源码**。
+这正是 v0.2.19 修过的缺陷从新门进来。
+
+修法是让"被拒绝"只统计**形状像刻意路径**的 token（新增 `looksLikeDeliberatePath`，
+已导出供测试）：有盘符 / 有前导斜杠之外的分隔符 / 有扩展名 → 是请求；裸 `/token` → 是噪声。
+实测两个真实问题（`pagehide 无 sendBeacon、无 /cancel`、`核验 … /resume 与 /cancel …`）
+恢复为正常附带源码包。
+
+> 判据一开始写成"路径必须真实存在"，结果和既有断言打架（`D/dev/elsewhere` 也不存在，
+> 但测试要求它抑制兜底）。实测 `candidatePaths` 对两个 token 的返回值才发现：区别在**形状**，不在存在性。
+
+## 2. 内容级密钥扫描
+
+文件名规则（`SECRET_NAME`）只挡名字自曝的文件，挡不住**粘在 README / notebook / 配置示例里的密钥**
+——而那正是会把凭据送到第三方 provider 的形态。新增 `SECRET_CONTENT` 覆盖
+`sk-` / `ghp_` / `github_pat_` / `AKIA` / `xox[baprs]-` / `AIza` / `-----BEGIN … PRIVATE KEY` /
+`token=「长字面量」`（要求敏感名 + ≥24 字符字面量，避免误伤散文与短常量）。
+
+- **脱敏而非拒读**：整份丢弃会破坏"只是记录密钥格式"的合法评审，且被拒文件对评审者同样不可见。
+- **但不静默**：附件头部追加"出站前已脱敏 N 个文件中的疑似密钥：path[pattern]…"，
+  并提示"这些位置对本次评审不可见，请勿据此判断文件完整性"；快照新增 `filesRedactions`。
+- 三处内容入口全部接入（关键文档、单文件附件、源码包）。
+
+## 3. CI：如实标记为"没有 CI"（未能启用）
+
+`.github/workflows/verify.yml` 本地完整（`npm install` + 四套 harness，约 17.5 s），
+但**没有进仓库**，Actions 一次都没跑过。2026-11-16 实测两条推送路径都被拒：
+
+```
+git push        → refusing to allow an OAuth App to create or update workflow
+                  `.github/workflows/verify.yml` without `workflow` scope
+REST /git/trees → 404（scope 不足时 GitHub 用 404 而非 403）
+```
+
+`gh` token 与 Git Credential Manager 凭据**都缺 `workflow` scope**，会话内无法修复。
+已把 `.gitignore`、README 的 CI 段落改成明说"当前没有 CI，权威检查是本地 `npm run verify`"，
+并写明启用步骤 —— 消除"看起来有门禁"的假象。
+
+## 4. 测试
+
+- `dev/verify-host.mjs` 新增：默认 fail-closed（canary 不得出现）、逃生舱恢复、
+  显式授权可用、密钥脱敏（内容不含明文 + 出现"已脱敏" + `redactions` 记录到 `openai-key`）、
+  `looksLikeDeliberatePath` 的 6 条形状判据。
+- 首次运行暴露了两个我引入的真缺陷并已修：`.volatile()` 后 `attachRoots` 不再被识别为数组；
+  HTTP 路径缺少 `filesRedactions` 声明（500）。
+
 # 0.2.27
 
 用户提的两件事：运行状态浮窗，以及把 `council_review` 放进设置里管理（含默认 models）。
