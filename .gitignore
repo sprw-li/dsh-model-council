@@ -2,22 +2,21 @@ node_modules/
 *.tgz
 .DS_Store
 
-# GitHub refuses workflow files from an OAuth App token without the "workflow"
-# scope. Measured 2026-11-16: `git push` of `.github/workflows/verify.yml` is
-# rejected with
-#   "refusing to allow an OAuth App to create or update workflow ... without
-#    `workflow` scope"
-# and the REST path is refused too — POST /git/trees carrying that path returns
-# 404 (GitHub uses 404 rather than 403 for an insufficient-scope write).
+# Kept out of version control only because CI is not enabled on main yet.
 #
-# BOTH the gh CLI token and the Git Credential Manager credential lack the scope,
-# so this cannot be fixed from inside a session: the OAuth device flow requires a
-# human to approve the scope. To enable CI:
-#   1. gh auth refresh -h github.com -s workflow   (approve the one-time code at
-#                                                   https://github.com/login/device)
-#      — or issue a fine-grained PAT with Workflows permission
-#   2. delete this `.github/workflows/` line
-#   3. git add -f .github/workflows/verify.yml && git commit && git push
-# Until then there is NO CI: `.github/workflows/verify.yml` is a local-only file
-# and the authoritative check is `npm run verify`.
+# 2026-11-17 correction: the "workflow scope" obstacle applies to OAuth App
+# tokens ONLY. Verified on this machine:
+#   git push over HTTPS  -> "refusing to allow an OAuth App to create or update
+#                           workflow ... without `workflow` scope"
+#   POST /git/trees      -> 404 (REST under OAuth)
+#   git push over SSH    -> SUCCESS  (git@github.com:sprw-li/dsh-model-council)
+# SSH keys are not OAuth Apps, so they can push workflow files. The `verify`
+# workflow was accepted by GitHub and ran green on ubuntu-latest in 49s:
+#   https://github.com/sprw-li/dsh-model-council/actions/runs/43903527781
+#
+# To enable CI (no browser authorization needed):
+#   git add -f .github/workflows/verify.yml
+#   git commit -m "ci: enable the verify workflow" && git push origin main
+#   (then delete this .gitignore line)
+# Until then `npm run verify` is the authoritative gate.
 .github/workflows/

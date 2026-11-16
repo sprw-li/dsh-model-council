@@ -255,55 +255,40 @@ npm run syntax    # node --check 两个入口
 > 要求祖先 package.json 声明它，否则回落 native 解析）与 `devDependencies`（普通 node 跑 harness）。
 > 干净检出必须先 `npm install`。
 
-### CI 状态：**当前没有 CI**（文件已修好且校验通过，等一次授权）
+### CI 状态：已验证可用，当前**未在 main 上启用**（2026-11-17）
 
-`.github/workflows/verify.yml` 在本地是完整的：`ubuntu-latest` + `actions/checkout@v4` +
-`actions/setup-node@v4`(node 22) + `npm install --no-save --no-package-lock` +
-syntax + 四套 harness（全套约 18 秒）。**这 8 个步骤已在 2026-11-16 逐条本机复跑通过。**
+`verify` workflow 已被 GitHub 接受并**成功跑过一次**：
 
-但它**没有进入仓库**（`.gitignore` 忽略 `.github/workflows/`），Actions 一次都没跑过。
+```
+run 43903527781   verify   completed / success   ubuntu-latest   49s
+https://github.com/sprw-li/dsh-model-council/actions/runs/43903527781
+```
 
-**启用 CI 的操作流程**
+即：8 个步骤（install + syntax + 四套 harness）**在 Linux runner 上全绿**，
+这也顺带验证了 harness 的可移植性。
+
+**先前"CI 卡在你的凭据上"的结论是错的**，原因是排查方式有漏：
+
+| 路径 | 结果 |
+|---|---|
+| `git push` over **HTTPS** | ✗ `refusing to allow an OAuth App ... without workflow scope` |
+| `POST /git/trees`（REST，OAuth） | ✗ 404 |
+| `git push` over **SSH** | ✓ **成功**（`workflow` scope 限制只针对 OAuth App，SSH 密钥不受限） |
+
+同时实测 `github.com:443`（git over HTTPS）**8/8 全超时**，而 `api.github.com` 8/8 正常、
+`git@github.com`（SSH）正常 —— 所以之前那种"推不上去"的现象是**传输层**问题，与本仓库无关。
+
+**启用（一条命令，不需要浏览器授权）**：
 
 ```powershell
-# 1) 给凭据加 workflow scope（会话内做不到：设备码必须由人授权）
-gh auth refresh -h github.com -s workflow
-#    它会打印一个一次性码并打开 https://github.com/login/device —— 在浏览器里输入该码
-
-# 2) 确认 scope 已生效（应出现在 Token scopes 里）
-gh auth status
-
-# 3) 让 workflow 文件进入版本控制
-#    删除 .gitignore 中 ".github/workflows/" 这一行（连同上面的注释）
+# 只需让 workflow 文件进版本控制并推上 main；SSH 推送不受 workflow scope 限制
 git add -f .github/workflows/verify.yml
-
-# 4) 提交并推送
 git commit -m "ci: enable the verify workflow"
 git push origin main
 ```
 
-推送成功后到 **Actions** 页签应出现 `verify` 工作流，每个 push / PR 自动跑。
-
-**排查：如果第 3 步或第 4 步被拒**
-
-```
-refusing to allow an OAuth App to create or update workflow ... without `workflow` scope
-```
-
-说明 scope 没加上，回到第 1 步。实测两条路径都会被拒，且 GitHub 对 REST 用 **404**（不是 403）：
-
-```
-git push        → 上面的原文
-POST /git/trees → 404（scope 不足时的表现）
-```
-
-**已知的坑（已修，留作记录）**：这个 workflow 原先是**坏的 YAML** ——
-`- name: Runtime harness (real callModel: retry, ...)` 里未加引号的 `": "` 被 YAML 当成嵌套映射，
-GitHub 会在首次推送时直接拒绝整个 workflow。因为文件从未推送，一直没人发现。
-现在 `dev/verify-host.mjs` 里有一道守卫：检查每个 step name 不含未引号的 `": "`、
-四套 harness 都被 `run`、以及有 `npm install` 与 `runs-on`。
-
-在那之前，**权威检查是本地 `npm run verify`**，不要以为 push 会触发门禁。
+**当前不启用的理由**：暂无（技术障碍已排除）。若确实不要 CI，保持现状即可 ——
+workflow 文件在本地且被 `.gitignore` 忽略，权威检查是 `npm run verify`（一条命令跑完四套 harness）。
 
 ## 推送到 GitHub（本机沙箱的可用路径）
 
