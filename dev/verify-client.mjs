@@ -15,6 +15,19 @@ import vm from 'node:vm'
 const here = dirname(fileURLToPath(import.meta.url))
 const source = readFileSync(join(here, '..', 'client.js'), 'utf8')
 
+/* Discovery delay, read from the source so the harness cannot drift from it. */
+const DISCOVERY_MS = Number((/const RUN_DISCOVERY_MS = (\d+)/.exec(source) || [])[1])
+if (!Number.isSafeInteger(DISCOVERY_MS) || DISCOVERY_MS <= 0) {
+  throw new Error('RUN_DISCOVERY_MS not found in client.js')
+}
+/* Every discovery-delay timer armed through window.setTimeout, plus its id so
+   the harness can stop the (deliberately endless) re-arm chain at the end. */
+let discoveryArms = 0
+const discoveryTimerIds = []
+/* GET /council/runs rows and the GET /council/run/run-live snapshot. */
+let discoveryRows = null
+let liveRunState = 'running'
+
 const PACKAGE_NAME = 'dsh-model-council'
 const TAB_ID = 'dsh-model-council/panel'
 const LS_KEY = '@local/council:v1'
@@ -125,6 +138,20 @@ const SCENARIOS = [
   },
 ]
 
+/* A run that stays live: GET /council/runs offers it, so adopting it fills the
+   shared store with `running:true` and the toolview's live section has data. */
+const LIVE_RUN = {
+  id: 'run-live', status: 'running', stage: 'reviews', question: '实时进度问题',
+  error: '', contextChars: 0, contextState: 'ok', useChairman: true,
+  answers: [
+    { key: 'p1|m1', provider: 'p1', model: 'p1/m1', name: 'Model One', text: '', done: true, error: '', seat: { phase: 'done', elapsedMs: 900 } },
+    { key: 'p1|m2', provider: 'p1', model: 'p1/m2', name: 'Model Two', text: '', done: false, error: '', seat: { phase: 'running', elapsedMs: 1400 } },
+  ],
+  reviews: [],
+  chairman: { key: 'p1|m1', provider: 'p1', model: 'm1', name: 'Model One', text: '', done: false, error: '' },
+}
+const LIVE_RUN_DONE = Object.assign({}, LIVE_RUN, { status: 'done', stage: 'done' })
+
 let postCount = 0
 
 const fakeWindow = {
@@ -163,6 +190,12 @@ const fakeWindow = {
       }
       return { ok: true, json: async () => (Object.assign({}, PREVIEW_RESPONSE)) }
     }
+    if (String(url).indexOf('/council/runs') === 0) {
+      return { ok: true, json: async () => ({ runs: discoveryRows === null ? [] : discoveryRows }) }
+    }
+    if (/\/council\/run\/run-live$/.test(String(url))) {
+      return { ok: true, json: async () => (liveRunState === 'done' ? LIVE_RUN_DONE : LIVE_RUN) }
+    }
     if (url === '/council/run') {
       postCount += 1
       const runId = `run-${postCount}`
@@ -195,8 +228,18 @@ const fakeWindow = {
     }
     return { ok: true, json: async () => ({ ok: true }) }
   },
-  setTimeout,
+  setTimeout: (fn, ms, ...rest) => {
+    const id = setTimeout(fn, ms, ...rest)
+    if (ms === DISCOVERY_MS) {
+      discoveryArms += 1
+      discoveryTimerIds.push(id)
+    }
+    return id
+  },
   clearTimeout,
+  /* The leader election needs both; the discovery case below drives it. */
+  setInterval,
+  clearInterval,
   addEventListener: addWindowListener,
   removeEventListener: removeWindowListener,
   navigator: { clipboard: { writeText: async () => {} } },
@@ -566,14 +609,208 @@ if (resumeCalls.length !== resumeBeforeOverlay) {
 if (fetchCalls.filter((call) => /\/cancel$/.test(call.url)).length !== cancelBeforeOverlay) {
   throw new Error('rendering the overlay must not cancel the run')
 }
-/* Discovery must stay a leader duty, exactly like the poll schedulers. */
-for (const name of ['scheduleRunDiscovery']) {
-  const at = source.indexOf('function ' + name + '(')
-  if (at === -1) throw new Error(name + ' not found')
-  const head = source.slice(at, at + 400)
-  if (!/isPollLeader\(\) !== true/.test(head)) {
-    throw new Error(name + ' must refuse to arm for a non-leader')
+/* ---- Conversation card: `tool.call.toolview`, keyed by the wire name ---- */
+const toolviewRegs = registrations.filter((entry) => entry.options !== undefined && entry.options.name === 'tool.call.toolview')
+if (toolviewRegs.length !== 1) {
+  throw new Error(`expected exactly one tool.call.toolview registration, got ${toolviewRegs.length}`)
+}
+const toolviewReg = toolviewRegs[0]
+/* The keyed slot dispatches on the exact wire tool name; a typo never renders. */
+if (toolviewReg.options.key !== 'council_review') {
+  throw new Error(`tool.call.toolview must be keyed exactly "council_review", got ${JSON.stringify(toolviewReg.options.key)}`)
+}
+if (toolviewReg.options.locale !== 'council') {
+  throw new Error(`tool.call.toolview must declare its locale namespace, got ${JSON.stringify(toolviewReg.options.locale)}`)
+}
+if (typeof toolviewReg.component !== 'function') throw new Error('tool.call.toolview has no component')
+const toolview = toolviewReg.component
+
+/* preparing: incomplete arguments are never dumped as raw JSON. */
+const preparingHtml = render(React.createElement(toolview, {
+  t, phase: 'preparing', block: { args: {}, argsRaw: '' },
+}))
+if (!preparingHtml.includes('正在准备理事会评审')) {
+  throw new Error(`preparing row is missing its copy: ${preparingHtml.slice(0, 300)}`)
+}
+if (preparingHtml.includes('{')) throw new Error('preparing row must not dump raw JSON arguments')
+
+/* start: question, participants, chairman and outbound-attachment hint. */
+const startArgs = {
+  question: '重构认证模块',
+  models: [{ provider: 'p1', model: 'm1' }, 'p2/m2'],
+  chairman: true,
+  attachFiles: true,
+}
+const startHtml = render(React.createElement(toolview, {
+  t, phase: 'start', block: { args: startArgs, argsRaw: JSON.stringify(startArgs) },
+}))
+for (const expected of ['重构认证模块', 'p1/m1', 'p2/m2', '参与模型（2 个）', '主席汇总：开', '将附带工作区文件']) {
+  if (!startHtml.includes(expected)) {
+    throw new Error(`start row missing "${expected}": ${startHtml.slice(0, 400)}`)
   }
+}
+
+/* The real Tool layer hands a lazy PartialArguments reader, not a plain object:
+   the fields must be read through its methods. */
+const readerArgs = {
+  text(key) { return key === 'question' ? '方法读取的问题' : undefined },
+  value(key) {
+    if (key === 'models') return [{ provider: 'p1', model: 'm9' }]
+    if (key === 'chairman') return false
+    return undefined
+  },
+}
+const readerHtml = render(React.createElement(toolview, {
+  t, phase: 'start', block: { args: readerArgs, argsRaw: '' },
+}))
+for (const expected of ['方法读取的问题', 'p1/m9', '主席汇总：关']) {
+  if (!readerHtml.includes(expected)) {
+    throw new Error(`start row must read the argument view through its methods, missing "${expected}": ${readerHtml.slice(0, 400)}`)
+  }
+}
+
+/* Explicitly off options and the automatic model pick. */
+const offStartHtml = render(React.createElement(toolview, {
+  t, phase: 'start', block: { args: { question: '简短问题', models: [], chairman: false, attachFiles: false }, argsRaw: '' },
+}))
+for (const expected of ['简短问题', '由 Host 自动挑选', '主席汇总：关', '不附带文件']) {
+  if (!offStartHtml.includes(expected)) {
+    throw new Error(`start row missing "${expected}": ${offStartHtml.slice(0, 400)}`)
+  }
+}
+
+/* A long question is truncated until the user expands it. */
+const longQuestion = '长'.repeat(400)
+const longHtml = render(React.createElement(toolview, {
+  t, phase: 'start', block: { args: { question: longQuestion, models: [], chairman: true, attachFiles: true }, argsRaw: '' },
+}))
+if (!longHtml.includes('展开全文')) throw new Error('a long question must offer the expand toggle')
+if (longHtml.includes(longQuestion)) throw new Error('a long question must be truncated before expansion')
+
+/* result: the settled call renders the blocks output.render() produced. */
+const resultHtml = render(React.createElement(toolview, {
+  t,
+  phase: 'result',
+  block: {
+    kind: 'tool-result', callId: 'call-1', isError: false,
+    content: [{ type: 'text', text: '结论正文' }],
+    call: { name: 'council_review', argsRaw: '{"question":"q"}' },
+    args: { question: 'q' },
+  },
+}))
+if (!resultHtml.includes('结论正文')) {
+  throw new Error(`result row must render block.content text: ${resultHtml.slice(0, 400)}`)
+}
+
+/* result: an error settles with no conclusion text. */
+const errorHtml = render(React.createElement(toolview, {
+  t,
+  phase: 'result',
+  block: {
+    kind: 'tool-result', callId: 'call-2', isError: true,
+    content: [], call: null, args: {},
+    error: { name: 'CouncilRunError', code: 'COUNCIL_FAILED' },
+  },
+}))
+for (const expected of ['评审失败', 'CouncilRunError', 'COUNCIL_FAILED']) {
+  if (!errorHtml.includes(expected)) {
+    throw new Error(`error row missing "${expected}": ${errorHtml.slice(0, 400)}`)
+  }
+}
+
+/* ---- Discovery: the timer always re-arms, but only a leader sends ---- *
+ * The old `isPollLeader() !== true` source-text assertion demanded the early
+ * return that IS the dead end (a tab that was not leader at mount never armed
+ * a timer and never retried), so it is replaced by behaviour. The 0.2.16
+ * defect was a follower turning itself into a poller: schedulePoll and
+ * schedulePollRetry keep their refuse-to-arm source assertions, because every
+ * poll callback does send HTTP. scheduleRunDiscovery differs — its callback
+ * only sends while leader, so a follower's re-arm is a local 4s no-op that is
+ * the precondition for starting discovery on takeover. The assertions here
+ * are therefore: no request while not leader, and a re-arm that happens
+ * anyway. */
+{
+  const channels = []
+  class HarnessBroadcastChannel {
+    constructor(name) {
+      this.name = name
+      this.onmessage = null
+      channels.push(this)
+    }
+    postMessage() {}
+    close() {}
+  }
+  /* The shipped election only runs where BroadcastChannel exists. */
+  fakeWindow.BroadcastChannel = HarnessBroadcastChannel
+  dispatchWindowEvent('pageshow', { type: 'pageshow' })
+  const channel = channels[channels.length - 1]
+  if (channel === undefined || typeof channel.onmessage !== 'function') {
+    throw new Error('leader election did not open a BroadcastChannel')
+  }
+  /* A lexicographically smaller rival holds the lease: this tab is a follower. */
+  const rivalClaim = { data: { leader: 'a-rival-tab', sessionId: 'session-test' } }
+  channel.onmessage(rivalClaim)
+  const rival = setInterval(() => channel.onmessage(rivalClaim), 600)
+
+  const runsRequests = () => fetchCalls.filter((call) => String(call.url).indexOf('/council/runs') === 0).length
+  const armsBefore = discoveryArms
+  const requestsBefore = runsRequests()
+  /* Mounting the overlay arms discovery. Its one-shot adopt is not the
+     discovery loop, so the request baseline is taken after that settles. */
+  renderAndFlush(React.createElement(overlayReg.component, { t }))
+  await new Promise((resolve) => setTimeout(resolve, 250))
+  const requestsAfterMount = runsRequests()
+  if (requestsAfterMount <= requestsBefore) {
+    throw new Error('the discovery baseline is empty: /council/runs was never probed')
+  }
+  /* One full discovery interval as a follower. */
+  await new Promise((resolve) => setTimeout(resolve, DISCOVERY_MS + 600))
+  const rearmCount = discoveryArms - armsBefore
+  if (rearmCount < 2) {
+    throw new Error(`a non-leader must still arm and re-arm discovery (armed ${rearmCount} time(s) in ${DISCOVERY_MS}ms)`)
+  }
+  if (runsRequests() !== requestsAfterMount) {
+    throw new Error('a non-leader must not run /council/runs discovery (follower sent a request)')
+  }
+  clearInterval(rival)
+  /* Let the election hand the lease back so every later poll path is party to
+     the same leader gate it was before this case. */
+  await new Promise((resolve) => setTimeout(resolve, 3200))
+}
+
+/* ---- Live progress: read from the shared store, never from the tool props ---- */
+{
+  /* feedbackMode off so the synthetic run cannot be delivered. */
+  const offRadio = findRadioByLabel(build(tabBody({ t })), '不做（只留在右侧栏）')
+  if (offRadio === undefined) throw new Error('feedback-off option is missing before the live-run check')
+  offRadio.props.onChange()
+  const resumeBeforeLive = resumeCalls.length
+  discoveryRows = [LIVE_RUN]
+  liveRunState = 'running'
+  /* Adopting the Host run fills store.run/running through the shipped path. */
+  renderAndFlush(React.createElement(overlayReg.component, { t }))
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  const liveArgs = { question: '实时进度问题', models: [{ provider: 'p1', model: 'm1' }], chairman: true, attachFiles: false }
+  const liveHtml = render(React.createElement(toolview, {
+    t, phase: 'start', block: { args: liveArgs, argsRaw: JSON.stringify(liveArgs) },
+  }))
+  for (const expected of ['实时进度：交叉互评', 'Model One', 'Model Two', '1/2', '运行中']) {
+    if (!liveHtml.includes(expected)) {
+      throw new Error(`live start row missing "${expected}": ${liveHtml.slice(0, 500)}`)
+    }
+  }
+  /* Settle the synthetic run, then stop offering it. */
+  liveRunState = 'done'
+  discoveryRows = null
+  await new Promise((resolve) => setTimeout(resolve, 700))
+  if (resumeCalls.length !== resumeBeforeLive) {
+    throw new Error('the live-progress check must not deliver a conclusion')
+  }
+  /* Restore the delivery mode this case borrowed (the storage default is
+     "wake", and nothing before here changed it). */
+  const wakeRadio = findRadioByLabel(build(tabBody({ t })), '直接唤醒主聊天')
+  if (wakeRadio === undefined) throw new Error('feedback option vanished after the live-run check')
+  wakeRadio.props.onChange()
 }
 
 /* ---- Settings page: settings.section over the Host configuration form ---- */
@@ -1121,6 +1358,12 @@ for (const cleanup of cleanups.reverse()) {
     throw new Error(`cleanup threw: ${error instanceof Error ? error.message : String(error)}`)
   }
 }
+
+/* This harness started two endless loops the plugin owns in a real tab: the
+   leader-election interval and the discovery chain (which re-arms on purpose).
+   Release both so the offline run terminates instead of hanging. */
+dispatchWindowEvent('pagehide', { type: 'pagehide' })
+for (const id of discoveryTimerIds) clearTimeout(id)
 
 console.log('client half: OK')
 console.log(`  slots: ${[...registered].join(', ')}`)

@@ -86,6 +86,27 @@ window.__ModuleLoader__.load({
       'overlay.running': '运行中',
       'overlay.starting': '正在启动',
       'overlay.hide': '隐藏浮窗',
+      /* In-conversation card for the agent-issued council_review tool call. */
+      'toolview.preparing': '正在准备理事会评审…',
+      'toolview.title': '理事会评审',
+      'toolview.question': '问题',
+      'toolview.showFull': '展开全文',
+      'toolview.showLess': '收起',
+      'toolview.models': '参与模型（{count} 个）',
+      'toolview.modelsAuto': '参与模型：由 Host 自动挑选',
+      'toolview.chairmanOn': '主席汇总：开',
+      'toolview.chairmanOff': '主席汇总：关',
+      'toolview.attachOn': '将附带工作区文件',
+      'toolview.attachOff': '不附带文件',
+      'toolview.progress': '实时进度：{stage}',
+      'toolview.seatCount': '{done}/{total} 个席位完成',
+      'toolview.seatRunning': '运行中',
+      'toolview.seatDone': '完成',
+      'toolview.seatFailed': '失败',
+      'toolview.failedSeats': '{failed}/{total} 个席位失败',
+      'toolview.result': '评审结论',
+      'toolview.error': '评审失败',
+      'toolview.noText': '（没有可显示的文本输出）',
       'settings.title': '理事会',
       'settings.toolEnabled': '启用内置工具 council_review',
       'settings.toolEnabledHint': '这是 agent 侧入口：关闭后模型调用 council_review 会被拒绝，并在工具结果里说明原因。',
@@ -208,6 +229,27 @@ window.__ModuleLoader__.load({
       'overlay.running': 'Running',
       'overlay.starting': 'Starting',
       'overlay.hide': 'Hide overlay',
+      /* In-conversation card for the agent-issued council_review tool call. */
+      'toolview.preparing': 'Preparing the council review…',
+      'toolview.title': 'Council review',
+      'toolview.question': 'Question',
+      'toolview.showFull': 'Show full question',
+      'toolview.showLess': 'Collapse',
+      'toolview.models': 'Participants ({count})',
+      'toolview.modelsAuto': 'Participants: chosen automatically by the Host',
+      'toolview.chairmanOn': 'Chairman synthesis: on',
+      'toolview.chairmanOff': 'Chairman synthesis: off',
+      'toolview.attachOn': 'Attaches workspace files',
+      'toolview.attachOff': 'No files attached',
+      'toolview.progress': 'Live progress: {stage}',
+      'toolview.seatCount': '{done}/{total} seats done',
+      'toolview.seatRunning': 'Running',
+      'toolview.seatDone': 'Done',
+      'toolview.seatFailed': 'Failed',
+      'toolview.failedSeats': '{failed}/{total} seats failed',
+      'toolview.result': 'Conclusion',
+      'toolview.error': 'Council review failed',
+      'toolview.noText': '(No text output to show)',
       'settings.title': 'Council',
       'settings.toolEnabled': 'Enable the built-in council_review tool',
       'settings.toolEnabledHint': 'The agent-facing entry: when disabled, a model calling council_review is refused with the reason in the tool result.',
@@ -379,6 +421,23 @@ const RUN_DISCOVERY_MS = 4000
 .dsc-settings-cell span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dsc-settings-select{max-width:340px;padding:4px 6px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-primary,#fff);color:inherit}
 .dsc-settings-actions{display:flex;align-items:center;gap:10px;margin-top:6px}
+.dsc-tool{display:flex;flex-direction:column;gap:5px;padding:7px 9px;border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:12px}
+.dsc-tool-head{display:flex;align-items:center;gap:6px}
+.dsc-tool-icon{font-size:13px;line-height:1}
+.dsc-tool-title{font-weight:600}
+.dsc-tool-toggle{align-self:flex-start;padding:0;border:0;background:transparent;color:var(--dsw-alias-brand-primary);font:inherit;font-size:11px;cursor:pointer}
+.dsc-tool-q{white-space:pre-wrap;word-break:break-word;color:var(--dsw-alias-label-secondary)}
+.dsc-tool-chips{display:flex;flex-wrap:wrap;gap:4px}
+.dsc-tool-chip{padding:1px 7px;border:1px solid var(--dsw-alias-border-l1);border-radius:999px;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px}
+.dsc-tool-meta{display:flex;flex-wrap:wrap;gap:10px;color:var(--dsw-alias-label-tertiary);font-size:11px}
+.dsc-tool-live{display:flex;flex-direction:column;gap:4px;padding-top:5px;border-top:1px solid var(--dsw-alias-border-l1)}
+.dsc-tool-live-head{display:flex;align-items:center;gap:6px;color:var(--dsw-alias-label-secondary)}
+.dsc-tool-count{flex:none;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums}
+.dsc-tool-seats{display:flex;flex-direction:column;gap:3px}
+.dsc-tool-seat{display:flex;align-items:center;gap:6px;min-width:0}
+.dsc-tool-seat-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dsc-tool-seat-state{flex:none;color:var(--dsw-alias-label-secondary)}
+.dsc-tool-text{max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word}
 `
 
     /* ------------------------------------------------------------------ *
@@ -990,29 +1049,31 @@ const RUN_DISCOVERY_MS = 4000
      *
      * An agent-issued `council_review` creates the Host run without any client
      * involvement, so nothing calls `watchRun`. The floating status card must
-     * not depend on the user opening the sidebar tab first.
+     * not depend on the user opening the sidebar tab first, nor on this tab
+     * happening to hold the leader role at mount time.
      *
-     * Leader-gated on purpose: "followers never schedule" is a fixed defect
-     * (a per-tab discovery timer is the same idle loop), and the leader is the
-     * tab that already owns polling.
+     * The timer therefore always exists and always re-arms; only the request
+     * itself is leader-gated. This is NOT the 0.2.16 idle-loop defect: a
+     * follower keeps a local 4s timer with zero HTTP, where the old loop
+     * fetched on a 320ms cycle. Keeping the timer alive is what lets a follower
+     * begin discovery the moment it takes the lease — the previous early
+     * `return` left a tab that was not leader at mount time permanently blind
+     * to agent-issued runs.
      */
     function scheduleRunDiscovery() {
-      if (isPollLeader() !== true) return
       if (discoveryTimer !== 0) return
       if (typeof window === 'undefined') return
       discoveryTimer = window.setTimeout(() => {
         discoveryTimer = 0
-        if (isPollLeader() !== true) return
-        /* A live run already has a stream; discovery is only for finding one. */
-        if (store.state.running === true && store.state.runId !== '' && store.state.run !== null) {
-          scheduleRunDiscovery()
-          return
+        if (isPollLeader() === true) {
+          /* A live run already has a stream; discovery is only for finding one. */
+          if (!(store.state.running === true && store.state.runId !== '' && store.state.run !== null)) {
+            void adoptRunningRun().then(scheduleRunDiscovery, scheduleRunDiscovery)
+            return
+          }
         }
-        void adoptRunningRun().then(() => {
-          scheduleRunDiscovery()
-        }, () => {
-          scheduleRunDiscovery()
-        })
+        /* Follower: no request, but keep re-arming so takeover starts discovery. */
+        scheduleRunDiscovery()
       }, RUN_DISCOVERY_MS)
     }
 
@@ -2227,6 +2288,223 @@ const RUN_DISCOVERY_MS = 4000
     }
 
     /* ------------------------------------------------------------------ *
+     * Conversation card — `tool.call.toolview`, key `council_review`       *
+     * ------------------------------------------------------------------ */
+
+    /* Field readers over a Tool argument view. The Tool layer hands a lazy
+       `PartialArguments` reader with methods, never a plain object; the
+       property arm keeps callers that pass literal args (the offline harness)
+       working. Every reader is total: a missing or mistyped field is empty. */
+    function toolArgValue(args, key) {
+      if (args === null || args === undefined || typeof args !== 'object') return undefined
+      if (typeof args.value === 'function') return args.value(key)
+      return args[key]
+    }
+
+    function toolArgText(args, key) {
+      if (args === null || args === undefined || typeof args !== 'object') return ''
+      if (typeof args.text === 'function') {
+        const text = args.text(key)
+        return typeof text === 'string' ? text : ''
+      }
+      const text = args[key]
+      return typeof text === 'string' ? text : ''
+    }
+
+    /**
+     * The argument view of any stage. Preparing, start and result all expose
+     * `block.args`; a settled call additionally carries `block.call.argsRaw`
+     * and `block.content`.
+     */
+    function toolArgsOf(block) {
+      if (block === null || block === undefined || typeof block !== 'object') return undefined
+      return block.args
+    }
+
+    /** `[{provider, model}, …]` or bare strings; anything else is dropped. */
+    function toolModelLabels(args) {
+      const raw = toolArgValue(args, 'models')
+      if (!Array.isArray(raw)) return []
+      const labels = []
+      for (const entry of raw) {
+        if (typeof entry === 'string') {
+          if (entry !== '') labels.push(entry)
+          continue
+        }
+        if (entry === null || typeof entry !== 'object') continue
+        const provider = typeof entry.provider === 'string' ? entry.provider : ''
+        const model = typeof entry.model === 'string' ? entry.model : ''
+        const label = provider !== '' && model !== '' ? `${provider}/${model}` : model !== '' ? model : provider
+        if (label !== '') labels.push(label)
+      }
+      return labels
+    }
+
+    /** Display text of one rendered content block; non-text blocks are skipped. */
+    function toolBlockText(block) {
+      if (block === null || block === undefined || typeof block !== 'object') return ''
+      return typeof block.text === 'string' ? block.text : ''
+    }
+
+    /** Characters of the question shown before the expand toggle appears. */
+    const TOOL_QUESTION_PREVIEW = 160
+
+    /**
+     * In-conversation card for the agent-issued `council_review` call.
+     *
+     * `phase` is a props discriminant, never `block.phase`; a settled call is
+     * recognised by `'kind' in block` and shows `block.content`, the blocks the
+     * tool output renderer produced. None of the three stages carries run
+     * progress, so the live section reads this module's shared store — the same
+     * fact the floating card reads. It starts no poller and no stream.
+     */
+    function CouncilReviewRow(props) {
+      const t = typeof props.t === 'function' ? props.t : tr
+      const phase = props.phase
+      const block = props.block
+      /* Hooks run before any early return: one row can move from preparing to
+         start to result across renders, and hook order must not change. */
+      const live = useStore((snapshot) => ({
+        run: snapshot.run,
+        running: snapshot.running,
+        runId: snapshot.runId,
+      }))
+      const [expanded, setExpanded] = React.useState(false)
+
+      if (phase === 'preparing') {
+        return h('div', { className: 'dsc-tool' },
+          h('div', { className: 'dsc-tool-head' },
+            h('span', { className: 'dsc-tool-icon', 'aria-hidden': true }, '⚖'),
+            h('span', { className: 'dsc-tool-title' }, t('toolview.preparing')),
+          ),
+        )
+      }
+
+      const args = toolArgsOf(block)
+      const question = toolArgText(args, 'question')
+      const models = toolModelLabels(args)
+      const chairmanOn = toolArgValue(args, 'chairman') !== false
+      const attachOn = toolArgValue(args, 'attachFiles') !== false
+
+      if (phase === 'result' || (block !== null && typeof block === 'object' && 'kind' in block)) {
+        const settled = block !== null && typeof block === 'object' && 'kind' in block
+        const content = settled && Array.isArray(block.content) ? block.content : []
+        const text = content.map(toolBlockText).filter((chunk) => chunk !== '').join('\n\n')
+        const error = settled && block.error !== null && block.error !== undefined && typeof block.error === 'object'
+          ? block.error
+          : null
+        const errorName = error !== null && typeof error.name === 'string' ? error.name : ''
+        const errorCode = error !== null && typeof error.code === 'string' ? error.code : ''
+        const isError = settled && (block.isError === true || error !== null)
+        if (isError) {
+          const detail = [errorName, errorCode].filter((part) => part !== '').join(' · ')
+          const message = [detail, text].filter((part) => part !== '').join('\n')
+          return h('div', { className: 'dsc-tool' },
+            h('div', { className: 'dsc-tool-head' },
+              h('span', { className: 'dsc-tool-icon', 'aria-hidden': true }, '⚖'),
+              h('span', { className: 'dsc-tool-title' }, t('toolview.title')),
+              h('span', { className: 'dsc-tool-chip' }, t('toolview.error')),
+            ),
+            h('div', { className: 'dsc-error-box' }, message !== '' ? message : t('toolview.error')),
+          )
+        }
+        return h('div', { className: 'dsc-tool' },
+          h('div', { className: 'dsc-tool-head' },
+            h('span', { className: 'dsc-tool-icon', 'aria-hidden': true }, '⚖'),
+            h('span', { className: 'dsc-tool-title' }, t('toolview.title')),
+            h('span', { className: 'dsc-tool-chip' }, t('status.done')),
+          ),
+          h('div', { className: 'dsc-section-title' }, t('toolview.result')),
+          h('div', { className: 'dsc-tool-text' }, text !== '' ? text : t('toolview.noText')),
+        )
+      }
+
+      /* start: the dispatched call with complete arguments. */
+      const showToggle = question.length > TOOL_QUESTION_PREVIEW
+      const shown = showToggle && expanded !== true ? `${question.slice(0, TOOL_QUESTION_PREVIEW)}…` : question
+
+      const run = live.run
+      const liveVisible = live.running === true && run !== null && typeof run === 'object'
+      const answers = liveVisible && Array.isArray(run.answers)
+        ? run.answers.filter((answer) => answer !== null && typeof answer === 'object')
+        : []
+      const finished = answers.filter((answer) => answer.done === true).length
+      const failed = answers.filter((answer) => typeof answer.error === 'string' && answer.error !== '').length
+      const stageNames = {
+        answers: t('stage.answers'),
+        reviews: t('stage.reviews'),
+        chairman: t('stage.chairman'),
+        done: t('stage.done'),
+      }
+      const stage = liveVisible && stageNames[run.stage] !== undefined ? stageNames[run.stage] : stageNames.answers
+
+      return h('div', { className: 'dsc-tool' },
+        h('div', { className: 'dsc-tool-head' },
+          h('span', { className: 'dsc-tool-icon', 'aria-hidden': true }, '⚖'),
+          h('span', { className: 'dsc-tool-title' }, t('toolview.title')),
+          h('span', { className: 'dsc-tool-chip' }, liveVisible ? t('status.streaming') : t('toolview.title')),
+        ),
+        question !== ''
+          ? h('div', { className: 'dsc-tool-q', title: question },
+              h('span', { className: 'dsc-section-title' }, `${t('toolview.question')} · `),
+              shown,
+            )
+          : null,
+        showToggle
+          ? h('button', {
+              type: 'button',
+              className: 'dsc-tool-toggle',
+              onClick: () => setExpanded((value) => value !== true),
+            }, expanded === true ? t('toolview.showLess') : t('toolview.showFull'))
+          : null,
+        models.length > 0
+          ? h('div', { className: 'dsc-tool-chips' },
+              models.map((label, index) => h('span', { className: 'dsc-tool-chip', key: `${index}:${label}` }, label)))
+          : null,
+        h('div', { className: 'dsc-tool-meta' },
+          models.length > 0
+            ? h('span', null, t('toolview.models', { count: models.length }))
+            : h('span', null, t('toolview.modelsAuto')),
+          h('span', null, chairmanOn ? t('toolview.chairmanOn') : t('toolview.chairmanOff')),
+          h('span', null, attachOn ? t('toolview.attachOn') : t('toolview.attachOff')),
+        ),
+        liveVisible
+          ? h('div', { className: 'dsc-tool-live' },
+              h('div', { className: 'dsc-tool-live-head' },
+                h('span', { className: 'dsc-spinner', 'aria-hidden': true }),
+                h('span', null, t('toolview.progress', { stage })),
+                h('span', { className: 'dsc-tool-count' }, `${finished}/${answers.length}`),
+              ),
+              failed > 0
+                ? h('div', { className: 'dsc-warn' }, t('toolview.failedSeats', { failed, total: answers.length }))
+                : null,
+              answers.length > 0
+                ? h('div', { className: 'dsc-tool-seats' },
+                    answers.map((answer, index) => {
+                      const seatFailed = typeof answer.error === 'string' && answer.error !== ''
+                      const tone = seatFailed ? ' is-error' : answer.done === true ? ' is-done' : ' is-live'
+                      const name = typeof answer.name === 'string' && answer.name !== ''
+                        ? answer.name
+                        : typeof answer.model === 'string' && answer.model !== '' ? answer.model : `${index + 1}`
+                      return h('div', {
+                        className: 'dsc-tool-seat',
+                        key: typeof answer.key === 'string' && answer.key !== '' ? answer.key : `${index}`,
+                      },
+                        h('span', { className: 'dsc-float-dot' + tone }),
+                        h('span', { className: 'dsc-tool-seat-name', title: name }, name),
+                        h('span', { className: 'dsc-tool-seat-state' },
+                          seatFailed ? t('toolview.seatFailed')
+                            : answer.done === true ? t('toolview.seatDone') : t('toolview.seatRunning')),
+                      )
+                    }),
+                  )
+                : null,
+            )
+          : null,
+      )
+    }
+
+    /* ------------------------------------------------------------------ *
      * Plugin                                                              *
      * ------------------------------------------------------------------ */
 
@@ -2385,6 +2663,17 @@ const RUN_DISCOVERY_MS = 4000
             key: 'council',
             locale: NS,
           }, CouncilSelectionMenu)))
+
+        /* Keyed by the exact wire tool name: the slot dispatches on `key`, and
+           a typo never renders. `council_review` is unclaimed, so this replaces
+           no shipped view. Without `locale` the framework would not inject the
+           `t` seat. */
+        track(ctx.slots.inject('tool.call.toolview', () =>
+          ctx.slots.register({
+            name: 'tool.call.toolview',
+            key: 'council_review',
+            locale: NS,
+          }, CouncilReviewRow)))
 
         track(ctx.inject(['sidebarRightTabs'], (scope) => {
           const tabs = scope.get('sidebarRightTabs')

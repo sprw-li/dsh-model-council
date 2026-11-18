@@ -133,6 +133,73 @@ function wantsSourcePack(question) {
   const text = String(question || '')
   return REVIEW_INTENT.test(text) || CODE_MENTION.test(text)
 }
+
+/**
+ * Extensions that mean the named artefact is a document, not source.
+ *
+ * `md` is deliberately here even though `CODE_MENTION` lists it: mentioning a
+ * Markdown file is not evidence that source code matters.
+ */
+const DOC_EXTENSIONS = new Set([
+  '.md', '.markdown', '.rst', '.txt', '.adoc', '.tex',
+  '.doc', '.docx', '.odt', '.rtf', '.pdf',
+  '.ppt', '.pptx', '.key', '.xls', '.xlsx', '.csv', '.ods',
+  '.epub', '.mobi',
+])
+
+/**
+ * Contract/entry docs. Naming one is evidence the project itself is in play, so
+ * the source pack survives (e.g. "核验 README.md 与实现是否一致").
+ *
+ * `KEY_FILE` cannot be reused directly: it anchors on `^` or a path separator
+ * because it classifies real walked paths, so a bare `README.md` written inside
+ * prose would not match. This variant also accepts a prose boundary (space,
+ * quote, backtick, punctuation).
+ */
+const CONTRACT_DOC_MENTION = /(?:^|[^A-Za-z0-9_\\/-])(?:README[^\\/\s]*\.md|SKILL\.md|CLAUDE\.md|AGENTS\.md|CHECKPOINT\.md|pyproject\.toml|package\.json|setup\.py|requirements\.txt|ARCHITECTURE[^\\/\s]*\.md|STATUS[^\\/\s]*\.md|DEFAULTS[^\\/\s]*\.md|RELEASE_NOTES[^\\/\s]*\.md|DECISIONS[^\\/\s]*\.md)/i
+
+/**
+ * Unambiguous "this question is about source" words, used to keep the code pack
+ * when a document is named alongside real source vocabulary.
+ *
+ * Deliberately EXCLUDES `实现`, even though `CODE_MENTION` includes it: in Chinese
+ * prose `实现` far more often means "achieve / realise" ("实现研究目标", "落地实现")
+ * than "implementation". Treating it as a code signal would re-open the very false
+ * positive this veto exists to close — a research-plan review that happens to use
+ * the word `实现` would drag the 90k source pack back in. `源码`/`代码`/`函数`/
+ * `行号`/`调用链` have no such second reading.
+ */
+const CODE_WORDS_STRONG = /源码|源代码|代码|函数|行号|调用链/
+
+/**
+ * Is this a review whose only named artefacts are documents?
+ *
+ * `wantsSourcePack` is too blunt on its own: `CODE_MENTION` lists `md` among its
+ * extensions, and `REVIEW_INTENT` fires on any review word. So "评审一份 .md 方案
+ * 文档" was read as a code review and attached 90k chars of source (24 files) from
+ * the fallback directory — a measured 17-minute run whose reviewers spent their
+ * budget on mostly irrelevant code.
+ *
+ * A named SOURCE file keeps the pack (that is the gate's whole purpose). A named
+ * document with no source file named anywhere drops it. Naming nothing at all
+ * keeps the existing workspace/review behaviour, and the contract docs
+ * (README/SKILL/AGENTS/CHECKPOINT…) stay code-adjacent so they keep it too.
+ */
+export function documentOnlyReview(question) {
+  const source = String(question || '')
+  if (CONTRACT_DOC_MENTION.test(source)) return false
+  if (CODE_WORDS_STRONG.test(source)) return false
+  let sawDocument = false
+  /* Scan bare extensions rather than path tokens: a filename like
+     `04_方案步骤与决策手册.md` has a non-ASCII basename, so a token regex that
+     demands `[\w.\-/]+` before the dot never matches it. */
+  for (const match of source.matchAll(/\.([A-Za-z0-9]{1,6})\b/g)) {
+    const ext = `.${match[1].toLowerCase()}`
+    if (CODE_EXTENSIONS.has(ext)) return false
+    if (DOC_EXTENSIONS.has(ext)) sawDocument = true
+  }
+  return sawDocument
+}
 /** Bounded source pack so llm-mode seats can cite real files instead of guessing. */
 const CODE_MAX_CHARS = 120000
 const CODE_MAX_FILES = 24
@@ -144,7 +211,12 @@ const CODE_EXTENSIONS = new Set([
   '.hpp', '.cc', '.lua', '.swift', '.scala', '.sh', '.ps1', '.sql', '.vue', '.svelte',
 ])
 /** `@relative/path` mentions inside the question. */
-const AT_MENTION = /@([A-Za-z0-9_.\-]+(?:[\\/][A-Za-z0-9_.\-]+)*)/g
+/*
+ * `@mention` path references. The character class must admit non-ASCII: the
+ * original `[A-Za-z0-9_.\-]` could not match `@评审/04_方案.md`, so an @mention
+ * of a Chinese-named path was silently ignored.
+ */
+const AT_MENTION = /@([\p{L}\p{N}_.\-]+(?:[\\/][\p{L}\p{N}_.\-]+)*)/gu
 const KEY_FILE = /(^|[\\/])(README[^\\/]*\.md|SKILL\.md|CLAUDE\.md|AGENTS\.md|CHECKPOINT\.md|pyproject\.toml|package\.json|setup\.py|requirements\.txt|ARCHITECTURE[^\\/]*\.md|STATUS[^\\/]*\.md|DEFAULTS[^\\/]*\.md|RELEASE_NOTES[^\\/]*\.md|DECISIONS[^\\/]*\.md)$/i
 
 /** Model ids that are not chat completions. */
@@ -484,10 +556,49 @@ function candidatePaths(text, workspaceCwd) {
     const variants = [token]
     const drive = /^([A-Za-z])[\\/](.+)$/.exec(token)
     if (drive !== null) variants.push(`${drive[1]}:\\${drive[2]}`)
+    /*
+     * Absolute variants FIRST, and only then the relative branch. Trying the
+     * relative branch inside this loop would win on the first variant of
+     * `D/dev/elsewhere` (it has a separator) and break before the drive-letter
+     * variant `D:\dev\elsewhere` was pushed — which is the token that makes
+     * `namedButRefused` true and suppresses the workspace fallback.
+     */
+    let pushed = false
     for (const variant of variants) {
       if (!/^([A-Za-z]:[\\/]|\/)/.test(variant)) continue
       push(variant)
+      pushed = true
       break
+    }
+    if (pushed) continue
+    /*
+     * A RELATIVE path with a directory component names a specific file the
+     * reviewer must see. Measured: "评审对象是工作区里的 `评审/04_方案步骤与
+     * 决策手册.md`" produced NO candidate at all — `candidatePaths` only accepted
+     * absolute paths, and `AT_MENTION`'s character class excluded non-ASCII, so
+     * the named document never reached the attachment. (The caller had learned
+     * this: their question says "若附件未包含该文件…".)
+     *
+     * Two guards, both load-bearing:
+     *  - strip a leading `@` (that form is the AT_MENTION branch's job, and it
+     *    uses the capture group WITHOUT the `@`). Feeding `@../../etc/passwd`
+     *    here as a path component made `join` absorb the `..` segments and land
+     *    back inside the workspace, so the containment check read a traversal as
+     *    safe — measured: candidatePaths returned 1 entry instead of 0.
+     *  - refuse any `..` segment outright. Containment alone is not enough when
+     *    the separator semantics can move the result back inside.
+     *
+     * A bare filename is deliberately NOT resolved here: `client.js` is ambiguous
+     * and the directory fallback handles it, so the pack behaviour locked by the
+     * harness is unchanged. A token that resolves to nothing is harmless — the
+     * existence check runs later and the directory fallbacks still fire.
+     */
+    const relativeToken = token.replace(/^@+/, '')
+    if (typeof workspaceCwd === 'string' && workspaceCwd !== ''
+      && /[\\/]/.test(relativeToken) && !/^[\\/]/.test(relativeToken)
+      && !/(^|[\\/])\.\.([\\/]|$)/.test(relativeToken)) {
+      const resolvedRelative = join(workspaceCwd, relativeToken)
+      if (isPathInside(resolvedRelative, workspaceCwd)) push(resolvedRelative)
     }
     if (candidates.length >= MAX_ATTACH_PATHS) return candidates
   }
@@ -1178,8 +1289,13 @@ async function collectPathContext(question, maxChars, workspaceCwd, codeMaxChars
   let codeFiles = 0
   let codeDiscovered = 0
   let codeTruncated = 0
+  /*
+   * Veto the CODE pack when the question only names documents. The document
+   * attachment and the workspace fallback above are unaffected — a review of a
+   * `.md` plan still receives the plan, just not 90k of unrelated source.
+   */
   const wantsCode = allowCode && typeof codeMaxChars === 'number' && codeMaxChars > 0
-    && wantsSourcePack(question) && dirs.length > 0
+    && wantsSourcePack(question) && dirs.length > 0 && !documentOnlyReview(question)
   if (wantsCode) {
     const code = await collectCodeContext(dirs, codeMaxChars, hints)
     codeState = code.state
@@ -2491,7 +2607,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v62', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v63', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -2504,7 +2620,7 @@ export function apply(ctx, config) {
              human or the client can see which side is off. */
           sendJson(res, 200, {
             ok: true,
-            build: 'v62',
+            build: 'v63',
             toolEnabled: toolEnabled(liveConfig),
             panelEnabled: panelEnabled(liveConfig),
           })

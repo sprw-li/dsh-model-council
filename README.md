@@ -2,7 +2,7 @@
 
 > 仓库：<https://github.com/sprw-li/dsh-model-council>
 >
-> **Status: alpha** — 接口与行为仍可能变化，正式版等外部反馈后再定。已发布到 npm 的只有 `0.1.0`；仓库源码为 `0.2.31`（见文末「版本与发布」）。
+> **Status: alpha** — 接口与行为仍可能变化，正式版等外部反馈后再定。已发布到 npm 的只有 `0.1.0`；仓库源码为 `0.2.32`（见文末「版本与发布」）。
 
 DeepSeek Harness 的多模型理事会插件：一个入口把问题交给多个模型并行作答、匿名互评，可选主席汇总，并可把结论回投主聊天。结果常驻右侧栏 tab。
 
@@ -167,14 +167,25 @@ council_review({
 
 > `@deepseek-ai/schemastery` 是 peerDependency（`^3.18.5`，`.volatile()` 从该版本起提供）。
 
+## 对话内工具卡片（0.2.32 新增）
+
+`council_review` 现在在对话里有自己的卡片，而不是塌成裸 JSON 输入。
+
+- 注册在 **`tool.call.toolview`**，`key` 必须**精确等于 wire 工具名** `council_review`（官方文档原话 "a typo never renders"——写错不报错、只是永远不渲染，退回通用行）。同时声明 `locale`，否则框架不注入 `t`。
+- 三个阶段各自渲染：`preparing`（单行，不 dump 不完整参数）→ `start`（问题摘要可展开、参与模型、主席开关、附件提示 + **实时阶段与每席位状态**）→ `result`（成功渲染输出文本；失败渲染 `name · code`）。
+- **两个易错契约**（实测自 `dsh-client-ui-tool/lib/client.js` 与 `packages/util/values/src/partial-json.ts`）：
+  - `block.args` 是**懒读器 `PartialArguments`，不是普通对象** → 必须 `.text(key)` / `.value(key)`，`block.args.question` 取不到值。
+  - `result` 的 `block.call` 只有 `{ name, argsRaw }`（或 `null`），**没有 `.args`**；参数视图始终是 `block.args`。`preparing` 的 block **没有 `argsRaw`**。
+
 ## 运行状态浮窗
 
 调用 `council_review`（或面板发起）时，对话区右下角会出现一个浮动状态卡：阶段（作答／互评／主席）、已完成席位比例、每个席位（模型名 + 运行/完成/失败）、问题摘要与错误。
 
 - 渲染在 `conversation.input.overlay`（与官方命令弹窗、斜杠菜单、反馈对话框同一个位），并按该 slot 的契约 **portal 到 `document.body`**。
 - **只读**：它不写运行状态、不投递结论、不取消运行；投递仍然只走 leader 的 stream/poll 路径。
-- **发现机制**：agent 发起的 `council_review` 只会创建 Host 侧运行，客户端原本不知道。浮窗挂载时会 `adoptRunningRun()`，并且 **leader 门控**地每 4 秒重查 `GET /council/runs`（follower 排定时器正是之前修掉的空转缺陷，所以这里不放开）。
-- 多标签页下 follower 目前不显示浮窗状态（沿用既有的 follower 缺口，未在本次放开）。
+- **发现机制（0.2.32 修正）**：agent 发起的 `council_review` 只会创建 Host 侧运行，客户端原本不知道，所以浮窗挂载时会 `adoptRunningRun()` 并每 4 秒重查 `GET /council/runs`。**旧实现在两处提前 `return`（挂载时非 leader、或回调时非 leader），于是那张标签页永久失明** —— 现在定时器**恒排恒重排**，只把"发请求"这一步做 leader 门控。
+  > 这不等于 0.2.16 修掉的空转缺陷：follower 只有一个本地 4s 定时器、**零 HTTP**（旧缺陷是 320ms 周期反复 fetch）。保留定时器正是 follower 接管租约后能立刻开始发现的前提。
+  > **每 4 秒的持续轮询是既有行为**（旧版 leader 找不到运行时同样继续重排），本次未放宽也未收紧。
 
 ## 已验证（2026-11-11，本机 DSH 0.2.2-rc.1）
 
@@ -193,6 +204,8 @@ council_review({
 - **单会话单 run**：同一 `sessionId` 已有运行中的评审时，`POST /council/run` 返回 409 + 现有 runId，前端改为接回而不是再开一份。
 - **运行注册表持久化**：写入 `${DSH_HOME:-~/.dsh}/council-runs.json`（最多 20 条，500ms 防抖）；Host 重启后仍能查到历史运行，重启前仍在跑的被标注为「Host 重启，运行中断」。
 - **源码包（评审必读）**：问题含 `评审/审查/review/audit` 等意图时，除目录树与关键文档外，还会自动打包**真实源码**：单文件 ≤ `CODE_FILE_CHARS`（12000 字）、总预算 `codeMaxChars`（默认 120000 字，即 `CODE_MAX_CHARS`），遍历条目上限 `CODE_WALK_ENTRIES`（2000）；主文件拿 80% 预算，大文件按问题关键词锚定采样（完整函数体 → 命名符号窗口 → 关键词簇），路径全部标注；提示词要求结论必须引用具体文件、附件未覆盖的内容标注【推断】。快照新增 `codeState/codeFiles/codeChars` 与**覆盖率** `codeDiscovered/codeTruncated`（发现数 vs 附带数、截断数），UI 显示「已附带源码 N 个文件（X 字）」——**这是抽样初审，不是全项目审查**；附件头部自带覆盖率声明。
+  - **判据（0.2.32 收窄）**：源码包只在**问题确实关于代码**时附带。`CODE_MENTION` 的扩展名列表里有 `md`，而 `REVIEW_INTENT` 对任何评审词都成立，于是"评审一份 `.md` 方案文档"被判成代码评审，从兜底目录附了 **90k 字源码（24 个文件）**——实测一次 17 分钟的运行，评审者读的多是无关代码。现在：点名的产物**全是文档**（`.md`/`.txt`/`.pdf`/`.docx`/`.csv`…）且没有任何源码文件被点名时，**不附源码包**；点名了源码文件、或什么都没点名（工作区评审）时**照旧附**；`README.md`/`SKILL.md`/`AGENTS.md`/`package.json` 等契约文件视为代码相邻，仍附。
+- **点名的文档会真的被附上（0.2.32 新增）**：相对路径（`` `评审/04_方案步骤与决策手册.md` ``）以前**完全不进候选**——`candidatePaths` 只接受绝对路径，而 `@mention` 的字符类不含非 ASCII，所以 `@评审/...` 也匹配不到。实测：一次评审点名了手册，附件里却只有目录树，评审者看不到评审对象（提问者当时已学会在问题里补一句"若附件未包含该文件…"）。现在带**目录部分**的相对路径会解析到工作区内并作为候选；`@mention` 支持中文路径。裸文件名（`client.js`）仍交给目录兜底，因为同名文件有歧义。
 - **附件安全**：`@mention` 只解析到工作区内（拒绝 `..` 穿越）；路径附件拒绝符号链接、密钥类文件（`.env`/`.pem`/`.key`/`.ssh`/`.aws`/`.kube`/`id_rsa` 等）、二进制与 >1MB 文件；skill 只读加载、脚本不执行。
   - **fail-closed 路径许可（0.2.28）**：默认只允许**会话工作区**与**调用方目录**。问题里写出的其他绝对路径会被拒绝，除非列在 `attachRoots` 里，或置 `allowExternalPaths: true`（逃生舱，恢复 0.2.27 之前"任意本机路径可读"的行为）。
     > 收紧前实测：默认配置下，问题里写一个工作区外的绝对路径，其内容**真的进入附件**（canary 命中）。原因是 `permitted` 写成 `attachRoots.length === 0 || ...` —— 空 allowlist 等于不做限制。对 agent 生成的问题，这是一条无需要用户有意的间接外发通道。
@@ -229,7 +242,7 @@ council_review({
 
 ## 安装
 
-npm 上的发布版本为 **0.1.0**（dist-tags `latest` / `alpha`）；本仓库源码版本 **0.2.31**，尚未发布到 npm——发布 0.2.x 需要新的 granular token（旧的已吊销）。
+npm 上的发布版本为 **0.1.0**（dist-tags `latest` / `alpha`）；本仓库源码版本 **0.2.32**，尚未发布到 npm——发布 0.2.x 需要新的 granular token（旧的已吊销）。
 
 ```sh
 # 从 npm
@@ -322,6 +335,6 @@ node <workspace>\tmp\push-council.mjs <本目录> sprw-li/dsh-model-council main
 ## 发布记录与后续
 
 - GitHub：<https://github.com/sprw-li/dsh-model-council>，release 有 `v0.1.0-alpha` 与 `v0.2.0`（pre-release）。
-- npm：<https://www.npmjs.com/package/dsh-model-council>（已发布 `0.1.0`；仓库源码 `0.2.31` **尚未发布**——`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
+- npm：<https://www.npmjs.com/package/dsh-model-council>（已发布 `0.1.0`；仓库源码 `0.2.32` **尚未发布**——`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
 
 发新版本：更新 `CHANGELOG.md` 与 `package.json` 版本 → `npm run verify` → commit/tag → `npm publish --tag alpha`（npm 新包首次发布会进入 staged 审核，通常几分钟内变为可安装）→ `npm pack` + `gh release create vX.Y.Z --prerelease --notes-file CHANGELOG.md <tarball>`。

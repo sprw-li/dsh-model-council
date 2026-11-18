@@ -16,7 +16,7 @@ import { existsSync, readFileSync } from 'node:fs'
    `npm install --no-save --no-package-lock @deepseek-ai/schemastery` — the DSH
    installation also routes a linked plugin's declared peerDependencies, but a plain
    `node dev/verify-host.mjs` has no such router. */
-import { TRANSIENT_FAILURE, SEAT_RESULT_TIMEOUT_MS, SEAT_START_TIMEOUT_MS, PROVIDER_CONCURRENCY, MAX_FALLBACKS_PER_RUN, RUN_TIMEOUT_MS, CODE_FILE_CHARS, CODE_MAX_CHARS, CODE_WALK_ENTRIES, looksLikeDeliberatePath, collectSourceFiles, defaultRoutesFromCatalog, candidatePaths, collectCodeContext, collectPathContext, isPathInside, readTextFile, runLimited, withTimeout, apply, Config, toolEnabled, panelEnabled, parseRouteSpec, resolveConfiguredRoutes, selectCouncilRoutes, pickChairmanRoute, readSetting } from '../index.js'
+import { TRANSIENT_FAILURE, SEAT_RESULT_TIMEOUT_MS, SEAT_START_TIMEOUT_MS, PROVIDER_CONCURRENCY, MAX_FALLBACKS_PER_RUN, RUN_TIMEOUT_MS, CODE_FILE_CHARS, CODE_MAX_CHARS, CODE_WALK_ENTRIES, looksLikeDeliberatePath, collectSourceFiles, defaultRoutesFromCatalog, candidatePaths, collectCodeContext, collectPathContext, documentOnlyReview, isPathInside, readTextFile, runLimited, withTimeout, apply, Config, toolEnabled, panelEnabled, parseRouteSpec, resolveConfiguredRoutes, selectCouncilRoutes, pickChairmanRoute, readSetting } from '../index.js'
 
 const root = await mkdtemp(join(tmpdir(), 'council-host-'))
 try {
@@ -124,6 +124,99 @@ try {
     const pack = await collectPathContext(question, 6000, workspace, 5000, true, [], workspace)
     assert.equal(pack.codeState, 'ok', `bogus path tokens must not suppress the fallback: ${question}`)
     assert.ok(pack.codeFiles >= 1, `expected code files for: ${question}`)
+  }
+
+  /* A RELATIVE path named in the question must reach the attachment.
+     Measured on a real run: "评审对象是工作区里的 `评审/04_方案步骤与决策手册.md`"
+     produced NO candidate at all, so the review target was never attached and the
+     reviewer received a directory tree instead. Only absolute paths were accepted,
+     and AT_MENTION's character class excluded non-ASCII, so a Chinese-named path
+     could not be mentioned either. */
+  {
+    const named = candidatePaths('评审对象是工作区里的 `评审/04_方案.md`。', workspace)
+    assert.ok(named.includes(join(workspace, '评审', '04_方案.md')),
+      `a relative named document must become a candidate: ${JSON.stringify(named)}`)
+    assert.ok(candidatePaths('请评审 @评审/04_方案.md', workspace).includes(join(workspace, '评审', '04_方案.md')),
+      'an @mention of a non-ASCII path must resolve')
+    /* Bare filenames stay out on purpose: `client.js` is ambiguous and the
+       directory fallback already covers it, which keeps the pack assertions above
+       meaningful. */
+    assert.equal(candidatePaths('评审 client.js 的实现', workspace).length, 0,
+      'a bare filename must not become a resolved candidate')
+    /* Traversal must stay refused. A leading `@` used to be fed in as a path
+       component, which let `join` absorb the `..` segments and land back inside
+       the workspace — containment then read a traversal as safe. */
+    for (const traversal of ['@../../etc/passwd', '@../../../windows/win.ini', '评审 ..\\..\\etc\\passwd']) {
+      assert.equal(candidatePaths(traversal, workspace).length, 0,
+        `traversal must not become a candidate: ${traversal}`)
+    }
+  }
+
+  /* Code-pack gating: a review whose only named artefact is a document must NOT
+     drag in source. `CODE_MENTION` lists `md` among its extensions and
+     `REVIEW_INTENT` fires on any review word, so a real run that asked to review a
+     Chinese Markdown plan attached 90k chars of source (24 files) from the
+     fallback directory — 17 minutes, reviewers reading mostly irrelevant code. */
+  {
+    assert.equal(documentOnlyReview('评审 docs/plan.md 的方案'), true, 'a document-only review must drop the pack')
+    assert.equal(documentOnlyReview('审查 report.pdf 的逻辑'), true, 'a PDF review must drop the pack')
+    /* Real source vocabulary keeps the pack even when a doc is also named. */
+    assert.equal(documentOnlyReview('评审 docs/plan.md 里的源码结构'), false, 'unambiguous code words keep the pack')
+    assert.equal(documentOnlyReview('核验 方案.md 的函数设计与调用链'), false, 'unambiguous code words keep the pack')
+    /* `实现` is deliberately NOT a blocker: in Chinese it usually means
+       "achieve/realise", so counting it would re-open this very false positive. */
+    assert.equal(documentOnlyReview('评审 docs/plan.md 的实现是否合理'), true,
+      '实现 must not be treated as a code signal')
+    assert.equal(documentOnlyReview('评审 docs/plan.md 与 src/app.js'), false, 'naming source keeps the pack')
+    assert.equal(documentOnlyReview('评审 README.md'), false, 'a contract doc keeps the pack')
+    assert.equal(documentOnlyReview('核验 SKILL.md 的描述'), false, 'a contract doc keeps the pack')
+    assert.equal(documentOnlyReview('评审这个项目'), false, 'naming nothing keeps the existing behaviour')
+    assert.equal(documentOnlyReview(''), false, 'an empty question changes nothing')
+  }
+  /* End to end on its own workspace: the document is attached, the source is not,
+     and the two other branches (source named, nothing named) still get the pack. */
+  {
+    const docWorkspace = join(root, 'docws')
+    await mkdir(join(docWorkspace, 'docs'), { recursive: true })
+    await mkdir(join(docWorkspace, 'src'), { recursive: true })
+    await writeFile(join(docWorkspace, 'docs', 'plan.md'), '# 方案\n\n## 总览\n\n| S0 立项 | 状态 |\n')
+    await writeFile(join(docWorkspace, 'src', 'app.js'), 'function SECRET_SOURCE_MARKER() { return 1 }\n')
+
+    const docOnly = await collectPathContext('评审对象是工作区里的 `docs/plan.md`。', 60000, docWorkspace, 60000)
+    assert.equal(docOnly.codeState, 'off', 'a document-only review must not attach a source pack')
+    assert.equal(docOnly.codeFiles, 0, 'a document-only review must attach zero code files')
+    assert.ok(docOnly.paths.some((p) => p.endsWith(join('docs', 'plan.md'))),
+      `the named document must be attached: ${JSON.stringify(docOnly.paths)}`)
+    assert.ok(docOnly.text.includes('S0 立项'), 'the attached document text must be present')
+    assert.equal(docOnly.text.includes('SECRET_SOURCE_MARKER'), false,
+      'a document-only review must not leak workspace source')
+
+    /* The DISCRIMINATING case for the veto, and the shape the real run had.
+       Naming an EXISTING file leaves `dirs` empty, so `wantsCode` is false with or
+       without the veto — an assertion built on that shape is vacuous (measured: it
+       passed after the veto was deleted). Here the named document does NOT resolve,
+       so the directory fallback fires, `dirs` becomes non-empty, and only the veto
+       keeps the source pack off. Verified by mutation. */
+    const missingDoc = await collectPathContext('评审 docs/missing-plan.md 的方案是否完整。', 60000, docWorkspace, 60000)
+    assert.equal(missingDoc.codeState, 'off',
+      'a review naming only a document must not attach a source pack, even when the directory fallback fires')
+    assert.equal(missingDoc.text.includes('SECRET_SOURCE_MARKER'), false,
+      'the directory fallback must not leak source into a document-only review')
+
+    /* Naming a source file attaches THAT file. `codeState` stays 'off' because no
+       directory was named for the pack to walk — the right signal here is that the
+       named source really is in the attachment, not which internal branch put it
+       there. */
+    const withSource = await collectPathContext('评审 `docs/plan.md` 与 `src/app.js` 是否一致', 60000, docWorkspace, 60000)
+    assert.ok(withSource.paths.some((p) => p.endsWith(join('src', 'app.js'))),
+      `a named source file must be attached: ${JSON.stringify(withSource.paths)}`)
+    assert.ok(withSource.text.includes('SECRET_SOURCE_MARKER'),
+      'a named source file must contribute its text')
+
+    const nothingNamed = await collectPathContext('评审这个项目', 60000, docWorkspace, 60000)
+    assert.equal(nothingNamed.codeState, 'ok', 'naming nothing must keep the existing workspace behaviour')
+    assert.ok(nothingNamed.text.includes('SECRET_SOURCE_MARKER'),
+      'the directory walk must still carry source for an unnamed review')
   }
 
   /* Nested project selection: an alphabetical walk spent the entry budget on
