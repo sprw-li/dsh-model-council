@@ -2,7 +2,7 @@
 
 > 仓库：<https://github.com/sprw-li/dsh-model-council>
 >
-> **Status: alpha** — 接口与行为仍可能变化，正式版等外部反馈后再定。已发布到 npm 的只有 `0.1.0`；仓库源码为 `0.2.32`（见文末「版本与发布」）。
+> **Status: alpha** — 接口与行为仍可能变化，正式版等外部反馈后再定。已发布到 npm 的只有 `0.1.0`；仓库源码为 `0.2.33`（见文末「版本与发布」）。
 
 DeepSeek Harness 的多模型理事会插件：一个入口把问题交给多个模型并行作答、匿名互评，可选主席汇总，并可把结论回投主聊天。结果常驻右侧栏 tab。
 
@@ -183,6 +183,8 @@ council_review({
 
 - 渲染在 `conversation.input.overlay`（与官方命令弹窗、斜杠菜单、反馈对话框同一个位），并按该 slot 的契约 **portal 到 `document.body`**。
 - **只读**：它不写运行状态、不投递结论、不取消运行；投递仍然只走 leader 的 stream/poll 路径。
+- **心跳（0.2.33）**：流只在状态变化时推数据，一次模型调用要几分钟——**实测 25 秒才 1 个事件**，而客户端 8 秒无消息就判流卡死。所以 Host 每 3 秒推一条**具名**事件 `event: beat`。具名是刻意的：`EventSource` 把具名事件交给 `addEventListener`、**不会**进 `onmessage`，所以只处理 `onmessage` 的客户端不可能把心跳当成快照。客户端收到 `beat` **只重排看门狗、不 publish**（它只是 liveness 信号）。
+- **看门狗超时后的分流**：leader 转轮询；**非 leader 重建只读流**——否则流被关掉、轮询又不排（轮询只有 leader 能做），那张标签页就永久变黑，卡片停在收养时的快照。实测过这个症状：卡片 `0/5 全部运行中`，而 Host 快照已是 `3/5 完成`。
 - **发现机制（0.2.32 修正）**：agent 发起的 `council_review` 只会创建 Host 侧运行，客户端原本不知道，所以浮窗挂载时会 `adoptRunningRun()` 并每 4 秒重查 `GET /council/runs`。**旧实现在两处提前 `return`（挂载时非 leader、或回调时非 leader），于是那张标签页永久失明** —— 现在定时器**恒排恒重排**，只把"发请求"这一步做 leader 门控。
   > 这不等于 0.2.16 修掉的空转缺陷：follower 只有一个本地 4s 定时器、**零 HTTP**（旧缺陷是 320ms 周期反复 fetch）。保留定时器正是 follower 接管租约后能立刻开始发现的前提。
   > **每 4 秒的持续轮询是既有行为**（旧版 leader 找不到运行时同样继续重排），本次未放宽也未收紧。
@@ -242,7 +244,7 @@ council_review({
 
 ## 安装
 
-npm 上的发布版本为 **0.1.0**（dist-tags `latest` / `alpha`）；本仓库源码版本 **0.2.32**，尚未发布到 npm——发布 0.2.x 需要新的 granular token（旧的已吊销）。
+npm 上的发布版本为 **0.1.0**（dist-tags `latest` / `alpha`）；本仓库源码版本 **0.2.33**，尚未发布到 npm——发布 0.2.x 需要新的 granular token（旧的已吊销）。
 
 ```sh
 # 从 npm
@@ -335,6 +337,6 @@ node <workspace>\tmp\push-council.mjs <本目录> sprw-li/dsh-model-council main
 ## 发布记录与后续
 
 - GitHub：<https://github.com/sprw-li/dsh-model-council>，release 有 `v0.1.0-alpha` 与 `v0.2.0`（pre-release）。
-- npm：<https://www.npmjs.com/package/dsh-model-council>（已发布 `0.1.0`；仓库源码 `0.2.32` **尚未发布**——`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
+- npm：<https://www.npmjs.com/package/dsh-model-council>（已发布 `0.1.0`；仓库源码 `0.2.33` **尚未发布**——`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
 
 发新版本：更新 `CHANGELOG.md` 与 `package.json` 版本 → `npm run verify` → commit/tag → `npm publish --tag alpha`（npm 新包首次发布会进入 staged 审核，通常几分钟内变为可安装）→ `npm pack` + `gh release create vX.Y.Z --prerelease --notes-file CHANGELOG.md <tarball>`。

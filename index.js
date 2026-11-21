@@ -40,8 +40,20 @@ const REVIEW_MAX_TOKENS = 16384
 const CHAIRMAN_MAX_TOKENS = 16384
 /** Retry budget for reasoning-only responses that burned the first one. */
 const RETRY_MAX_TOKENS = 32768
-/** One model call, not one run. */
-const CALL_TIMEOUT_MS = 300000
+/**
+ * One model call, not one run.
+ *
+ * Was 300000 (5 min). Measured on a real run: healthy seats reached
+ * time-to-first-token of 54 / 118 / 214 / 218 / 284 s on this link, so a
+ * reasoning model that then generates up to ANSWER_MAX_TOKENS routinely
+ * exceeded 5 min. The result was not a slow run but a LOST one — every seat
+ * timed out and the run ended `所有模型作答失败`.
+ *
+ * 600000 (10 min) leaves room for the measured ttft plus generation, and is
+ * still clamped by `remaining()` so one attempt can never overrun the run
+ * deadline (RUN_TIMEOUT_MS).
+ */
+const CALL_TIMEOUT_MS = 600000
 /** A subagent seat must finish startup within this bound. */
 const SEAT_START_TIMEOUT_MS = 60000
 /** A subagent seat must return a result within this bound after startup. */
@@ -60,6 +72,12 @@ const MAX_FALLBACKS_PER_RUN = 3
  *  HTTP/status context so "500 字" / "5000 tokens" / "timeoutMs" never match. */
 const TRANSIENT_FAILURE = /(\bHTTP[ _-]?429\b|\bHTTP[ _-]?5\d\d\b|\bstatus[ _:= ]*429\b|\bstatus[ _:= ]*5\d\d\b|\b429 too many\b|\b5\d\d (?:internal |bad |service |gateway |upstream )?[a-z ]*error|\bECONNRESET\b|\bECONNREFUSED\b|\bETIMEDOUT\b|\bEAI_AGAIN\b|\bEPIPE\b|\bsocket hang up\b|\brate[ -]?limit(?:ed)?\b|\boverloaded\b|\btemporarily unavailable\b|\bnetwork error\b|\bfetch failed\b|\bread tcp .*: connection reset\b)/i
 const RUN_TTL_MS = 30 * 60 * 1000
+/**
+ * SSE heartbeat interval. Must stay comfortably below the client's
+ * `STREAM_STALL_MS` (8000) so a healthy-but-quiet run is never declared dead;
+ * 3000 leaves room for two lost beats before the client gives up.
+ */
+const STREAM_BEAT_MS = 3000
 const MAX_RUNS = 16
 const MODEL_CACHE_MS = 60000
 /** Read-only Agent Preset used by subagent-backed seats. */
@@ -1826,7 +1844,29 @@ export function apply(ctx, config) {
       /* Adapter and transport failures settle as a terminal finish chunk rather
          than a throw; surfacing them keeps one failed seat from looking empty. */
       if (finish !== null && typeof finish === 'object') {
-        if (finish.kind === 'aborted') throw new Error('调用被中止或超时')
+        if (finish.kind === 'aborted') {
+          /*
+           * Two different aborts share this chunk, and treating them alike cost
+           * a whole run: measured, all five seats came back "调用被中止或超时"
+           * with ttft=0 and the run ended `error: 所有模型作答失败`. Our own
+           * CALL_TIMEOUT_MS expiry landed here, and the `throw` below made it
+           * TERMINAL — one slow provider per seat was enough to lose the run,
+           * even though `TRANSIENT_FAILURE` retries everything else.
+           *
+           * `signal.aborted` distinguishes the two: the run's own cancel signal
+           * aborts only on an explicit cancel (or the run deadline), so a plain
+           * timeout must stay retryable.
+           */
+          if (signal.aborted) throw new Error('已取消')
+          lastError = new Error(`调用超时（${Math.round(attemptTimeout / 1000)}s 内未完成）`)
+          if (attempt < 2) {
+            const backoff = Math.min(800 * (attempt + 1), remaining())
+            if (backoff <= 0) throw new Error(`整轮预算耗尽：${lastError.message}`)
+            await new Promise((resolve) => setTimeout(resolve, backoff))
+            continue
+          }
+          throw lastError
+        }
         if (finish.kind === 'error') {
           const failure = finish.failure
           const detail = failure !== null && typeof failure === 'object'
@@ -2607,7 +2647,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v63', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v64', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -2620,7 +2660,7 @@ export function apply(ctx, config) {
              human or the client can see which side is off. */
           sendJson(res, 200, {
             ok: true,
-            build: 'v63',
+            build: 'v64',
             toolEnabled: toolEnabled(liveConfig),
             panelEnabled: panelEnabled(liveConfig),
           })
@@ -2953,12 +2993,42 @@ export function apply(ctx, config) {
           listeners.set(write, () => res.end())
           const drop = () => listeners.delete(write)
           req.on('close', drop)
+          /*
+           * Heartbeat.
+           *
+           * The stream only carries state changes, so a healthy run emits
+           * NOTHING for the minutes a model call takes — measured: one event in
+           * 25 s. The client treats 8 s of silence as a stalled stream, so
+           * without a beat it declared this stream dead, closed it, and a
+           * non-leader tab then had neither a stream nor (by design) a poller:
+           * its status card froze on the snapshot taken when the run was
+           * adopted. Observed as a card stuck at "0/5, all running" while the
+           * host snapshot already had 3 seats finished.
+           *
+           * `beat` is a NAMED event on purpose: EventSource routes named events
+           * to addEventListener listeners and never to onmessage, so a client
+           * that only handles onmessage cannot mistake a beat for a snapshot.
+           * The client must treat it as liveness only — never as state.
+           */
+          const beat = setInterval(() => {
+            if (res.writableEnded === true) return
+            write(`event: beat\ndata: ${JSON.stringify({ seq: typeof run.seq === 'number' ? run.seq : 0 })}\n\n`)
+          }, STREAM_BEAT_MS)
+          /* Both endings clear it: a closed socket would otherwise keep beating
+             into a dead response for as long as the process lives. */
+          const clearBeat = () => clearInterval(beat)
+          req.on('close', clearBeat)
+          listeners.set(write, () => {
+            clearBeat()
+            res.end()
+          })
           /* Catch-up first: the current snapshot, no matter the stored seq. */
           write(`retry: 1000\n`)
           write(`id: ${typeof run.seq === 'number' ? run.seq : 0}\n`)
           write(`data: ${JSON.stringify(snapshot(run))}\n\n`)
           if (run.status !== 'running') {
             write(`event: end\ndata: ${JSON.stringify({ id: run.id, status: run.status, seq: run.seq })}\n\n`)
+            clearBeat()
             drop()
             res.end()
           }

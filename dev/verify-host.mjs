@@ -896,6 +896,60 @@ try {
     }
   }
 
+  /* SSE heartbeat.
+     The stream carries state changes only, so a healthy run emits nothing for the
+     minutes a model call takes (measured: 1 event in 25 s). The client treats 8 s
+     of silence as a dead stream, so without a beat it closed a healthy stream and
+     a non-leader tab then had neither stream nor poller — its status card froze
+     (observed: card at "0/5, all running" while the snapshot had 3 seats done). */
+  {
+    /* The interval must stay below the client's STREAM_STALL_MS with margin for
+       two lost beats. Read both sides so the pairing cannot silently drift. */
+    const hostSource = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+    const clientSource = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
+    const beat = /const STREAM_BEAT_MS = (\d+)/.exec(hostSource)
+    const stall = /const STREAM_STALL_MS = (\d+)/.exec(clientSource)
+    assert.ok(beat !== null, 'the host must declare STREAM_BEAT_MS')
+    assert.ok(stall !== null, 'the client must declare STREAM_STALL_MS')
+    const beatMs = Number(beat[1])
+    const stallMs = Number(stall[1])
+    assert.ok(beatMs * 2 < stallMs,
+      `STREAM_BEAT_MS (${beatMs}) must leave room for two lost beats below the client stall bound (${stallMs})`)
+    /* A NAMED event, so a client that only handles onmessage cannot treat a beat
+       as a snapshot. */
+    assert.ok(/event: beat\\ndata:/.test(hostSource),
+      'the heartbeat must be sent as the named event `beat`')
+    /* The interval must be cleared on both endings, or it beats into a dead
+       response for the life of the process. */
+    assert.ok(/clearInterval\(beat\)/.test(hostSource), 'the heartbeat interval must be cleared')
+  }
+
+  /* A timed-out attempt is retryable, and a cancel is not.
+     Measured: a real run had all five seats settle as `调用被中止或超时` with
+     ttft=0 and end `所有模型作答失败`. Our own CALL_TIMEOUT_MS expiry reached the
+     `aborted` branch, which threw terminally — so one slow provider per seat lost
+     the whole run even though every other transport failure is retried. */
+  {
+    const hostSource = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+    const abortedBranch = /finish\.kind === 'aborted'\) \{([\s\S]{0,1400}?)\n        \}/.exec(hostSource)
+    assert.ok(abortedBranch !== null, 'the aborted branch must exist')
+    const body = abortedBranch[1]
+    assert.ok(/signal\.aborted/.test(body),
+      'the aborted branch must distinguish a run cancel from our own timeout')
+    assert.ok(/已取消/.test(body), 'a run cancel must stay a distinct, terminal error')
+    assert.ok(/continue/.test(body),
+      'a timeout must be retried, not thrown terminally')
+    assert.ok(/调用超时/.test(body), 'a timeout must carry its own message so it is diagnosable')
+    /* The budget must exceed the measured time-to-first-token, or the retry just
+       re-times-out. 284 s was measured on this link. */
+    const call = /const CALL_TIMEOUT_MS = (\d+)/.exec(hostSource)
+    assert.ok(call !== null, 'CALL_TIMEOUT_MS must be declared')
+    assert.ok(Number(call[1]) > 284 * 1000,
+      `CALL_TIMEOUT_MS (${call[1]}) must exceed the measured 284 s time-to-first-token`)
+    assert.equal(Number(call[1]) < 30 * 60 * 1000, true,
+      'CALL_TIMEOUT_MS must stay below the run deadline')
+  }
+
   /* Portability guard. The harnesses must run unchanged on the CI runner
      (ubuntu-latest). `dev/tune-sampler.mjs` used to hardcode
      `<repo-root>`, so the sampler looked at a path that does

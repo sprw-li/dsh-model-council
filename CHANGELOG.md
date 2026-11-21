@@ -1,3 +1,57 @@
+# 0.2.33
+
+起因仍然是那张卡片：`council_review` 停在「独立作答 0/5，5 席全部运行中」，而 Host 快照已经是 **3/5 完成、3 席失败**。查下去发现三条独立缺陷——一条让**卡片冻结**，两条让**整轮失败且不可诊断**。
+
+## 1. SSE 没有心跳 → 客户端把健康流判死（卡片冻结的直接原因）
+
+- 客户端 `STREAM_STALL_MS = 8000`：8 秒没收到消息就判定流卡死。
+- 但 Host 的 `/council/run/<id>/stream` **只在状态变化时推**：**实测 25 秒只推 1 个事件**。一次模型调用要几分钟 → 流永远"安静" → 看门狗**必然误杀**。
+- 误杀后：`stopEventStream()`，然后**只在 leader 时才转轮询**。非 leader 标签页：流关了、轮询（按设计）又不排 → **永久冻结**在收养时的快照。
+- 且 `streamStalls >= 2` 之后该 run **永不再开流**，彻底降级为 320ms 轮询（正是 0.2.16 判定为空转的节奏）。
+
+修法：
+- **Host** 每 `STREAM_BEAT_MS = 3000` 推一条**具名**事件 `event: beat` + `data: {"seq":N}`；具名是刻意的——`EventSource` 把具名事件交给 `addEventListener`，**不会**进 `onmessage`，所以只处理 `onmessage` 的客户端不可能把心跳误当成快照。两端 `close` / `end` 都清 `clearInterval`，否则会对着已关闭的响应一直打拍子。
+- **Client** 收到 `beat` 只重排看门狗、**不 publish**（它只是 liveness 信号）；看门狗超时时**非 leader 重建只读流**而不是就地变黑（轮询仍然只有 leader 能做）。
+
+**实测心跳**：`+3.0s / +6.0s / +9.3s / +12.3s / +15.3s`，间隔 3.0–3.2 秒，远低于 8 秒判定线。
+
+## 2. 我们的超时是**终局失败**（丢整轮的原因）
+
+```
+if (finish.kind === 'aborted') throw new Error('调用被中止或超时')   // 直接抛
+```
+
+而 `TRANSIENT_FAILURE` **不匹配**这句文案（它只认 429/5xx/ECONNRESET/socket 等），所以**我们自己那次超时一次就废掉一个席位**。实测一次运行：5 席全部 `调用被中止或超时`、`ttft=0` → `status=error`，`error="所有模型作答失败"`。
+
+修法：用 `signal.aborted` 区分两种 abort——
+- **用户取消 / 整轮截止** → `已取消`（保持终局，这是对的）；
+- **我们自己的单次调用超时** → `调用超时（Ns 内未完成）`，按重试预算重试，而非就地抛出。
+
+## 3. `CALL_TIMEOUT_MS = 300000` 对这条链路太紧
+
+实测健康席位的 **ttft = 54 / 118 / 214 / 218 / 284 秒**；再生成到 `ANSWER_MAX_TOKENS`（16384）就很容易超过 5 分钟。改成 **600000（10 分钟）**，仍由 `remaining()` 夹住，单次尝试永远不会越过整轮截止（`RUN_TIMEOUT_MS` = 30 分钟）。
+
+## 4. 修完之后的实测：错误终于可诊断了
+
+用两个可用模型跑一次最小评审（`attachFiles:false`），完整走过 `answers → reviews → chairman`，最终失败原因是**明确的**：
+
+```
+error = "余额不足 (request_id: ...) (QUOTA)"
+作答 DeepSeek-V4.1-Flash  err=余额不足
+作答 modelA            chars=2  ← 成功
+```
+
+修复前这里只会看到不可归因的「所有模型作答失败」。**这条是本次最有价值的副产品**：失败原因从"猜测"变成"读数"。
+
+> 说明：`余额不足` 是 deepseek 账号余额问题，不是插件缺陷。要跑多模型评审需要该 provider 有余额，或改用 `providerA`/`providerB` 下的模型。
+
+## 5. 测试
+
+- `dev/verify-host.mjs`：心跳间隔必须满足 `STREAM_BEAT_MS * 2 < STREAM_STALL_MS`（跨文件读两端常量，防止悄悄漂移）；必须是具名 `beat`；`clearInterval` 必须在；`aborted` 分支必须区分 `signal.aborted`、必须含 `continue`、必须带 `调用超时` 文案；`CALL_TIMEOUT_MS` 必须大于实测 284 秒且小于整轮截止。
+- `dev/verify-client.mjs`：`beat` 只重排看门狗不 publish；非 leader 超时后重建流且**零轮询请求**；leader 超时仍转轮询；`streamStalls >= 2` 降级语义保持；follower 任何路径都不发轮询。
+- **变异测试 4 次全部 exit 1 并已还原**：超时改回终局抛出、心跳间隔调到 20000（越过客户端判定线）（我），以及 teammate 的两处（非 leader 重建流、beat 不 publish）。
+- 全套 `npm run verify` exit 0。
+
 # 0.2.32
 
 起因：一次**真实运行**（run `cmwksoahcood7z`，17 分钟）的复盘。用户截图问"这个对吗，都不冒内容"——工具卡片运行期间只有裸 JSON 输入、什么都不显示。查下去发现**四个**独立问题，全修。

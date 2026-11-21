@@ -27,6 +27,69 @@ const discoveryTimerIds = []
 /* GET /council/runs rows and the GET /council/run/run-live snapshot. */
 let discoveryRows = null
 let liveRunState = 'running'
+/* Lets one case make POST /council/run return a chosen run id (the fake host
+   only serves a live snapshot for `run-live`). */
+let nextRunId = null
+/* SSE liveness constants, read from the source like DISCOVERY_MS so a case can
+   fire the watchdog/rebuild timers without waiting the real seconds. */
+const STREAM_STALL_MS = Number((/const STREAM_STALL_MS = (\d+)/.exec(source) || [])[1])
+if (!Number.isSafeInteger(STREAM_STALL_MS) || STREAM_STALL_MS <= 0) {
+  throw new Error('STREAM_STALL_MS not found in client.js')
+}
+const STREAM_REBUILD_MAX = Number((/const STREAM_REBUILD_MAX = (\d+)/.exec(source) || [])[1])
+const STREAM_REBUILD_BASE_MS = Number((/const STREAM_REBUILD_BASE_MS = (\d+)/.exec(source) || [])[1])
+if (!Number.isSafeInteger(STREAM_REBUILD_MAX) || STREAM_REBUILD_MAX < 2) {
+  throw new Error('STREAM_REBUILD_MAX not found in client.js')
+}
+if (!Number.isSafeInteger(STREAM_REBUILD_BASE_MS) || STREAM_REBUILD_BASE_MS <= 0) {
+  throw new Error('STREAM_REBUILD_BASE_MS not found in client.js')
+}
+
+/* The client only arms its stream timers through window.setTimeout, so keeping
+   the pending callbacks here lets a case fire one deterministically instead of
+   sleeping STREAM_STALL_MS/… for real. */
+let timerSeq = 0
+const pendingTimers = new Map()
+
+/** Newest timer still armed (optionally newer than a sequence watermark). */
+function newestPendingTimer(sinceSeq = 0) {
+  return [...pendingTimers.values()]
+    .filter((timer) => timer.seq > sinceSeq)
+    .sort((left, right) => right.seq - left.seq)[0]
+}
+
+/** Fire the newest pending timer by hand; the real one is cancelled first. */
+function fireNewestPendingTimer(what, sinceSeq = 0) {
+  const timer = newestPendingTimer(sinceSeq)
+  if (timer === undefined) throw new Error(`no pending timer to fire for ${what}`)
+  pendingTimers.delete(timer.id)
+  clearTimeout(timer.id)
+  timer.fn(...timer.rest)
+  return timer
+}
+
+/* Count store publishes. The only `Object.assign({}, <state>, patch)` in
+   client.js is store.publish, so tapping Object.assign inside the plugin's
+   context lets a case assert "a beat must not publish" exactly: rendered HTML
+   cannot reveal a publish that writes identical data. The store state is
+   recognised by two of its own keys, which the other Object.assign in client.js
+   (fetch options) never has. */
+let publishCount = 0
+const objectTap = new Proxy(Object, {
+  get(target, key, receiver) {
+    if (key !== 'assign') return Reflect.get(target, key, receiver)
+    return function countingAssign(first, ...sources) {
+      const state = sources[0]
+      if (sources.length >= 2
+        && state !== null && typeof state === 'object'
+        && Object.prototype.hasOwnProperty.call(state, 'catalog')
+        && Object.prototype.hasOwnProperty.call(state, 'feedbackMode')) {
+        publishCount += 1
+      }
+      return Object.assign(first, ...sources)
+    }
+  },
+})
 
 const PACKAGE_NAME = 'dsh-model-council'
 const TAB_ID = 'dsh-model-council/panel'
@@ -198,7 +261,8 @@ const fakeWindow = {
     }
     if (url === '/council/run') {
       postCount += 1
-      const runId = `run-${postCount}`
+      const runId = nextRunId === null ? `run-${postCount}` : nextRunId
+      nextRunId = null
       return { ok: true, json: async () => ({ runId }) }
     }
     const resumeMatch = /\/council\/run\/(run-\d+)\/resume$/.exec(String(url))
@@ -229,14 +293,23 @@ const fakeWindow = {
     return { ok: true, json: async () => ({ ok: true }) }
   },
   setTimeout: (fn, ms, ...rest) => {
-    const id = setTimeout(fn, ms, ...rest)
+    timerSeq += 1
+    const seq = timerSeq
+    const id = setTimeout(() => {
+      pendingTimers.delete(id)
+      fn(...rest)
+    }, ms)
+    pendingTimers.set(id, { id, seq, ms, fn, rest })
     if (ms === DISCOVERY_MS) {
       discoveryArms += 1
       discoveryTimerIds.push(id)
     }
     return id
   },
-  clearTimeout,
+  clearTimeout: (id) => {
+    pendingTimers.delete(id)
+    clearTimeout(id)
+  },
   /* The leader election needs both; the discovery case below drives it. */
   setInterval,
   clearInterval,
@@ -318,7 +391,7 @@ const context = {
   window: fakeWindow,
   document: fakeDocument,
   console,
-  Map, Set, WeakMap, Promise, Date, Math, JSON, String, Number, Object, Array,
+  Map, Set, WeakMap, Promise, Date, Math, JSON, String, Number, Object: objectTap, Array,
   ArrayBuffer, Uint8Array, URL, AbortController, AbortSignal,
   encodeURIComponent, decodeURIComponent, setTimeout, clearTimeout,
   navigator: fakeWindow.navigator,
@@ -1171,6 +1244,306 @@ function checkboxByLabel(text) {
   const label = findNode(build(tabBody({ t })), (node) => node.type === 'label' && textOf(node.children).includes(text))
   if (label === undefined) return undefined
   return findNode(label.children, (node) => node.type === 'input')
+}
+
+/* ---- SSE liveness: host heartbeat + a follower that must never go dark ---- *
+ * Host protocol: `event: beat` / `data: {"seq":N}` every ~3s while the stream
+ * lives. The client treats it as liveness only. When a stream stalls or
+ * errors, the leader still falls back to polling; a follower owns no poller,
+ * so it must re-open the read-only stream (bounded + backed off) and never
+ * send a poll request of its own. */
+{
+  const sseInstances = []
+  const rivalIntervals = []
+  class FakeEventSource {
+    constructor(url) {
+      this.url = String(url)
+      this.readyState = 1
+      this.onmessage = null
+      this.onerror = null
+      this.closed = false
+      this.handlers = new Map()
+      sseInstances.push(this)
+    }
+    addEventListener(type, listener) {
+      const set = this.handlers.get(type) || new Set()
+      set.add(listener)
+      this.handlers.set(type, set)
+    }
+    removeEventListener(type, listener) {
+      const set = this.handlers.get(type)
+      if (set !== undefined) set.delete(listener)
+    }
+    close() {
+      this.closed = true
+      this.readyState = 2
+    }
+    /* The browser never routes a NAMED event to onmessage. Keeping that split
+       here is what makes a beat handler written against onmessage fail loudly. */
+    emit(type, payload) {
+      const event = { type, data: typeof payload === 'string' ? payload : JSON.stringify(payload) }
+      if (type === 'message' && typeof this.onmessage === 'function') this.onmessage(event)
+      const set = this.handlers.get(type)
+      if (set !== undefined) for (const listener of [...set]) listener(event)
+    }
+    fail() {
+      if (typeof this.onerror === 'function') this.onerror({ type: 'error' })
+    }
+  }
+  fakeWindow.EventSource = FakeEventSource
+
+  const latestInstance = () => sseInstances[sseInstances.length - 1]
+  /* GET /council/run/<id> only: POST /council/run and the cancel/resume verbs
+     are different URLs and must not be counted as polls. */
+  const pollRequests = () => fetchCalls.filter((call) => /^\/council\/run\/[^/]+$/.test(String(call.url))).length
+  /** The newest armed timer has to be a fresh stall watchdog. */
+  function requireWatchdog(what, sinceSeq) {
+    const timer = newestPendingTimer(sinceSeq)
+    if (timer === undefined || timer.ms !== STREAM_STALL_MS) {
+      throw new Error(`${what}: expected a fresh ${STREAM_STALL_MS}ms watchdog, got ${timer === undefined ? 'no timer' : timer.ms + 'ms'}`)
+    }
+    return timer
+  }
+  /** Start one run and return the stream watchRun opened for it. */
+  async function startWatchedRun() {
+    setQuestion('SSE 心跳测试问题')
+    const postsBefore = postCount
+    const streamsBefore = sseInstances.length
+    clickRun()
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    if (postCount !== postsBefore + 1) throw new Error('the SSE case could not start a run')
+    if (sseInstances.length !== streamsBefore + 1) {
+      throw new Error('watchRun did not open an EventSource stream for a fresh run')
+    }
+    return latestInstance()
+  }
+  /** End the run through the shipped done-frame path, so no timer outlives it. */
+  function finishStream(instance, what) {
+    instance.emit('message', Object.assign({}, LIVE_RUN, { status: 'done', stage: 'done' }))
+    if (instance.closed !== true) throw new Error(`${what}: a done frame must close the stream`)
+  }
+
+  /* Delivery off: these synthetic runs must not post back to the chat. */
+  const offRadio = findRadioByLabel(build(tabBody({ t })), '不做（只留在右侧栏）')
+  if (offRadio === undefined) throw new Error('feedback-off option is missing before the SSE cases')
+  offRadio.props.onChange()
+
+  try {
+    /* A. A beat re-arms the watchdog and publishes nothing. */
+    {
+      const stream = await startWatchedRun()
+      const beatListeners = stream.handlers.get('beat')
+      if (beatListeners === undefined || beatListeners.size === 0) {
+        throw new Error('watchRun must listen for the named "beat" event: EventSource never routes it to onmessage')
+      }
+      const watchdogBefore = requireWatchdog('fresh run', 0)
+      const publishesBefore = publishCount
+      const pollsBefore = pollRequests()
+      stream.emit('beat', { seq: 1 })
+      if (publishCount !== publishesBefore) {
+        throw new Error(`a beat is liveness only and must not publish (store.publish +${publishCount - publishesBefore})`)
+      }
+      if (stream.closed === true) throw new Error('a beat must not close the stream')
+      if (pendingTimers.has(watchdogBefore.id)) {
+        throw new Error('a beat must re-arm the watchdog instead of leaving the previous timer armed')
+      }
+      requireWatchdog('after a beat', watchdogBefore.seq)
+      if (pollRequests() !== pollsBefore) throw new Error('a beat must not trigger a poll request')
+      finishStream(stream, 'beat case')
+    }
+
+    /* Follower cases: a lexicographically smaller rival tab holds the lease. */
+    const channels = []
+    class HarnessBroadcastChannel {
+      constructor(name) {
+        this.name = name
+        this.onmessage = null
+        channels.push(this)
+      }
+      postMessage() {}
+      close() {}
+    }
+    fakeWindow.BroadcastChannel = HarnessBroadcastChannel
+    dispatchWindowEvent('pageshow', { type: 'pageshow' })
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    const channel = channels[channels.length - 1]
+    if (channel === undefined || typeof channel.onmessage !== 'function') {
+      throw new Error('the SSE cases could not open a leader-election channel')
+    }
+    const rivalClaim = { data: { leader: 'a-rival-tab', sessionId: 'session-test' } }
+    channel.onmessage(rivalClaim)
+    rivalIntervals.push(setInterval(() => channel.onmessage(rivalClaim), 400))
+
+    /* B. A follower whose watchdog fires re-opens the stream — it causes no
+          polling and does not stay dark. */
+    {
+      const stream = await startWatchedRun()
+      const pollsBefore = pollRequests()
+      const streamsBefore = sseInstances.length
+      const fired = fireNewestPendingTimer('follower stream stall')
+      if (fired.ms !== STREAM_STALL_MS) {
+        throw new Error(`the newest timer should be the ${STREAM_STALL_MS}ms watchdog, got ${fired.ms}ms`)
+      }
+      if (stream.closed !== true) throw new Error('a stalled stream must be closed before it is rebuilt')
+      if (sseInstances.length !== streamsBefore) {
+        throw new Error('a follower must wait for its backoff before re-opening the stream')
+      }
+      const rebuild = newestPendingTimer()
+      if (rebuild === undefined || rebuild.ms !== STREAM_REBUILD_BASE_MS) {
+        throw new Error(`a follower must schedule a ${STREAM_REBUILD_BASE_MS}ms stream rebuild (newest pending timer: ${rebuild === undefined ? 'none' : rebuild.ms + 'ms'})`)
+      }
+      if (pollRequests() !== pollsBefore) throw new Error('a follower must never poll: the stall path sent a request')
+      fireNewestPendingTimer('follower stream rebuild')
+      if (sseInstances.length !== streamsBefore + 1) {
+        throw new Error('a follower must re-open the stream after the backoff')
+      }
+      const rebuilt = latestInstance()
+      if (rebuilt.closed === true) throw new Error('the rebuilt follower stream closed immediately')
+      requireWatchdog('rebuilt follower stream', 0)
+      if (pollRequests() !== pollsBefore) throw new Error('a follower must never poll: the rebuild path sent a request')
+      finishStream(rebuilt, 'follower stall case')
+    }
+
+    /* C. The same for an SSE transport error (onerror). */
+    {
+      const stream = await startWatchedRun()
+      const pollsBefore = pollRequests()
+      const streamsBefore = sseInstances.length
+      stream.fail()
+      if (stream.closed !== true) throw new Error('an errored stream must be closed')
+      const rebuild = newestPendingTimer()
+      if (rebuild === undefined || rebuild.ms !== STREAM_REBUILD_BASE_MS) {
+        throw new Error('a follower must rebuild after an SSE error instead of going dark')
+      }
+      if (pollRequests() !== pollsBefore) throw new Error('a follower must never poll: the error path sent a request')
+      fireNewestPendingTimer('follower rebuild after error')
+      if (sseInstances.length !== streamsBefore + 1) {
+        throw new Error('the follower did not re-open the stream after an error')
+      }
+      finishStream(latestInstance(), 'follower error case')
+    }
+
+    /* D. Consecutive failures back off (1s → 2s), so this cannot become an
+          open→fail→open tight loop. */
+    {
+      const stream = await startWatchedRun()
+      const pollsBefore = pollRequests()
+      fireNewestPendingTimer('backoff stall 1')
+      const firstDelay = newestPendingTimer()
+      fireNewestPendingTimer('backoff rebuild 1')
+      fireNewestPendingTimer('backoff stall 2')
+      const secondDelay = newestPendingTimer()
+      if (firstDelay === undefined || firstDelay.ms !== STREAM_REBUILD_BASE_MS) {
+        throw new Error(`the first follower rebuild must wait ${STREAM_REBUILD_BASE_MS}ms, got ${firstDelay === undefined ? 'nothing' : firstDelay.ms + 'ms'}`)
+      }
+      if (secondDelay === undefined || secondDelay.ms !== STREAM_REBUILD_BASE_MS * 2) {
+        throw new Error(`the second consecutive rebuild must back off to ${STREAM_REBUILD_BASE_MS * 2}ms, got ${secondDelay === undefined ? 'nothing' : secondDelay.ms + 'ms'}`)
+      }
+      fireNewestPendingTimer('backoff rebuild 2')
+      if (stream.closed !== true) throw new Error('the first stalled stream must stay closed')
+      if (pollRequests() !== pollsBefore) throw new Error('a follower must never poll: the backoff path sent a request')
+      finishStream(latestInstance(), 'follower backoff case')
+    }
+
+    /* E. The budget caps the retries: past STREAM_REBUILD_MAX the follower
+          stops trying instead of spinning forever (0.2.16's loop had no bound). */
+    {
+      nextRunId = 'run-live'
+      liveRunState = 'running'
+      await startWatchedRun()
+      for (let attempt = 1; attempt <= STREAM_REBUILD_MAX; attempt += 1) {
+        fireNewestPendingTimer(`cap stall ${attempt}`)
+        const retry = newestPendingTimer()
+        if (retry === undefined) throw new Error(`rebuild attempt ${attempt} did not schedule a retry`)
+        fireNewestPendingTimer(`cap rebuild ${attempt}`)
+      }
+      const timersBefore = timerSeq
+      fireNewestPendingTimer('cap stall after the rebuild budget')
+      if (timerSeq !== timersBefore) {
+        throw new Error('the follower rebuild budget must cap retries: a further retry was armed past STREAM_REBUILD_MAX')
+      }
+      if (latestInstance().closed !== true) throw new Error('the exhausted stream must be closed, not left half-open')
+      /* Bounded is not the same as permanent: a fresh leader role re-attaches
+         (and with streamStalls past the limit the leader polls), so the card
+         recovers instead of freezing. */
+      for (const id of rivalIntervals) clearInterval(id)
+      rivalIntervals.length = 0
+      dispatchWindowEvent('pageshow', { type: 'pageshow' })
+      const poll = newestPendingTimer()
+      if (poll === undefined || poll.ms !== 320) {
+        throw new Error('after the rebuild budget a leader must poll (no dead end left behind)')
+      }
+      liveRunState = 'done'
+      fireNewestPendingTimer('settle poll after the rebuild budget')
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      liveRunState = 'running'
+    }
+
+    /* F. The leader keeps its existing semantics: a stalled stream becomes
+          polling. */
+    {
+      const stream = await startWatchedRun()
+      const pollsBefore = pollRequests()
+      const streamsBefore = sseInstances.length
+      fireNewestPendingTimer('leader stream stall')
+      if (stream.closed !== true) throw new Error('a stalled leader stream must be closed')
+      const poll = newestPendingTimer()
+      if (poll === undefined || poll.ms !== 320) {
+        throw new Error(`a leader must convert a stall into the 320ms poll, got ${poll === undefined ? 'nothing' : poll.ms + 'ms'}`)
+      }
+      if (sseInstances.length !== streamsBefore) throw new Error('a leader must not re-open the stream on the stall path')
+      if (pollRequests() !== pollsBefore) throw new Error('the leader poll must not have run yet')
+      fireNewestPendingTimer('leader stall poll')
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      if (pollRequests() !== pollsBefore + 1) {
+        throw new Error('the leader stall poll did not issue GET /council/run/<id>')
+      }
+    }
+
+    /* G. `streamStalls >= 2` still degrades the leader to polling for good. */
+    {
+      liveRunState = 'running'
+      nextRunId = 'run-live'
+      await startWatchedRun()
+      /* First stall: the leader polls, and a running answer re-opens the stream
+         (streamStalls is still 1). */
+      fireNewestPendingTimer('degrade stall 1')
+      fireNewestPendingTimer('degrade poll 1')
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      const healed = latestInstance()
+      if (healed.closed === true) throw new Error('the first leader poll should have re-opened the stream')
+      requireWatchdog('healed leader stream', 0)
+      const streamsBefore = sseInstances.length
+      /* Second stall: streamStalls is now 2, so polling wins for good. */
+      fireNewestPendingTimer('degrade stall 2')
+      fireNewestPendingTimer('degrade poll 2')
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      if (sseInstances.length !== streamsBefore) {
+        throw new Error('streamStalls >= 2 must keep the leader on polling instead of re-opening the stream')
+      }
+      const poll = newestPendingTimer()
+      if (poll === undefined || poll.ms !== 320) throw new Error('the degraded leader must keep its 320ms poll armed')
+      /* A done answer ends the chain. */
+      liveRunState = 'done'
+      fireNewestPendingTimer('degrade settle poll')
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      liveRunState = 'running'
+      if (sseInstances.some((instance) => instance.closed !== true)) {
+        throw new Error('an SSE case left a stream open')
+      }
+    }
+  } finally {
+    for (const id of rivalIntervals) clearInterval(id)
+    rivalIntervals.length = 0
+    delete fakeWindow.EventSource
+    liveRunState = 'running'
+    nextRunId = null
+  }
+
+  /* Restore the delivery mode these cases borrowed (silent before them). */
+  const silentRadio = findRadioByLabel(build(tabBody({ t })), '静默放进上下文')
+  if (silentRadio === undefined) throw new Error('feedback option vanished after the SSE cases')
+  silentRadio.props.onChange()
 }
 
 /* 1. "预览附件" posts /council/preview and renders the manifest in full. */

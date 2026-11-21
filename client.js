@@ -729,9 +729,26 @@ const RUN_DISCOVERY_MS = 4000
     let streamStalls = 0
     /** No SSE frame for this long while running => the stream is half-open. */
     const STREAM_STALL_MS = 8000
+    /* Follower stream rebuild. A follower owns no polling duty, so a stall or
+       an error used to end its view for good: `stopEventStream()` left no
+       channel behind and the card froze on its last snapshot. The stream is
+       read-only, so rebuilding it is safe — but it must not become an
+       open→fail→open churn. This is NOT the 0.2.16 idle loop: that one
+       re-armed a 320ms timer that sent no HTTP at all, forever. Here every
+       retry is one real SSE connection, the gap doubles up to 8s, and the
+       per-run budget is capped, so a stream that never comes back costs at
+       most STREAM_REBUILD_MAX connections and then stops. Any frame on a
+       rebuilt stream (a beat included) clears the budget again. */
+    const STREAM_REBUILD_MAX = 8
+    const STREAM_REBUILD_BASE_MS = 1000
+    const STREAM_REBUILD_MAX_DELAY_MS = 8000
+    let streamRebuildTimer = 0
+    let streamRebuilds = 0
 
     /** Preferred live channel: SSE with automatic fallback to 320ms polling. */
     function stopEventStream() {
+      /* A stream stopped on purpose must not be re-opened behind our back. */
+      cancelStreamRebuild()
       if (streamWatchdog !== 0) {
         window.clearTimeout(streamWatchdog)
         streamWatchdog = 0
@@ -746,6 +763,59 @@ const RUN_DISCOVERY_MS = 4000
       }
     }
 
+    /** Drop a pending follower re-open: the stream was stopped deliberately. */
+    function cancelStreamRebuild() {
+      if (streamRebuildTimer !== 0) {
+        window.clearTimeout(streamRebuildTimer)
+        streamRebuildTimer = 0
+      }
+    }
+
+    /**
+     * A frame (state update or beat) proves the stream is alive, so a follower
+     * that hits a later failure starts from a fresh rebuild budget. A pending
+     * retry cannot be useful once a live frame arrived on the current stream.
+     */
+    function noteStreamFrame() {
+      streamRebuilds = 0
+      cancelStreamRebuild()
+    }
+
+    /**
+     * Re-open a follower's stream after a stall or a transport error.
+     *
+     * Only the leader may convert a dead stream into polling, so a follower
+     * that just dropped its stream had no channel left at all — that is the
+     * frozen "0/5 running" card. Followers re-open the read-only stream
+     * instead, behind an exponential backoff (1s→8s) and a per-run budget
+     * (STREAM_REBUILD_MAX). The budget is the guard that keeps this from
+     * degrading into a loop: a host that never answers costs a bounded number
+     * of connection attempts, not an endless chain — which is exactly what the
+     * old 320ms follower poll→watchRun→poll cycle was.
+     */
+    function scheduleStreamRebuild(runId) {
+      if (isPollLeader() === true) return
+      if (store.state.runId !== runId || store.state.running !== true) return
+      if (streamRebuilds >= STREAM_REBUILD_MAX) return
+      streamRebuilds += 1
+      cancelStreamRebuild()
+      const delay = Math.min(
+        STREAM_REBUILD_MAX_DELAY_MS,
+        STREAM_REBUILD_BASE_MS * Math.pow(2, streamRebuilds - 1),
+      )
+      streamRebuildTimer = window.setTimeout(() => {
+        streamRebuildTimer = 0
+        if (store.state.runId !== runId || store.state.running !== true) return
+        /* The election may have handed this tab the lease while we waited. */
+        if (isPollLeader() === true) {
+          schedulePoll(runId)
+          return
+        }
+        if (eventSource !== null) return
+        watchRun(runId)
+      }, delay)
+    }
+
     /**
      * A stream that opens but never sends (dead proxy, half-open socket) fires
      * neither onmessage nor onerror, so `running` stayed true forever. This
@@ -758,8 +828,11 @@ const RUN_DISCOVERY_MS = 4000
         if (store.state.runId !== runId || store.state.running !== true) return
         streamStalls += 1
         stopEventStream()
-        /* Only the leader converts a stall into polling. */
+        /* Only the leader converts a stall into polling. A follower has no
+           poller to fall back on, so dropping the stream there means going
+           dark: it re-opens the read-only stream instead. */
         if (isPollLeader() === true) schedulePoll(runId)
+        else scheduleStreamRebuild(runId)
       }, STREAM_STALL_MS)
     }
 
@@ -770,10 +843,13 @@ const RUN_DISCOVERY_MS = 4000
         if (isPollLeader() === true) schedulePoll(runId)
         return
       }
-      /* Two stalls are enough evidence: keep this run on polling (leader only —
-         a follower that turns itself into a poller is the idle-loop bug). */
-      if (streamStalls >= 2) {
-        if (isPollLeader() === true) schedulePoll(runId)
+      /* Two stalls are enough evidence for the LEADER to give up the stream
+         and stay on polling. A follower must not be trapped here: it has no
+         poller to fall back on, so returning would leave it permanently dark
+         (exactly the frozen card this fixed). It re-opens behind
+         scheduleStreamRebuild's backoff and budget instead. */
+      if (streamStalls >= 2 && isPollLeader() === true) {
+        schedulePoll(runId)
         return
       }
       try {
@@ -788,6 +864,7 @@ const RUN_DISCOVERY_MS = 4000
       armStreamWatchdog(runId)
       eventSource.onmessage = (event) => {
         if (store.state.runId !== runId) return
+        noteStreamFrame()
         armStreamWatchdog(runId)
         let data
         try {
@@ -805,16 +882,29 @@ const RUN_DISCOVERY_MS = 4000
           }
         }
       }
+      /* Host heartbeat (`event: beat`, `data: {"seq":N}`, every ~3s while the
+         stream lives). `EventSource` never routes a NAMED event to
+         `onmessage`, so it needs an explicit listener. A beat is a liveness
+         signal only: re-arm the watchdog and touch nothing else — publishing
+         it would overwrite `run` with `{"seq":N}` and stop the run. */
+      eventSource.addEventListener('beat', () => {
+        if (store.state.runId !== runId) return
+        noteStreamFrame()
+        armStreamWatchdog(runId)
+      })
       eventSource.onerror = () => {
-        /* The stream died: fall back to polling. Count it like a stall so a
-           proxy that always blocks SSE cannot cause a 320ms open→error→poll
-           loop — after two failures this run stays on polling. Followers just
-           drop the stream; the election will hand them a poll if needed. */
+        /* The stream died: count it like a stall so a proxy that always blocks
+           SSE cannot cause a 320ms open→error→poll loop — after two failures
+           the leader stays on polling. A follower has no poller, so it
+           rebuilds the read-only stream instead of going dark. */
         streamStalls += 1
         stopEventStream()
         if (store.state.runId !== runId || store.state.running !== true) return
-        if (isPollLeader() !== true) return
-        schedulePoll(runId)
+        if (isPollLeader() === true) {
+          schedulePoll(runId)
+          return
+        }
+        scheduleStreamRebuild(runId)
       }
     }
 
@@ -837,6 +927,7 @@ const RUN_DISCOVERY_MS = 4000
         if (store.state.runId !== current.id) {
           pollFailures = 0
           streamStalls = 0
+          streamRebuilds = 0
         }
         store.publish({ runId: current.id, run: current, running: true, error: '' })
         watchRun(current.id)
@@ -985,6 +1076,7 @@ const RUN_DISCOVERY_MS = 4000
       if (cached.running === true && typeof cached.runId === 'string' && cached.runId !== '') {
         pollFailures = 0
         streamStalls = 0
+        streamRebuilds = 0
         watchRun(cached.runId)
       }
     }
@@ -1000,6 +1092,7 @@ const RUN_DISCOVERY_MS = 4000
       stopEventStream()
       pollFailures = 0
       streamStalls = 0
+      streamRebuilds = 0
       saveSessionState()
       store.publish({ sessionId })
       restoreSessionState(sessionId)
@@ -1246,6 +1339,8 @@ const RUN_DISCOVERY_MS = 4000
          failed polls must not make the next run fail on its first blip. */
       pollFailures = 0
       streamStalls = 0
+      streamRebuilds = 0
+      cancelStreamRebuild()
       store.publish({ running: true, error: '', run: null, runId: '', feedbackRunId: '', feedbackNote: '' })
       try {
         const data = await fetchJson('/council/run', {
