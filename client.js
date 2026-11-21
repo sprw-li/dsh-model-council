@@ -107,6 +107,20 @@ window.__ModuleLoader__.load({
       'toolview.result': '评审结论',
       'toolview.error': '评审失败',
       'toolview.noText': '（没有可显示的文本输出）',
+      /* Expandable seat detail (card + floating card). The Host ships only the
+         TAIL of the reasoning chain, so the window is always labelled instead
+         of being passed off as the whole chain. */
+      'seat.reasoning': '思考',
+      'seat.answer': '正文',
+      'seat.reviewer': '评审员',
+      'seat.chairman': '主席',
+      'seat.chars': '共 {count} 字',
+      'seat.window': '仅显示最近 {shown} 字（共 {total} 字）',
+      'seat.thinking': '思考中…',
+      'seat.waitingToken': '等待首个 token…（推理模型首 token 可能超过 200 秒）',
+      'seat.stageWaiting': '等待该阶段的实时内容…',
+      'seat.expand': '展开该席位的实时思考与正文',
+      'seat.collapse': '收起该席位的实时思考与正文',
       'settings.title': '理事会',
       'settings.toolEnabled': '启用内置工具 council_review',
       'settings.toolEnabledHint': '这是 agent 侧入口：关闭后模型调用 council_review 会被拒绝，并在工具结果里说明原因。',
@@ -250,6 +264,18 @@ window.__ModuleLoader__.load({
       'toolview.result': 'Conclusion',
       'toolview.error': 'Council review failed',
       'toolview.noText': '(No text output to show)',
+      /* The reasoning window is the tail of the chain, never the whole chain. */
+      'seat.reasoning': 'Reasoning',
+      'seat.answer': 'Answer',
+      'seat.reviewer': 'Reviewer',
+      'seat.chairman': 'Chairman',
+      'seat.chars': '{count} chars',
+      'seat.window': 'Latest {shown} of {total} chars only',
+      'seat.thinking': 'Thinking…',
+      'seat.waitingToken': 'Waiting for the first token… (a reasoning model can take over 200s)',
+      'seat.stageWaiting': 'Waiting for this stage to stream…',
+      'seat.expand': "Show this seat's live reasoning and answer",
+      'seat.collapse': "Hide this seat's live reasoning and answer",
       'settings.title': 'Council',
       'settings.toolEnabled': 'Enable the built-in council_review tool',
       'settings.toolEnabledHint': 'The agent-facing entry: when disabled, a model calling council_review is refused with the reason in the tool result.',
@@ -399,8 +425,8 @@ const RUN_DISCOVERY_MS = 4000
 .dsc-float-btn{flex:none;width:18px;height:18px;line-height:1;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}
 .dsc-float-btn:hover{background:var(--dsw-alias-interactive-bg-hover)}
 .dsc-float-q{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary)}
-.dsc-float-seats{display:flex;flex-direction:column;gap:4px;max-height:168px;overflow:auto}
-.dsc-float-seat{display:flex;align-items:center;gap:6px;min-width:0}
+.dsc-float-seats{display:flex;flex-direction:column;gap:6px;max-height:280px;overflow:auto}
+.dsc-float-seat{display:flex;flex-direction:column;gap:3px;min-width:0}
 .dsc-float-dot{flex:none;width:7px;height:7px;border-radius:50%;background:var(--dsw-alias-label-secondary)}
 .dsc-float-dot.is-live{background:var(--dsw-alias-brand-primary);animation:dsc-pulse 1.2s ease-in-out infinite}
 .dsc-float-dot.is-done{background:var(--dsw-alias-state-success,#2e7d32)}
@@ -433,11 +459,26 @@ const RUN_DISCOVERY_MS = 4000
 .dsc-tool-live{display:flex;flex-direction:column;gap:4px;padding-top:5px;border-top:1px solid var(--dsw-alias-border-l1)}
 .dsc-tool-live-head{display:flex;align-items:center;gap:6px;color:var(--dsw-alias-label-secondary)}
 .dsc-tool-count{flex:none;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums}
-.dsc-tool-seats{display:flex;flex-direction:column;gap:3px}
-.dsc-tool-seat{display:flex;align-items:center;gap:6px;min-width:0}
+.dsc-tool-seats{display:flex;flex-direction:column;gap:4px}
+.dsc-tool-seat{display:flex;flex-direction:column;gap:3px;min-width:0}
 .dsc-tool-seat-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dsc-tool-seat-state{flex:none;color:var(--dsw-alias-label-secondary)}
 .dsc-tool-text{max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+/* Expandable seat row + live detail, shared by the card and the floating one.
+   Collapsed rows render one line only; the 4000-char reasoning window exists
+   in the DOM only while its row is open. */
+.dsc-seat-row{display:flex;align-items:center;gap:6px;width:100%;min-width:0;padding:0;border:0;background:transparent;color:inherit;font:inherit;font-size:12px;text-align:left;cursor:pointer}
+.dsc-seat-row:focus-visible{outline:1px solid var(--dsw-alias-brand-primary);outline-offset:1px;border-radius:var(--dsw-radius-sm)}
+.dsc-seat-caret{flex:none;color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:1}
+.dsc-seat-role{flex:none;padding:0 5px;border-radius:999px;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary);font-size:10px;line-height:15px}
+.dsc-seat-detail{display:flex;flex-direction:column;gap:5px;padding:3px 0 2px}
+.dsc-seat-part-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;min-width:0}
+.dsc-seat-part{font-size:11px;font-weight:600;color:var(--dsw-alias-label-secondary)}
+.dsc-seat-chars{font-size:11px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}
+.dsc-seat-window{font-size:11px;font-style:italic;color:var(--dsw-alias-label-tertiary)}
+.dsc-seat-body{max-height:220px;overflow:auto;padding:6px 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-2,var(--dsw-alias-bg-layer-1));color:var(--dsw-alias-label-secondary);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.dsc-seat-phase{font-size:11px;color:var(--dsw-alias-brand-primary)}
+.dsc-seat-waiting{font-size:11px;color:var(--dsw-alias-label-tertiary)}
 `
 
     /* ------------------------------------------------------------------ *
@@ -494,6 +535,13 @@ const RUN_DISCOVERY_MS = 4000
         previewKey: '',
         previewError: '',
         previewLoading: false,
+        /* Which seat row is expanded on each surface that shows seats. View
+           state only: a row click publishes one of these strings so the
+           existing subscription repaints the surface, and no run field is
+           read or written. The two surfaces keep separate fields because
+           opening a seat in the card must not move the floating card. */
+        seatOpenCard: '',
+        seatOpenFloat: '',
       },
       subscribe(listener) {
         listeners.add(listener)
@@ -1466,6 +1514,287 @@ const RUN_DISCOVERY_MS = 4000
         && document.body !== undefined
     }
 
+    /* ------------------------------------------------------------------ *
+     * Seat live detail — shared by the conversation card and the floating *
+     * card, so the phase rules, the reasoning window and the follow       *
+     * behaviour cannot drift between the two surfaces.                    *
+     * ------------------------------------------------------------------ */
+
+    /* The store field that owns the one expanded seat of each surface. Two
+       surfaces must not overwrite each other's open row, so each gets its own
+       field. Both are plain view state: a click publishes one of these and
+       touches nothing else. */
+    const SEAT_OPEN_FIELD = { card: 'seatOpenCard', float: 'seatOpenFloat' }
+
+    function seatOpenFieldOf(surface) {
+      return SEAT_OPEN_FIELD[surface] !== undefined ? SEAT_OPEN_FIELD[surface] : 'seatOpenCard'
+    }
+
+    /** The seat key expanded on this surface, or '' when every row is closed. */
+    function seatOpenKeyOf(state, surface) {
+      if (state === null || typeof state !== 'object') return ''
+      const field = seatOpenFieldOf(surface)
+      return typeof state[field] === 'string' ? state[field] : ''
+    }
+
+    /**
+     * Open or close one seat row. The key lives in the shared store so the
+     * shipped subscription repaints the surface; no run field is published and
+     * no run state is read or written.
+     */
+    function toggleSeatRow(surface, key) {
+      if (typeof key !== 'string' || key === '') return
+      const field = seatOpenFieldOf(surface)
+      const open = store.state[field] === key
+      /* Re-opening a row always follows the stream again, even when the user
+         had scrolled up during the previous expansion. */
+      if (open !== true) delete seatFollowUp[seatFollowKey(surface, key)]
+      store.publish({ [field]: open === true ? '' : key })
+    }
+
+    /* Expanded bodies stay pinned to the newest token until the user scrolls
+       up. Following is read inside a callback ref and written by an onScroll
+       handler, so it is deliberately NOT React state: a scroll gesture fires
+       far too often to re-render a card for each one. */
+    const seatFollowUp = Object.create(null)
+
+    function seatFollowKey(surface, key) {
+      return `${surface}\u0000${key}`
+    }
+
+    /** True while the body should follow the stream (default: yes). */
+    function seatFollows(surface, key) {
+      return seatFollowUp[seatFollowKey(surface, key)] !== false
+    }
+
+    /** User scrolled: follow only while the body is still at its bottom. */
+    function noteSeatScroll(surface, key, element) {
+      if (element === null || typeof element !== 'object') return
+      const top = typeof element.scrollTop === 'number' ? element.scrollTop : 0
+      const view = typeof element.clientHeight === 'number' ? element.clientHeight : 0
+      const full = typeof element.scrollHeight === 'number' ? element.scrollHeight : 0
+      seatFollowUp[seatFollowKey(surface, key)] = top + view >= full - 2
+    }
+
+    /** New tokens arrived: pin the body to the bottom unless the user scrolled up. */
+    function followSeatBottom(surface, key, element) {
+      if (element === null || typeof element !== 'object') return
+      if (seatFollows(surface, key) !== true) return
+      if (typeof element.scrollHeight !== 'number') return
+      element.scrollTop = element.scrollHeight
+    }
+
+    /** The element an onScroll event happened on, total over fake events. */
+    function scrollElementOf(event) {
+      if (event === null || event === undefined || typeof event !== 'object') return null
+      if (event.currentTarget !== undefined && event.currentTarget !== null) return event.currentTarget
+      return event.target !== undefined ? event.target : null
+    }
+
+    /**
+     * The Host ships the TAIL of the reasoning chain (at most 4000 chars) plus
+     * the total length, so a shorter `reasoning` is a window, never the whole
+     * chain. `truncated` is what the row has to say out loud.
+     */
+    function seatReasoningOf(answer) {
+      const reasoning = answer !== null && typeof answer === 'object' && typeof answer.reasoning === 'string'
+        ? answer.reasoning : ''
+      const raw = answer !== null && typeof answer === 'object' ? answer.reasoningChars : undefined
+      const chars = typeof raw === 'number' && Number.isFinite(raw) && raw >= 0
+        ? Math.floor(raw) : reasoning.length
+      return { text: reasoning, chars, truncated: chars > reasoning.length }
+    }
+
+    /** The answer body of one seat. Streaming runs grow it in place. */
+    function seatAnswerTextOf(answer) {
+      return answer !== null && typeof answer === 'object' && typeof answer.text === 'string' ? answer.text : ''
+    }
+
+    function seatErrorOf(answer) {
+      return answer !== null && typeof answer === 'object' && typeof answer.error === 'string' ? answer.error : ''
+    }
+
+    /**
+     * Label of one live seat, tolerant of every row shape the Host ships:
+     * `answers[]` and `chairman` carry `name`, `reviews[]` carries `reviewer`
+     * (whatever the Host put there — a model name or an anonymous label — is
+     * rendered verbatim, never invented).
+     */
+    function seatLabel(item) {
+      if (item === null || typeof item !== 'object') return ''
+      if (typeof item.reviewer === 'string' && item.reviewer !== '') return item.reviewer
+      if (typeof item.name === 'string' && item.name !== '') return item.name
+      if (typeof item.model === 'string' && item.model !== '') return item.model
+      return ''
+    }
+
+    /** Display name for a seat row, with a positional fallback. */
+    function seatNameOf(item, index) {
+      const label = seatLabel(item)
+      return label !== '' ? label : `${index + 1}`
+    }
+
+    /** Raw identity of a seat within its stage (also the DOM `data-seat`). */
+    function seatKeyOf(item, index) {
+      return item !== null && typeof item === 'object' && typeof item.key === 'string' && item.key !== ''
+        ? item.key : `${index}`
+    }
+
+    /**
+     * Identity of one live row INCLUDING the stage it belongs to. The stage is
+     * part of the open/follow key, so a stage change cannot inherit the open
+     * row of the previous stage: the stale key matches no current row, the row
+     * simply collapses, and no render-time state write is needed.
+     */
+    function seatRowKeyOf(stage, item, index) {
+      return `${stage}\u0000${seatKeyOf(item, index)}`
+    }
+
+    /**
+     * Which live seats the current stage streams.
+     *
+     * The Host runs answers → reviews → chairman. A card that kept reading
+     * `answers` showed only finished seats throughout the reviews and chairman
+     * minutes — the exact stretch the user wants to watch — so the live seat
+     * region switches its data source with the stage. `role` names the stage
+     * for the row chip; the row label itself stays the Host's.
+     */
+    function liveSeatsOf(run) {
+      if (run === null || typeof run !== 'object') return { stage: 'answers', items: [], role: 'member' }
+      const onlyObjects = (value) => Array.isArray(value)
+        ? value.filter((item) => item !== null && typeof item === 'object') : []
+      if (run.stage === 'reviews') {
+        return { stage: 'reviews', items: onlyObjects(run.reviews), role: 'reviewer' }
+      }
+      if (run.stage === 'chairman') {
+        const chairman = run.chairman
+        return {
+          stage: 'chairman',
+          items: chairman !== null && typeof chairman === 'object' ? [chairman] : [],
+          role: 'chairman',
+        }
+      }
+      return { stage: 'answers', items: onlyObjects(run.answers), role: 'member' }
+    }
+
+    /** Row-role chip copy: '' when the stage needs no explanation. */
+    function seatRoleLabel(t, role) {
+      if (role === 'reviewer') return t('seat.reviewer')
+      if (role === 'chairman') return t('seat.chairman')
+      return ''
+    }
+
+    function seatToneClass(answer) {
+      if (seatErrorOf(answer) !== '') return ' is-error'
+      return answer !== null && typeof answer === 'object' && answer.done === true ? ' is-done' : ' is-live'
+    }
+
+    /**
+     * The seat is between its first reasoning token and its first answer token.
+     * "运行中" is not wrong there, but the user has something to read, so the
+     * row names the phase instead of looking idle.
+     */
+    function seatThinking(answer) {
+      if (answer === null || typeof answer !== 'object' || answer.done === true) return false
+      if (seatErrorOf(answer) !== '') return false
+      return seatAnswerTextOf(answer) === '' && seatReasoningOf(answer).text !== ''
+    }
+
+    /**
+     * Seat phase label for a running card (starting/running/closed/activity).
+     * Module scope because both the sidebar panel and the floating card need
+     * it; it was previously scoped inside the panel, so a floating card that
+     * rendered a live seat threw a ReferenceError.
+     */
+    function seatStatusText(t, seat) {
+      if (seat === null || typeof seat !== 'object') return t('status.streaming')
+      const seconds = typeof seat.elapsedMs === 'number' && seat.elapsedMs > 0
+        ? Math.max(1, Math.round(seat.elapsedMs / 1000))
+        : 0
+      const phase = seat.phase === 'starting'
+        ? t('status.seatStarting', { s: seconds })
+        : seat.phase === 'running'
+          ? t('status.seatRunning', { s: seconds })
+          : seat.phase === 'closed'
+            ? t('status.seatClosed')
+            : t('status.streaming')
+      const activity = typeof seat.activity === 'string' && seat.activity !== ''
+        ? t(`seat.activity.${seat.activity}`)
+        : ''
+      const waiting = typeof seat.activityMs === 'number' && seat.activityMs > 15000
+        ? ` · ${t('seat.activity.waiting')}`
+        : ''
+      if (activity === '' || activity === `seat.activity.${seat.activity}`) return `${phase}${waiting}`
+      return `${phase} · ${activity}${waiting}`
+    }
+
+    /**
+     * Expanded body of one seat: the live reasoning window, the growing answer,
+     * the phase note, the "no token yet" note and the error.
+     *
+     * Only an expanded row renders this: a collapsed row stays one line, so a
+     * 4000-char reasoning window is never laid out for every seat of a frame.
+     * Both surfaces render the identical markup (`data-surface` keeps their
+     * open/follow state apart).
+     */
+    function seatDetailNodes(t, item, surface, rowKey, domKey) {
+      const reasoning = seatReasoningOf(item)
+      const text = seatAnswerTextOf(item)
+      const error = seatErrorOf(item)
+      const done = item !== null && typeof item === 'object' && item.done === true
+      const thinking = seatThinking(item)
+      const waiting = !done && error === '' && text === '' && reasoning.text === ''
+      const nodes = []
+      if (reasoning.text !== '' || reasoning.chars > 0) {
+        nodes.push(h('div', { className: 'dsc-seat-reason', key: 'reasoning' },
+          h('div', { className: 'dsc-seat-part-head' },
+            h('span', { className: 'dsc-seat-part' }, t('seat.reasoning')),
+            h('span', { className: 'dsc-seat-chars' }, t('seat.chars', { count: reasoning.chars })),
+            reasoning.truncated
+              ? h('span', { className: 'dsc-seat-window' },
+                  t('seat.window', { shown: reasoning.text.length, total: reasoning.chars }))
+              : null,
+          ),
+          reasoning.text !== ''
+            ? h('div', {
+                className: 'dsc-seat-body',
+                'data-surface': surface,
+                'data-seat': domKey,
+                'data-part': 'reasoning',
+                ref: (element) => followSeatBottom(surface, rowKey, element),
+                onScroll: (event) => noteSeatScroll(surface, rowKey, scrollElementOf(event)),
+              }, reasoning.text)
+            : null,
+        ))
+      }
+      if (thinking) {
+        nodes.push(h('div', { className: 'dsc-seat-phase', key: 'thinking' }, t('seat.thinking')))
+      }
+      if (text !== '') {
+        nodes.push(h('div', { className: 'dsc-seat-answer', key: 'answer' },
+          h('div', { className: 'dsc-seat-part-head' },
+            h('span', { className: 'dsc-seat-part' }, t('seat.answer')),
+          ),
+          h('div', {
+            className: 'dsc-seat-body',
+            'data-surface': surface,
+            'data-seat': domKey,
+            'data-part': 'answer',
+            ref: (element) => followSeatBottom(surface, rowKey, element),
+            onScroll: (event) => noteSeatScroll(surface, rowKey, scrollElementOf(event)),
+          }, text),
+        ))
+      }
+      if (waiting) {
+        nodes.push(h('div', { className: 'dsc-seat-waiting', key: 'waiting' }, t('seat.waitingToken')))
+      }
+      if (error !== '') {
+        nodes.push(h('div', { className: 'dsc-error-box', key: 'error' }, error))
+      }
+      return nodes.length === 0 ? null
+        : h('div', { className: 'dsc-seat-detail', 'data-surface': surface, 'data-seat': domKey }, nodes)
+    }
+
     /**
      * Floating council run-status card.
      *
@@ -1482,6 +1811,9 @@ const RUN_DISCOVERY_MS = 4000
         run: snapshot.run,
         running: snapshot.running,
         runId: snapshot.runId,
+        /* Only this card's open row: expanding a row here must not move the
+           conversation card, and vice versa. */
+        seatOpenFloat: snapshot.seatOpenFloat,
       }))
       const [hidden, setHidden] = React.useState(false)
 
@@ -1501,8 +1833,12 @@ const RUN_DISCOVERY_MS = 4000
       const run = state.run
       if (hidden === true || (run === null && state.running !== true)) return null
 
-      const answers = run !== null && Array.isArray(run.answers) ? run.answers : []
-      const finished = answers.filter((answer) => answer !== null && typeof answer === 'object' && answer.done === true).length
+      /* The live seat region follows `run.stage`: answers → reviews → chairman.
+         Otherwise the card kept showing finished answers through the reviews
+         and chairman minutes. */
+      const seats = liveSeatsOf(run)
+      const finished = seats.items.filter((item) => item.done === true).length
+      const roleLabel = seatRoleLabel(t, seats.role)
       const stageNames = {
         answers: t('stage.answers'),
         reviews: t('stage.reviews'),
@@ -1524,7 +1860,7 @@ const RUN_DISCOVERY_MS = 4000
         h('div', { className: 'dsc-float-head' },
           h('span', { className: 'dsc-float-title' }, t('overlay.title')),
           h('span', { className: 'dsc-float-stage' }, `${statusText} · ${stage}`),
-          h('span', { className: 'dsc-float-count' }, `${finished}/${answers.length}`),
+          h('span', { className: 'dsc-float-count' }, `${finished}/${seats.items.length}`),
           h('button', {
             type: 'button',
             className: 'dsc-float-btn',
@@ -1536,21 +1872,39 @@ const RUN_DISCOVERY_MS = 4000
         run !== null && typeof run.question === 'string' && run.question !== ''
           ? h('div', { className: 'dsc-float-q', title: run.question }, run.question)
           : null,
-        answers.length > 0
+        seats.items.length > 0
           ? h('div', { className: 'dsc-float-seats' },
-            answers.map((answer) => {
-              const failed = typeof answer.error === 'string' && answer.error !== ''
-              const tone = failed ? ' is-error' : answer.done === true ? ' is-done' : ' is-live'
-              return h('div', { className: 'dsc-float-seat', key: answer.key },
-                h('span', { className: 'dsc-float-dot' + tone }),
-                h('span', { className: 'dsc-float-name', title: answer.model }, answer.name),
-                h('span', { className: 'dsc-float-state' },
-                  failed ? t('status.error')
-                    : answer.done === true ? t('status.done') : seatStatusText(answer.seat)),
+            seats.items.map((item, index) => {
+              const domKey = seatKeyOf(item, index)
+              const rowKey = seatRowKeyOf(seats.stage, item, index)
+              const open = seatOpenKeyOf(state, 'float') === rowKey
+              const name = seatNameOf(item, index)
+              const failed = seatErrorOf(item) !== ''
+              return h('div', { className: 'dsc-float-seat' + (open === true ? ' is-open' : ''), key: rowKey },
+                h('button', {
+                  type: 'button',
+                  className: 'dsc-seat-row',
+                  'aria-expanded': open === true ? 'true' : 'false',
+                  'aria-label': open === true ? t('seat.collapse') : t('seat.expand'),
+                  title: open === true ? t('seat.collapse') : t('seat.expand'),
+                  onClick: () => toggleSeatRow('float', rowKey),
+                },
+                  h('span', { className: 'dsc-float-dot' + seatToneClass(item) }),
+                  roleLabel !== '' ? h('span', { className: 'dsc-seat-role' }, roleLabel) : null,
+                  h('span', { className: 'dsc-float-name', title: name }, name),
+                  h('span', { className: 'dsc-float-state' },
+                    failed ? t('status.error')
+                      : seatThinking(item) ? t('seat.thinking')
+                        : item.done === true ? t('status.done') : seatStatusText(t, item.seat)),
+                  h('span', { className: 'dsc-seat-caret', 'aria-hidden': true }, open === true ? '▾' : '▸'),
+                ),
+                /* Collapsed rows render one line: the long reasoning window is
+                   only mounted for the row the user opened. */
+                open === true ? seatDetailNodes(t, item, 'float', rowKey, domKey) : null,
               )
             }),
           )
-          : null,
+          : h('div', { className: 'dsc-seat-waiting' }, t('seat.stageWaiting')),
         run !== null && typeof run.error === 'string' && run.error !== ''
           ? h('div', { className: 'dsc-float-error' }, run.error)
           : null,
@@ -2025,28 +2379,8 @@ const RUN_DISCOVERY_MS = 4000
         return ttft === '' ? t('metrics.total', { total }) : t('metrics.both', { ttft, total })
       }
 
-      /** Seat phase label for a running card (starting/running/closed). */
-      function seatStatusText(seat) {
-        if (seat === null || typeof seat !== 'object') return t('status.streaming')
-        const seconds = typeof seat.elapsedMs === 'number' && seat.elapsedMs > 0
-          ? Math.max(1, Math.round(seat.elapsedMs / 1000))
-          : 0
-        const phase = seat.phase === 'starting'
-          ? t('status.seatStarting', { s: seconds })
-          : seat.phase === 'running'
-            ? t('status.seatRunning', { s: seconds })
-            : seat.phase === 'closed'
-              ? t('status.seatClosed')
-              : t('status.streaming')
-        const activity = typeof seat.activity === 'string' && seat.activity !== ''
-          ? t(`seat.activity.${seat.activity}`)
-          : ''
-        const waiting = typeof seat.activityMs === 'number' && seat.activityMs > 15000
-          ? ` · ${t('seat.activity.waiting')}`
-          : ''
-        if (activity === '' || activity === `seat.activity.${seat.activity}`) return `${phase}${waiting}`
-        return `${phase} · ${activity}${waiting}`
-      }
+      /* Seat phase labels come from the module-scope helper: the floating card
+         renders the same seats and used to call a name it could not see. */
       const participants = state.selected.length
       /* Answers + peer reviews per model, plus the chairman. Delivery is NOT a
          model call: `silent` injects the conclusion as context (no provider
@@ -2337,7 +2671,7 @@ const RUN_DISCOVERY_MS = 4000
                             ? (answer.seat !== null && typeof answer.seat === 'object' && answer.seat.fallback === true
                                 ? t('status.fallback')
                                 : t('status.done'))
-                            : seatStatusText(answer.seat)),
+                            : seatStatusText(t, answer.seat)),
                         answer.done === true && seatMetrics(answer.seat) !== ''
                           ? h('span', { className: 'dsc-metrics', title: t('metrics.hint') }, seatMetrics(answer.seat))
                           : null,
@@ -2359,7 +2693,7 @@ const RUN_DISCOVERY_MS = 4000
                             h('div', { className: 'dsc-card-head' },
                               h('span', { className: 'dsc-card-title' }, review.reviewer),
                               h('span', { className: 'dsc-badge' },
-                                review.error !== '' ? t('status.error') : review.done ? t('status.done') : seatStatusText(review.seat)),
+                                review.error !== '' ? t('status.error') : review.done ? t('status.done') : seatStatusText(t, review.seat)),
                             ),
                             review.error !== ''
                               ? h('div', { className: 'dsc-error-box' }, review.error)
@@ -2463,6 +2797,10 @@ const RUN_DISCOVERY_MS = 4000
         run: snapshot.run,
         running: snapshot.running,
         runId: snapshot.runId,
+        /* Which live seat row is open on THIS card. View state only: the
+           shipped store subscription repaints the card, run fields are not
+           touched, and the floating card keeps its own open row. */
+        seatOpenCard: snapshot.seatOpenCard,
       }))
       const [expanded, setExpanded] = React.useState(false)
 
@@ -2520,11 +2858,12 @@ const RUN_DISCOVERY_MS = 4000
 
       const run = live.run
       const liveVisible = live.running === true && run !== null && typeof run === 'object'
-      const answers = liveVisible && Array.isArray(run.answers)
-        ? run.answers.filter((answer) => answer !== null && typeof answer === 'object')
-        : []
-      const finished = answers.filter((answer) => answer.done === true).length
-      const failed = answers.filter((answer) => typeof answer.error === 'string' && answer.error !== '').length
+      /* The live seat region follows `run.stage`, so the reviews and chairman
+         minutes stream too instead of leaving only finished answers on screen. */
+      const seats = liveVisible ? liveSeatsOf(run) : { stage: 'answers', items: [], role: 'member' }
+      const finished = seats.items.filter((item) => item.done === true).length
+      const failed = seats.items.filter((item) => seatErrorOf(item) !== '').length
+      const roleLabel = seatRoleLabel(t, seats.role)
       const stageNames = {
         answers: t('stage.answers'),
         reviews: t('stage.reviews'),
@@ -2568,32 +2907,47 @@ const RUN_DISCOVERY_MS = 4000
               h('div', { className: 'dsc-tool-live-head' },
                 h('span', { className: 'dsc-spinner', 'aria-hidden': true }),
                 h('span', null, t('toolview.progress', { stage })),
-                h('span', { className: 'dsc-tool-count' }, `${finished}/${answers.length}`),
+                h('span', { className: 'dsc-tool-count' }, `${finished}/${seats.items.length}`),
               ),
               failed > 0
-                ? h('div', { className: 'dsc-warn' }, t('toolview.failedSeats', { failed, total: answers.length }))
+                ? h('div', { className: 'dsc-warn' }, t('toolview.failedSeats', { failed, total: seats.items.length }))
                 : null,
-              answers.length > 0
+              seats.items.length > 0
                 ? h('div', { className: 'dsc-tool-seats' },
-                    answers.map((answer, index) => {
-                      const seatFailed = typeof answer.error === 'string' && answer.error !== ''
-                      const tone = seatFailed ? ' is-error' : answer.done === true ? ' is-done' : ' is-live'
-                      const name = typeof answer.name === 'string' && answer.name !== ''
-                        ? answer.name
-                        : typeof answer.model === 'string' && answer.model !== '' ? answer.model : `${index + 1}`
+                    seats.items.map((item, index) => {
+                      const domKey = seatKeyOf(item, index)
+                      const rowKey = seatRowKeyOf(seats.stage, item, index)
+                      const open = seatOpenKeyOf(live, 'card') === rowKey
+                      const name = seatNameOf(item, index)
                       return h('div', {
-                        className: 'dsc-tool-seat',
-                        key: typeof answer.key === 'string' && answer.key !== '' ? answer.key : `${index}`,
+                        className: 'dsc-tool-seat' + (open === true ? ' is-open' : ''),
+                        key: rowKey,
                       },
-                        h('span', { className: 'dsc-float-dot' + tone }),
-                        h('span', { className: 'dsc-tool-seat-name', title: name }, name),
-                        h('span', { className: 'dsc-tool-seat-state' },
-                          seatFailed ? t('toolview.seatFailed')
-                            : answer.done === true ? t('toolview.seatDone') : t('toolview.seatRunning')),
+                        h('button', {
+                          type: 'button',
+                          className: 'dsc-seat-row',
+                          'aria-expanded': open === true ? 'true' : 'false',
+                          'aria-label': open === true ? t('seat.collapse') : t('seat.expand'),
+                          title: open === true ? t('seat.collapse') : t('seat.expand'),
+                          onClick: () => toggleSeatRow('card', rowKey),
+                        },
+                          h('span', { className: 'dsc-float-dot' + seatToneClass(item) }),
+                          roleLabel !== '' ? h('span', { className: 'dsc-seat-role' }, roleLabel) : null,
+                          h('span', { className: 'dsc-tool-seat-name', title: name }, name),
+                          h('span', { className: 'dsc-tool-seat-state' },
+                            seatErrorOf(item) !== '' ? t('toolview.seatFailed')
+                              : seatThinking(item) ? t('seat.thinking')
+                                : item.done === true ? t('toolview.seatDone') : t('toolview.seatRunning')),
+                          h('span', { className: 'dsc-seat-caret', 'aria-hidden': true }, open === true ? '▾' : '▸'),
+                        ),
+                        /* The live reasoning/answer body exists only while this
+                           row is open: a collapsed seat is one line, never a
+                           4000-char window. */
+                        open === true ? seatDetailNodes(t, item, 'card', rowKey, domKey) : null,
                       )
                     }),
                   )
-                : null,
+                : h('div', { className: 'dsc-seat-waiting' }, t('seat.stageWaiting')),
             )
           : null,
       )

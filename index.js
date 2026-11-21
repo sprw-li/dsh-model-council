@@ -78,6 +78,23 @@ const RUN_TTL_MS = 30 * 60 * 1000
  * 3000 leaves room for two lost beats before the client gives up.
  */
 const STREAM_BEAT_MS = 3000
+
+/**
+ * How much of a seat's live reasoning the snapshot carries.
+ *
+ * The provider streams `reasoning-delta` chunks (chain-of-thought), and the whole
+ * trace can be tens of kilobytes. Snapshots are republished on every throttled
+ * stream tick and every SSE frame carries the full snapshot, so shipping all of
+ * it would multiply wire cost by the reasoning length. A tail window is what an
+ * expanded card actually needs: it shows the model thinking *now*.
+ */
+const REASONING_TAIL = 4000
+
+/** Last REASONING_TAIL chars of a live reasoning trace. */
+function reasoningTail(reasoning) {
+  if (typeof reasoning !== 'string' || reasoning === '') return ''
+  return reasoning.length <= REASONING_TAIL ? reasoning : reasoning.slice(-REASONING_TAIL)
+}
 const MAX_RUNS = 16
 const MODEL_CACHE_MS = 60000
 /** Read-only Agent Preset used by subagent-backed seats. */
@@ -819,12 +836,50 @@ async function collectSourceFiles(root, hints = []) {
     }
   }
   await walk(root, 1)
-  const score = (file) => {
+  /*
+   * Rank candidate files by how many of the question's hints their CONTENT
+   * matches, then by depth, then by size.
+   *
+   * This used to score `file.path` only. A path almost never contains the
+   * question's identifiers (`callModel`, `deadlineWall`), so every file scored 0
+   * and the tie-break (`b.size - a.size`) handed the primary slot — and with it
+   * 80% of the character budget — to the LARGEST file in the tree. Measured: for
+   * an acceptance question naming four `index.js` symbols, `client.js` (3 hint
+   * hits) took the primary budget while `index.js` (8 hits) was cut to
+   * CODE_FILE_CHARS, which pushed the `deadlineWall` handler out of the pack.
+   * The comment further down already claimed "the file with the most hint hits is
+   * the review's subject"; now it is true.
+   *
+   * Content scoring is bounded: only the first SCORE_SCAN_FILES candidates are
+   * read, so a large tree cannot turn this into a full-tree read.
+   */
+  const SCORE_SCAN_FILES = 40
+  const pathScore = (file) => {
     const lower = file.path.toLowerCase()
     let hits = 0
     for (const hint of hints) if (lower.includes(hint)) hits += 1
     return hits
   }
+  const contentHits = new Map()
+  const scanned = [...found]
+    .sort((a, b) => pathScore(b) - pathScore(a) || a.depth - b.depth || b.size - a.size)
+    .slice(0, SCORE_SCAN_FILES)
+  if (hints.length > 0) {
+    await runLimited(scanned, 8, async (file) => {
+      let hits = 0
+      try {
+        const text = await readTextFile(file.path, 200 * 1024)
+        if (text !== '') {
+          const lower = text.toLowerCase()
+          for (const hint of hints) if (lower.includes(hint)) hits += 1
+        }
+      } catch {
+        /* unreadable/binary: fall back to the path score */
+      }
+      contentHits.set(file.path, hits)
+    })
+  }
+  const score = (file) => (contentHits.get(file.path) ?? 0) + pathScore(file)
   found.sort((a, b) => score(b) - score(a) || a.depth - b.depth || b.size - a.size)
   return found
 }
@@ -963,7 +1018,7 @@ async function readCodeSegments(path, budget, hints = []) {
             const from = Math.max(0, index - 3)
             const to = Math.min(totalLines, index + 12)
             if (!regions.some((region) => from >= region.from && to <= region.to)) {
-              regions.push({ from, to, share: 1600, named: true })
+              regions.push({ from, to, share: 1600, named: true, hint, windowIndex: 0 })
             }
             break
           }
@@ -983,10 +1038,20 @@ async function readCodeSegments(path, budget, hints = []) {
           const line = (lines[index] || '').toLowerCase()
           if (!line.includes(hint)) continue
           if (shadowed.some((other) => line.includes(other))) continue
+          /*
+           * A COMMENT that merely names the symbol is not where the symbol is
+           * implemented. Measured: a doc comment mentioning `deadlineWall` won
+           * this hint's first window, so the window opened on the comment and the
+           * real `const deadlineWall = new Promise(...)` never entered the pack —
+           * the acceptance gate then reported the wall as missing while the code
+           * was right there. Prefer lines that look like code.
+           */
+          const trimmed = (lines[index] || '').trimStart()
+          if (trimmed.startsWith('*') || trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('--')) continue
           const from = Math.max(0, index - 3)
           const to = Math.min(totalLines, index + 8)
           if (regions.some((region) => from >= region.from && to <= region.to)) continue
-          regions.push({ from, to, share: 1200, named: true })
+          regions.push({ from, to, share: 1200, named: true, hint, windowIndex: windows })
           windows += 1
         }
       }
@@ -1031,7 +1096,57 @@ async function readCodeSegments(path, budget, hints = []) {
     if (region.named === true) return 1
     return 2
   }
-  const ordered = [...regions].sort((a, b) => regionRank(a) - regionRank(b))
+  /*
+   * Within the named windows, spend the FIRST window of every hint before any
+   * hint's second window.
+   *
+   * The clamp at the end of the pack cuts the tail, and named windows used to be
+   * ordered purely by the order hints appeared in the question. So the LAST hint
+   * was the first casualty once a file grew: measured, a question naming
+   * `deadlineWall` last lost that window entirely after index.js grew by ~60
+   * lines, and the acceptance gate reported the wall as missing while the code
+   * was right there. A hint the reviewer explicitly named must never lose to a
+   * second window of another hint.
+   */
+  const hintOrder = new Map()
+  for (const region of regions) {
+    if (typeof region.hint === 'string' && !hintOrder.has(region.hint)) hintOrder.set(region.hint, hintOrder.size)
+  }
+  const ordered = [...regions].sort((a, b) => {
+    const rank = regionRank(a) - regionRank(b)
+    if (rank !== 0) return rank
+    /* Only named windows reach here with hint metadata; keep insertion order
+       otherwise so behaviour is unchanged for the broad clusters. */
+    if (a.named === true && b.named === true) {
+      const windowDelta = (a.windowIndex ?? 0) - (b.windowIndex ?? 0)
+      if (windowDelta !== 0) return windowDelta
+      const hintDelta = (hintOrder.get(a.hint) ?? 0) - (hintOrder.get(b.hint) ?? 0)
+      if (hintDelta !== 0) return hintDelta
+    }
+    return 0
+  })
+  /*
+   * Fair budget for the windows the question explicitly named.
+   *
+   * The final clamp is a plain character slice, so whatever sits past `budget`
+   * simply vanishes. With ~20 named windows at 1200 chars the file budget could
+   * not hold them all, and the LAST hint in the question lost its window
+   * entirely — measured: `deadlineWall` (named last) disappeared from the pack,
+   * so the acceptance gate reported the wall as missing while it was right
+   * there. Presence beats depth for a named identifier: shrink every hint's
+   * first window until all of them fit, then let the extras be clamped.
+   */
+  {
+    const defChars = [...regions]
+      .filter((region) => region.share === Number.MAX_SAFE_INTEGER)
+      .reduce((sum, region) => sum + lines.slice(region.from, region.to).join('\n').length + 80, 0)
+    const windowBudget = Math.max(1500, budget - head.length - defChars)
+    const firstWindows = ordered.filter((region) => region.named === true && (region.windowIndex ?? 0) === 0)
+    if (firstWindows.length > 0) {
+      const fairShare = Math.max(400, Math.floor((windowBudget * 0.85) / firstWindows.length))
+      for (const region of firstWindows) region.share = Math.min(region.share, fairShare)
+    }
+  }
   const regionTexts = []
   for (const region of ordered) {
     const text = lines.slice(region.from, region.to).join('\n')
@@ -1779,7 +1894,7 @@ export function apply(ctx, config) {
    * clamped to the remaining time, and a retry that cannot fit is refused, so
    * retries can never eat the whole run behind the watchdog's back.
    */
-  async function callModel(route, system, userText, maxTokens, signal, onDelta, seat, deadlineAt) {
+  async function callModel(route, system, userText, maxTokens, signal, onDelta, seat, deadlineAt, onReasoning) {
     if (seat !== undefined && seat !== null && typeof seat.startedAt !== 'number') {
       seat.startedAt = Date.now()
       seat.phase = 'running'
@@ -1787,6 +1902,13 @@ export function apply(ctx, config) {
     const report = (text) => {
       if (seat !== undefined && seat !== null && typeof seat.ttftAt !== 'number') seat.ttftAt = Date.now()
       if (typeof onDelta === 'function') onDelta(text)
+    }
+    /* Chain-of-thought is a separate chunk stream; it arrives BEFORE any
+       `text-delta`, so without this the card sits on a status dot through the
+       entire thinking phase — which on this link can be 200+ seconds. */
+    const reportReasoning = (reasoning) => {
+      if (seat !== undefined && seat !== null && typeof seat.ttftAt !== 'number') seat.ttftAt = Date.now()
+      if (typeof onReasoning === 'function') onReasoning(reasoning)
     }
     /** Remaining ms until the run deadline, or Infinity without one. */
     const remaining = () => (typeof deadlineAt === 'number' ? Math.max(0, deadlineAt - Date.now()) : Infinity)
@@ -1800,24 +1922,28 @@ export function apply(ctx, config) {
       const timeout = AbortSignal.timeout(attemptTimeout)
       const combined = typeof AbortSignal.any === 'function' ? AbortSignal.any([signal, timeout]) : timeout
       let text = ''
-      let finish
-      let thrown
-      try {
-        await withProviderSlot(route.provider, signal, async () => {
-          const stream = ctx.llm.stream({
-            provider: route.provider,
-            model: route.model,
-            system,
-            messages: [{ role: 'user', content: [{ type: 'text', text: userText }] }],
-            maxTokens: budget,
-            signal: combined,
-          })
-          for await (const chunk of stream) {
-            if (chunk === null || typeof chunk !== 'object') continue
-            if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
-              text += chunk.text
-              report(text)
-            } else if (chunk.type === 'block-end' && text === '' && chunk.block !== null && typeof chunk.block === 'object') {
+          let reasoning = ''
+          let finish
+          let thrown
+          try {
+            await withProviderSlot(route.provider, signal, async () => {
+              const stream = ctx.llm.stream({
+                provider: route.provider,
+                model: route.model,
+                system,
+                messages: [{ role: 'user', content: [{ type: 'text', text: userText }] }],
+                maxTokens: budget,
+                signal: combined,
+              })
+              for await (const chunk of stream) {
+                if (chunk === null || typeof chunk !== 'object') continue
+                if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
+                  text += chunk.text
+                  report(text)
+                } else if (chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') {
+                  reasoning += chunk.text
+                  reportReasoning(reasoning)
+                } else if (chunk.type === 'block-end' && text === '' && chunk.block !== null && typeof chunk.block === 'object') {
               if (chunk.block.type === 'text' && typeof chunk.block.text === 'string') {
                 text = chunk.block.text
                 report(text)
@@ -1962,6 +2088,10 @@ export function apply(ctx, config) {
         model: answer.model,
         name: answer.name,
         text: answer.text,
+        /* Live reasoning tail, so an expanded card can show the model thinking
+           instead of only a status dot. Bounded on purpose: see REASONING_TAIL. */
+        reasoning: reasoningTail(answer.reasoning),
+        reasoningChars: typeof answer.reasoningChars === 'number' ? answer.reasoningChars : 0,
         done: answer.done,
         error: answer.error,
         seat: summarizeSeat(answer.seat),
@@ -1970,6 +2100,8 @@ export function apply(ctx, config) {
         key: review.key,
         reviewer: review.reviewer,
         text: review.text,
+        reasoning: reasoningTail(review.reasoning),
+        reasoningChars: typeof review.reasoningChars === 'number' ? review.reasoningChars : 0,
         done: review.done,
         error: review.error,
         seat: summarizeSeat(review.seat),
@@ -1980,6 +2112,8 @@ export function apply(ctx, config) {
         model: run.chairman.model,
         name: run.chairman.name,
         text: run.chairman.text,
+        reasoning: reasoningTail(run.chairman.reasoning),
+        reasoningChars: typeof run.chairman.reasoningChars === 'number' ? run.chairman.reasoningChars : 0,
         done: run.chairman.done,
         error: run.chairman.error,
         seat: summarizeSeat(run.chairman.seat),
@@ -2215,12 +2349,12 @@ export function apply(ctx, config) {
      * the fast raw path so a six-model run cannot spend a whole subagent turn
      * per reviewer.
      */
-    const invokeAnswer = async (route, system, prompt, maxTokens, onDelta, seat) => {
+    const invokeAnswer = async (route, system, prompt, maxTokens, onDelta, seat, onReasoning) => {
       if (!useSubagentSeats || subagentSeatCount >= subagentSeatLimit) {
         if (useSubagentSeats && subagentSeatCount >= subagentSeatLimit && seat !== undefined && seat !== null) {
           seat.phase = 'fast'
         }
-        return callModel(route, system, prompt, maxTokens, signal, onDelta, seat, deadlineAt)
+        return callModel(route, system, prompt, maxTokens, signal, onDelta, seat, deadlineAt, onReasoning)
       }
       subagentSeatCount += 1
       try {
@@ -2236,7 +2370,7 @@ export function apply(ctx, config) {
           seat.fallback = true
           seat.fallbackFrom = 'subagent'
         }
-        return callModel(route, system, prompt, maxTokens, signal, onDelta, seat, deadlineAt)
+        return callModel(route, system, prompt, maxTokens, signal, onDelta, seat, deadlineAt, onReasoning)
       }
     }
     const concurrency = useSubagentSeats ? SEAT_CONCURRENCY : run.answers.length
@@ -2249,7 +2383,11 @@ export function apply(ctx, config) {
           answer.text = await invokeAnswer(routes[answer.key], ANSWER_SYSTEM, questionBlock, ANSWER_MAX_TOKENS, (text) => {
             answer.text = text
             scheduleRunStreamTick(run)
-          }, answer.seat)
+          }, answer.seat, (reasoning) => {
+            answer.reasoning = reasoning
+            answer.reasoningChars = reasoning.length
+            scheduleRunStreamTick(run)
+          })
         } catch (error) {
           answer.error = errorText(error)
         }
@@ -2288,7 +2426,11 @@ export function apply(ctx, config) {
           review.text = await callModel(routes[review.key], REVIEW_SYSTEM, reviewPrompt, REVIEW_MAX_TOKENS, signal, (text) => {
             review.text = text
             scheduleRunStreamTick(run)
-          }, review.seat, deadlineAt)
+          }, review.seat, deadlineAt, (reasoning) => {
+            review.reasoning = reasoning
+            review.reasoningChars = reasoning.length
+            scheduleRunStreamTick(run)
+          })
         } catch (error) {
           review.error = errorText(error)
         }
@@ -2332,9 +2474,15 @@ export function apply(ctx, config) {
         signal,
         (text) => {
           run.chairman.text = text
+          scheduleRunStreamTick(run)
         },
         run.chairman.seat,
         deadlineAt,
+        (reasoning) => {
+          run.chairman.reasoning = reasoning
+          run.chairman.reasoningChars = reasoning.length
+          scheduleRunStreamTick(run)
+        },
       )
       run.chairman.done = true
       run.stage = 'done'
@@ -2647,7 +2795,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v65', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v66', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -2662,7 +2810,7 @@ export function apply(ctx, config) {
           for (const run of runs.values()) if (run.status === 'running') runningCount += 1
           sendJson(res, 200, {
             ok: true,
-            build: 'v65',
+            build: 'v66',
             toolEnabled: toolEnabled(liveConfig),
             panelEnabled: panelEnabled(liveConfig),
             /*
@@ -3163,6 +3311,7 @@ export {
   isPathInside,
   looksLikeDeliberatePath,
   readTextFile,
+  reasoningTail,
   runLimited,
   withTimeout,
 }

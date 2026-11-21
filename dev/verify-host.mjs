@@ -16,7 +16,7 @@ import { existsSync, readFileSync } from 'node:fs'
    `npm install --no-save --no-package-lock @deepseek-ai/schemastery` — the DSH
    installation also routes a linked plugin's declared peerDependencies, but a plain
    `node dev/verify-host.mjs` has no such router. */
-import { TRANSIENT_FAILURE, SEAT_RESULT_TIMEOUT_MS, SEAT_START_TIMEOUT_MS, PROVIDER_CONCURRENCY, MAX_FALLBACKS_PER_RUN, RUN_TIMEOUT_MS, CODE_FILE_CHARS, CODE_MAX_CHARS, CODE_WALK_ENTRIES, looksLikeDeliberatePath, collectSourceFiles, defaultRoutesFromCatalog, candidatePaths, collectCodeContext, collectPathContext, documentOnlyReview, isPathInside, readTextFile, runLimited, withTimeout, apply, Config, toolEnabled, panelEnabled, parseRouteSpec, resolveConfiguredRoutes, selectCouncilRoutes, pickChairmanRoute, readSetting } from '../index.js'
+import { TRANSIENT_FAILURE, SEAT_RESULT_TIMEOUT_MS, SEAT_START_TIMEOUT_MS, PROVIDER_CONCURRENCY, MAX_FALLBACKS_PER_RUN, RUN_TIMEOUT_MS, CODE_FILE_CHARS, CODE_MAX_CHARS, CODE_WALK_ENTRIES, looksLikeDeliberatePath, reasoningTail, collectSourceFiles, defaultRoutesFromCatalog, candidatePaths, collectCodeContext, collectPathContext, documentOnlyReview, isPathInside, readTextFile, runLimited, withTimeout, apply, Config, toolEnabled, panelEnabled, parseRouteSpec, resolveConfiguredRoutes, selectCouncilRoutes, pickChairmanRoute, readSetting } from '../index.js'
 
 const root = await mkdtemp(join(tmpdir(), 'council-host-'))
 try {
@@ -970,6 +970,43 @@ try {
      reload?" answerable before the fact.
      (The live probe assertion sits in the fake-host block above, where `http` and
      `previewHost` are in scope.) */
+
+  /* Live reasoning must reach the snapshot.
+     The provider streams chain-of-thought as its own `reasoning-delta` chunk
+     stream, which arrives BEFORE any `text-delta`. It was dropped entirely, so an
+     expanded card could only show a status dot through the whole thinking phase —
+     measured at 200+ s on this link. */
+  {
+    const hostSource = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+    assert.ok(/chunk\.type === 'reasoning-delta'/.test(hostSource),
+      'the stream loop must consume reasoning-delta chunks')
+    assert.ok(/reportReasoning\(reasoning\)/.test(hostSource),
+      'a reasoning delta must be reported (so it can be streamed live)')
+    /* Bounded on purpose: SSE frames carry the whole snapshot and are republished
+       on every tick, so shipping the full trace would multiply wire cost by the
+       reasoning length. */
+    const tail = /const REASONING_TAIL = (\d+)/.exec(hostSource)
+    assert.ok(tail !== null, 'REASONING_TAIL must be declared')
+    assert.ok(Number(tail[1]) > 0 && Number(tail[1]) <= 20000,
+      `REASONING_TAIL (${tail[1]}) must be a bounded window`)
+    /* The snapshot must expose both the tail and the true total, so a client can
+       tell "short trace" from "truncated trace" instead of claiming full text. */
+    for (const field of ['reasoning: reasoningTail(', 'reasoningChars:']) {
+      assert.ok(hostSource.includes(field),
+        `the snapshot must expose ${field.trim()} for answers, reviews and the chairman`)
+    }
+    /* Answers, reviews and the chairman each accumulate their own trace. */
+    assert.equal((hostSource.match(/reasoningChars = reasoning\.length/g) || []).length >= 3, true,
+      'answers, reviews and the chairman must each record reasoningChars')
+    /* The tail helper must actually bound the value. */
+    for (const [input, expected] of [['', 0], ['abc', 3]]) {
+      assert.equal(typeof reasoningTail(input), 'string', 'reasoningTail must return a string')
+      assert.equal(reasoningTail(input).length, expected, `reasoningTail(${JSON.stringify(input)}) length`)
+    }
+    const long = 'x'.repeat(Number(tail[1]) + 500)
+    assert.equal(reasoningTail(long).length, Number(tail[1]), 'reasoningTail must clamp to REASONING_TAIL')
+    assert.equal(reasoningTail(long).endsWith('x'), true, 'reasoningTail must keep the newest text')
+  }
 
   /* Portability guard. The harnesses must run unchanged on the CI runner
      (ubuntu-latest). `dev/tune-sampler.mjs` used to hardcode

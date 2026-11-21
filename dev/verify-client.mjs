@@ -27,6 +27,9 @@ const discoveryTimerIds = []
 /* GET /council/runs rows and the GET /council/run/run-live snapshot. */
 let discoveryRows = null
 let liveRunState = 'running'
+/* Replaces the `GET /council/run/run-live` body while one case streams a seat
+   the plain LIVE_RUN stub does not carry (reasoning + growing answer). */
+let liveRunOverride = null
 /* Lets one case make POST /council/run return a chosen run id (the fake host
    only serves a live snapshot for `run-live`). */
 let nextRunId = null
@@ -202,18 +205,98 @@ const SCENARIOS = [
 ]
 
 /* A run that stays live: GET /council/runs offers it, so adopting it fills the
-   shared store with `running:true` and the toolview's live section has data. */
+   shared store with `running:true` and the toolview's live section has data.
+   `reasoning`/`reasoningChars` are the Host contract's empty defaults here; the
+   THINKING_RUN scenario below fills them in for the expandable-seat cases. */
 const LIVE_RUN = {
-  id: 'run-live', status: 'running', stage: 'reviews', question: '实时进度问题',
+  id: 'run-live', status: 'running', stage: 'answers', question: '实时进度问题',
   error: '', contextChars: 0, contextState: 'ok', useChairman: true,
   answers: [
-    { key: 'p1|m1', provider: 'p1', model: 'p1/m1', name: 'Model One', text: '', done: true, error: '', seat: { phase: 'done', elapsedMs: 900 } },
-    { key: 'p1|m2', provider: 'p1', model: 'p1/m2', name: 'Model Two', text: '', done: false, error: '', seat: { phase: 'running', elapsedMs: 1400 } },
+    { key: 'p1|m1', provider: 'p1', model: 'p1/m1', name: 'Model One', text: '', done: true, error: '', reasoning: '', reasoningChars: 0, seat: { phase: 'done', elapsedMs: 900 } },
+    { key: 'p1|m2', provider: 'p1', model: 'p1/m2', name: 'Model Two', text: '', done: false, error: '', reasoning: '', reasoningChars: 0, seat: { phase: 'running', elapsedMs: 1400 } },
   ],
   reviews: [],
   chairman: { key: 'p1|m1', provider: 'p1', model: 'm1', name: 'Model One', text: '', done: false, error: '' },
 }
 const LIVE_RUN_DONE = Object.assign({}, LIVE_RUN, { status: 'done', stage: 'done' })
+
+/* One seat per live-stream phase, in the shape the Host streams (reasoning
+   first, answer text later):
+   - Model One: done; reasoning window truncated (9999 chars total, 3 sent) and
+     a finished answer text.
+   - Model Two: still thinking — reasoning is flowing, the answer is not there
+     yet, so the row must say "思考中", not "无输出".
+   - Model Three: running but no token at all yet → "等待首个 token".
+   - Model Four: failed with an error → the expanded row must show it. */
+const THINKING_RUN = Object.assign({}, LIVE_RUN, {
+  id: 'run-live',
+  stage: 'answers',
+  answers: [
+    {
+      key: 'p1|m1', provider: 'p1', model: 'p1/m1', name: 'Model One',
+      text: '已到达的正文', done: true, error: '',
+      reasoning: 'abc', reasoningChars: 9999,
+      seat: { phase: 'done', elapsedMs: 4200, ttftMs: 900, fallback: false },
+    },
+    {
+      key: 'p1|m2', provider: 'p1', model: 'p1/m2', name: 'Model Two',
+      text: '', done: false, error: '',
+      reasoning: '正在推演的思考片段', reasoningChars: '正在推演的思考片段'.length,
+      seat: { phase: 'running', elapsedMs: 6000, ttftMs: 118249 },
+    },
+    {
+      key: 'p1|m3', provider: 'p1', model: 'p1/m3', name: 'Model Three',
+      text: '', done: false, error: '',
+      reasoning: '', reasoningChars: 0,
+      seat: { phase: 'starting', elapsedMs: 0 },
+    },
+    {
+      key: 'p2|m4', provider: 'p2', model: 'p2/m4', name: 'Model Four',
+      text: '', done: false, error: '模型调用失败',
+      reasoning: '', reasoningChars: 0,
+      seat: { phase: 'running', elapsedMs: 800 },
+    },
+  ],
+})
+const THINKING_RUN_DONE = Object.assign({}, THINKING_RUN, { status: 'done', stage: 'done' })
+
+/* Stage snapshots for the reviews/chairman minutes. The Host runs
+   answers → reviews → chairman, so a live seat region that only ever reads
+   `answers` shows nothing but finished rows for those ~165 seconds.
+   - REVIEW_RUN_EMPTY: reviews stage, the reviews array has not arrived yet.
+   - REVIEW_RUN: two reviewers streaming; `reviews[]` items carry `reviewer`
+     (not `name`), and the anonymous-label semantics must be the Host's own.
+   - CHAIRMAN_RUN: the chairman is thinking, so its reasoning must stream too. */
+const REVIEW_RUN = Object.assign({}, LIVE_RUN, {
+  id: 'run-live',
+  stage: 'reviews',
+  answers: LIVE_RUN.answers.map((answer) => Object.assign({}, answer, { done: true, text: '作答已完成' })),
+  reviews: [
+    {
+      key: 'rev|one', reviewer: 'Model One', text: '', done: false, error: '',
+      reasoning: '互评正在逐条比对答案', reasoningChars: 10,
+      seat: { phase: 'running', elapsedMs: 3000 },
+    },
+    {
+      key: 'rev|two', reviewer: 'Model Two', text: '互评完成正文', done: true, error: '',
+      reasoning: '互评思考完毕', reasoningChars: 7,
+      seat: { phase: 'done', elapsedMs: 5000 },
+    },
+  ],
+  chairman: { key: 'chair|one', provider: 'p1', model: 'm1', name: 'Model One', text: '', done: false, error: '', reasoning: '', reasoningChars: 0 },
+})
+const REVIEW_RUN_EMPTY = Object.assign({}, REVIEW_RUN, { reviews: [] })
+const CHAIRMAN_RUN = Object.assign({}, REVIEW_RUN, {
+  stage: 'chairman',
+  reviews: REVIEW_RUN.reviews.map((review) => Object.assign({}, review, { done: true, text: '互评完成正文' })),
+  chairman: {
+    key: 'chair|one', provider: 'p1', model: 'm1', name: 'Model One',
+    text: '', done: false, error: '',
+    reasoning: '主席正在综合各方评审意见', reasoningChars: 12,
+    seat: { phase: 'running', elapsedMs: 8000 },
+  },
+})
+const CHAIRMAN_RUN_DONE = Object.assign({}, CHAIRMAN_RUN, { status: 'done', stage: 'done' })
 
 let postCount = 0
 
@@ -257,7 +340,12 @@ const fakeWindow = {
       return { ok: true, json: async () => ({ runs: discoveryRows === null ? [] : discoveryRows }) }
     }
     if (/\/council\/run\/run-live$/.test(String(url))) {
-      return { ok: true, json: async () => (liveRunState === 'done' ? LIVE_RUN_DONE : LIVE_RUN) }
+      return {
+        ok: true,
+        json: async () => (liveRunOverride !== null
+          ? liveRunOverride
+          : liveRunState === 'done' ? LIVE_RUN_DONE : LIVE_RUN),
+      }
     }
     if (url === '/council/run') {
       postCount += 1
@@ -546,13 +634,45 @@ function renderAndFlush(node) {
   return html
 }
 
+/* Fake DOM nodes handed to callback refs. An expanded seat body is pinned to
+   the newest token by assigning scrollTop = scrollHeight; recording those
+   writes is what lets the auto-follow case assert the behaviour instead of
+   trusting it. Identity is stable per (surface, seat, part), like a real DOM
+   node that survives a re-render, and the fake box grows with its text. */
+const scrollNodes = new Map()
+function fakeScrollNode(props, contentChars) {
+  const key = `${props['data-surface'] || ''}|${props['data-seat'] || ''}|${props['data-part'] || ''}|${props.className || ''}`
+  let node = scrollNodes.get(key)
+  if (node === undefined) {
+    let top = 0
+    node = { clientHeight: 120, scrollHeight: 100, writes: [] }
+    Object.defineProperty(node, 'scrollTop', {
+      get() { return top },
+      set(value) {
+        top = value
+        node.writes.push(value)
+      },
+    })
+    scrollNodes.set(key, node)
+  }
+  node.scrollHeight = 100 + contentChars * 2
+  return node
+}
+
 /** Materialize a React element tree with the fake React. */
 function build(node) {
   if (node === null || node === undefined || node === false || node === true) return null
   if (typeof node === 'string' || typeof node === 'number') return { text: String(node) }
   if (Array.isArray(node)) return node.map(build)
   if (typeof node.type === 'function') return build(node.type(Object.assign({}, node.props, { children: node.children })))
-  return { type: node.type, props: node.props, children: (node.children || []).map(build) }
+  const children = (node.children || []).map(build)
+  const built = { type: node.type, props: node.props, children }
+  /* The only refs the code uses are callback refs. Invoking one here is the
+     harness stand-in for React's commit, which is when a real DOM ref fires. */
+  if (typeof node.props.ref === 'function') {
+    node.props.ref(fakeScrollNode(node.props, textOf(children).length))
+  }
+  return built
 }
 
 function textOf(node) {
@@ -581,6 +701,13 @@ function findNode(node, predicate) {
 
 function findButtonByText(node, text) {
   return findNode(node, (item) => item.type === 'button' && textOf(item.children).includes(text))
+}
+
+/** The expandable seat-row toggle of one live seat, matched by visible label. */
+function findSeatRow(node, label) {
+  return findNode(node, (item) => item.type === 'button'
+    && String(item.props.className || '').includes('dsc-seat-row')
+    && textOf(item.children).includes(label))
 }
 
 function findRadioByLabel(node, text) {
@@ -867,7 +994,7 @@ for (const expected of ['评审失败', 'CouncilRunError', 'COUNCIL_FAILED']) {
   const liveHtml = render(React.createElement(toolview, {
     t, phase: 'start', block: { args: liveArgs, argsRaw: JSON.stringify(liveArgs) },
   }))
-  for (const expected of ['实时进度：交叉互评', 'Model One', 'Model Two', '1/2', '运行中']) {
+  for (const expected of ['实时进度：独立作答', 'Model One', 'Model Two', '1/2', '运行中']) {
     if (!liveHtml.includes(expected)) {
       throw new Error(`live start row missing "${expected}": ${liveHtml.slice(0, 500)}`)
     }
@@ -883,6 +1010,217 @@ for (const expected of ['评审失败', 'CouncilRunError', 'COUNCIL_FAILED']) {
      "wake", and nothing before here changed it). */
   const wakeRadio = findRadioByLabel(build(tabBody({ t })), '直接唤醒主聊天')
   if (wakeRadio === undefined) throw new Error('feedback option vanished after the live-run check')
+  wakeRadio.props.onChange()
+}
+
+/* ---- Live reasoning: an expanded seat streams its thinking and answer ---- *
+ * "我需要展开实时可见思考": a status dot is not enough. Both the conversation
+ * card and the floating card must expand one seat and show the Host's reasoning
+ * tail plus the growing answer, follow the newest token, say "思考中" while only
+ * reasoning exists, say "等待首个 token" when nothing arrived yet, and never
+ * imply the tail is the whole chain. Data arrives through the shipped poll
+ * path: this case grows the Host snapshot and waits for the poller — it never
+ * publishes run state by hand. */
+{
+  const offRadio = findRadioByLabel(build(tabBody({ t })), '不做（只留在右侧栏）')
+  if (offRadio === undefined) throw new Error('feedback-off option is missing before the reasoning cases')
+  offRadio.props.onChange()
+  const resumeBeforeReasoning = resumeCalls.length
+
+  /* Both dictionaries must carry the new copy: a key present only in zh renders
+     as a raw key in an English UI. */
+  const councilDicts = dictionaries.find((entry) => entry.namespace === 'council')
+  const enDict = councilDicts !== undefined && councilDicts.dicts !== undefined ? councilDicts.dicts.en : undefined
+  if (enDict === undefined) throw new Error('council en dictionary is missing')
+  for (const key of ['seat.reasoning', 'seat.answer', 'seat.reviewer', 'seat.chairman', 'seat.chars', 'seat.window', 'seat.thinking', 'seat.waitingToken', 'seat.stageWaiting', 'seat.expand', 'seat.collapse']) {
+    if (typeof enDict[key] !== 'string' || enDict[key] === '') throw new Error(`en dictionary is missing "${key}"`)
+  }
+
+  liveRunState = 'running'
+  liveRunOverride = THINKING_RUN
+  discoveryRows = [THINKING_RUN]
+  /* Adopting the Host run fills store.run/running through the shipped path. */
+  renderAndFlush(React.createElement(overlayReg.component, { t }))
+  await new Promise((resolve) => setTimeout(resolve, 120))
+
+  const liveArgs = {
+    question: '实时思考问题',
+    models: [{ provider: 'p1', model: 'm1' }],
+    chairman: true,
+    attachFiles: false,
+  }
+  const liveProps = { t, phase: 'start', block: { args: liveArgs, argsRaw: JSON.stringify(liveArgs) } }
+  const thinkingText = THINKING_RUN.answers[1].reasoning
+  const answerText = THINKING_RUN.answers[0].text
+
+  /* A. A collapsed seat is one line: no long text is mounted, but the phase is
+     named — reasoning already started, so the row must not look like "无输出". */
+  const collapsed = render(React.createElement(toolview, liveProps))
+  for (const expected of ['实时思考问题', 'Model One', 'Model Two', 'Model Three', '思考中…']) {
+    if (!collapsed.includes(expected)) {
+      throw new Error(`live reasoning row missing "${expected}": ${collapsed.slice(0, 800)}`)
+    }
+  }
+  for (const absent of [thinkingText, answerText, '仅显示最近', '等待首个 token', '模型调用失败']) {
+    if (collapsed.includes(absent)) {
+      throw new Error(`a collapsed seat must not mount its live detail ("${absent}" leaked)`)
+    }
+  }
+
+  /* B. Expanding a seat renders the reasoning window, the answer text, the
+     total reasoning size and — because the Host only ships the tail — an
+     explicit "latest N of M chars" note. */
+  const treeOne = build(React.createElement(toolview, liveProps))
+  const rowOne = findSeatRow(treeOne, 'Model One')
+  if (rowOne === undefined) throw new Error('a live seat row is not expandable: no seat toggle button rendered')
+  if (rowOne.props['aria-expanded'] !== 'false') throw new Error('a live seat row must start collapsed')
+  rowOne.props.onClick()
+  const expandedOne = render(React.createElement(toolview, liveProps))
+  if (!expandedOne.includes('abc')) {
+    throw new Error(`an expanded seat did not render its reasoning text: ${expandedOne.slice(0, 800)}`)
+  }
+  if (!expandedOne.includes(answerText)) {
+    throw new Error(`an expanded seat did not render its answer text: ${expandedOne.slice(0, 800)}`)
+  }
+  /* Host contract: reasoning is the tail window, reasoningChars the total. A
+     shorter window must be labelled, never passed off as the whole chain. */
+  if (!expandedOne.includes('仅显示最近 3 字')) {
+    throw new Error(`a truncated reasoning window must say which part is shown: ${expandedOne.slice(0, 800)}`)
+  }
+  if (!expandedOne.includes('共 9999 字')) {
+    throw new Error(`a seat must show the total reasoning length, not just the window: ${expandedOne.slice(0, 800)}`)
+  }
+
+  /* C. Nothing arrived yet (reasoning and answer both empty): say so instead of
+     showing a blank box — a reasoning model's first token can take >200s. */
+  const treeWait = build(React.createElement(toolview, liveProps))
+  const rowWait = findSeatRow(treeWait, 'Model Three')
+  if (rowWait === undefined) throw new Error('the not-started seat row is not expandable')
+  rowWait.props.onClick()
+  const expandedWait = render(React.createElement(toolview, liveProps))
+  if (!expandedWait.includes('等待首个 token')) {
+    throw new Error(`an expanded seat with no token must say it is waiting: ${expandedWait.slice(0, 800)}`)
+  }
+
+  /* D. A failed seat shows its error inside the expanded area. */
+  const treeError = build(React.createElement(toolview, liveProps))
+  const rowError = findSeatRow(treeError, 'Model Four')
+  if (rowError === undefined) throw new Error('the failed seat row is not expandable')
+  rowError.props.onClick()
+  const expandedError = render(React.createElement(toolview, liveProps))
+  if (!expandedError.includes('模型调用失败')) {
+    throw new Error(`an expanded failed seat did not render its error: ${expandedError.slice(0, 800)}`)
+  }
+
+  /* E. Auto-follow: opening the thinking seat pins its reasoning body to the
+     bottom (scrollTop = scrollHeight), and the row states the thinking phase. */
+  const treeTwo = build(React.createElement(toolview, liveProps))
+  const rowTwo = findSeatRow(treeTwo, 'Model Two')
+  if (rowTwo === undefined) throw new Error('the thinking seat row is not expandable')
+  rowTwo.props.onClick()
+  const expandedTwo = render(React.createElement(toolview, liveProps))
+  if (!expandedTwo.includes(thinkingText)) {
+    throw new Error(`an expanded thinking seat did not render its live reasoning: ${expandedTwo.slice(0, 800)}`)
+  }
+  if (!expandedTwo.includes('思考中…')) {
+    throw new Error('a seat with reasoning but no answer text must say it is thinking')
+  }
+  build(React.createElement(toolview, liveProps))
+  const followNode = scrollNodes.get('card|p1|m2|reasoning|dsc-seat-body')
+  if (followNode === undefined) {
+    throw new Error('the expanded reasoning body is not scrollable: no callback ref reached it')
+  }
+  if (followNode.writes.length !== 1 || followNode.writes[0] !== followNode.scrollHeight) {
+    throw new Error(`expanding a seat must follow the reasoning tail to the bottom: ${JSON.stringify(followNode.writes)} of ${followNode.scrollHeight}`)
+  }
+  const firstHeight = followNode.scrollHeight
+
+  /* F. New tokens arrive on the shipped poll path. The card must show the grown
+     text and keep the body pinned to the bottom. */
+  const grownReasoning = thinkingText.repeat(20)
+  const grown = JSON.parse(JSON.stringify(THINKING_RUN))
+  grown.answers[1].reasoning = grownReasoning
+  grown.answers[1].reasoningChars = grownReasoning.length
+  liveRunOverride = grown
+  await new Promise((resolve) => setTimeout(resolve, 500))
+  const grownHtml = render(React.createElement(toolview, liveProps))
+  if (!grownHtml.includes(thinkingText.repeat(3))) {
+    throw new Error('the polled reasoning growth did not reach the expanded seat')
+  }
+  build(React.createElement(toolview, liveProps))
+  if (followNode.writes.length !== 2 || followNode.writes[1] !== followNode.scrollHeight) {
+    throw new Error(`new reasoning tokens must keep the body pinned to the bottom: ${JSON.stringify(followNode.writes)} of ${followNode.scrollHeight}`)
+  }
+  if (followNode.scrollHeight <= firstHeight) throw new Error('the fake reasoning body did not grow with its text')
+
+  /* G. A user scroll-up wins: later tokens must not move the viewport. */
+  const scrollTree = build(React.createElement(toolview, liveProps))
+  const reasoningBody = findNode(scrollTree, (node) => node !== null && typeof node === 'object'
+    && node.props !== undefined && node.props !== null
+    && node.props['data-part'] === 'reasoning' && node.props['data-surface'] === 'card')
+  if (reasoningBody === undefined) throw new Error('the expanded reasoning body has no onScroll handler')
+  followNode.scrollTop = 0
+  reasoningBody.props.onScroll({ currentTarget: followNode })
+  const writesAfterScroll = followNode.writes.length
+  const grownAgain = JSON.parse(JSON.stringify(grown))
+  grownAgain.answers[1].reasoning += '又一段'
+  grownAgain.answers[1].reasoningChars = grownAgain.answers[1].reasoning.length
+  liveRunOverride = grownAgain
+  await new Promise((resolve) => setTimeout(resolve, 500))
+  build(React.createElement(toolview, liveProps))
+  if (followNode.writes.length !== writesAfterScroll) {
+    throw new Error(`a manual scroll-up must not be stolen by follow: ${JSON.stringify(followNode.writes)}`)
+  }
+  /* Scrolling back to the bottom resumes following. */
+  followNode.scrollTop = followNode.scrollHeight
+  reasoningBody.props.onScroll({ currentTarget: followNode })
+  const writesBeforeResume = followNode.writes.length
+  const grownLast = JSON.parse(JSON.stringify(grownAgain))
+  grownLast.answers[1].reasoning += '再一段'
+  grownLast.answers[1].reasoningChars = grownLast.answers[1].reasoning.length
+  liveRunOverride = grownLast
+  await new Promise((resolve) => setTimeout(resolve, 500))
+  build(React.createElement(toolview, liveProps))
+  if (followNode.writes.length !== writesBeforeResume + 1
+    || followNode.writes[followNode.writes.length - 1] !== followNode.scrollHeight) {
+    throw new Error(`scrolling back to the bottom must resume follow: ${JSON.stringify(followNode.writes)} of ${followNode.scrollHeight}`)
+  }
+
+  /* H. The floating card expands the same seat on its own surface: its closed
+     row does not inherit the card's open row, and its open row streams too. */
+  const floatCollapsed = render(React.createElement(overlayReg.component, { t }))
+  if (floatCollapsed.includes(grownLast.answers[1].reasoning.slice(0, 12))) {
+    throw new Error('the floating card must not inherit the conversation card\'s open seat')
+  }
+  const floatTree = build(React.createElement(overlayReg.component, { t }))
+  const floatRow = findSeatRow(floatTree, 'Model Two')
+  if (floatRow === undefined) throw new Error('the floating card has no expandable seat row')
+  floatRow.props.onClick()
+  const floatExpanded = render(React.createElement(overlayReg.component, { t }))
+  if (!floatExpanded.includes(grownLast.answers[1].reasoning.slice(0, 12))) {
+    throw new Error(`the expanded floating seat did not render its live reasoning: ${floatExpanded.slice(0, 800)}`)
+  }
+  if (!floatExpanded.includes('思考中…')) {
+    throw new Error('the floating card must name the thinking phase')
+  }
+
+  /* Close the rows again so no later render inherits an open seat. */
+  const closeCard = findSeatRow(build(React.createElement(toolview, liveProps)), 'Model Two')
+  if (closeCard !== undefined) closeCard.props.onClick()
+  const closeFloat = findSeatRow(build(React.createElement(overlayReg.component, { t })), 'Model Two')
+  if (closeFloat !== undefined) closeFloat.props.onClick()
+
+  /* Settle the synthetic run, then restore the delivery mode this case borrowed. */
+  liveRunOverride = THINKING_RUN_DONE
+  discoveryRows = null
+  await new Promise((resolve) => setTimeout(resolve, 700))
+  liveRunState = 'done'
+  liveRunOverride = null
+  if (resumeCalls.length !== resumeBeforeReasoning) {
+    throw new Error('the live-reasoning cases must not deliver a conclusion')
+  }
+  const wakeRadio = findRadioByLabel(build(tabBody({ t })), '直接唤醒主聊天')
+  if (wakeRadio === undefined) throw new Error('feedback option vanished after the reasoning cases')
   wakeRadio.props.onChange()
 }
 

@@ -48,13 +48,25 @@ function blockOf(packText, fileName) {
      returned only the header itself (147 chars) and silently disabled every
      assertion. Match a real path header and stop at the next one. */
   const isFileHeader = (line) => /^--- .*[\\/].* ---$/.test(line) && !/^--- 关键区/.test(line)
-  const start = lines.findIndex((line) => isFileHeader(line) && line.endsWith('/' + fileName + ' ---'))
+  /*
+   * The header separator is platform-dependent. This used to demand a POSIX
+   * `'/' + fileName`, which never matches a Windows header (`...\index.js ---`),
+   * so the loose `includes` fallback ALWAYS ran — and `includes` accepted the
+   * first line anywhere that merely MENTIONS the name. Once client.js grew a
+   * comment containing `index.js ---`, that mention landed inside the client
+   * block, so `blockOf` returned the wrong slice: it began in client.js and
+   * stopped before index.js's own regions. `deadlineWall` then read as MISSING
+   * while the pack did contain it (verified: pack.includes(target) === true).
+   */
+  const headerEndsWith = (line, separator) => line.endsWith(separator + fileName + ' ---')
+  let start = lines.findIndex((line) => isFileHeader(line)
+    && (headerEndsWith(line, '/') || headerEndsWith(line, '\\')))
   if (start === -1) {
-    const fallback = lines.findIndex((line) => isFileHeader(line) && line.includes(fileName + ' ---'))
-    if (fallback === -1) return ''
-    const next = lines.findIndex((line, index) => index > fallback && isFileHeader(line))
-    return lines.slice(fallback, next === -1 ? lines.length : next).join('\n')
+    /* Last resort: a header that STARTS as an absolute path, never a mention. */
+    start = lines.findIndex((line) => isFileHeader(line)
+      && /^--- [A-Za-z]:[\\/]/.test(line) && line.includes(fileName + ' ---'))
   }
+  if (start === -1) return ''
   const next = lines.findIndex((line, index) => index > start && isFileHeader(line))
   return lines.slice(start, next === -1 ? lines.length : next).join('\n')
 }
@@ -156,6 +168,31 @@ const DEADLINE_QUESTION = '终审验收 deadline 机制。附件应含标注「�
 const deadlineHints = hintsOf(DEADLINE_QUESTION)
 const realPack = await collectCodeContext([ROOT], 60000, deadlineHints)
 const realBlock = blockOf(realPack.text, 'index.js')
+
+/* Guard against the sampler grading itself.
+ *
+ * The deadline checks below look for literals such as
+ * `Promise.race([execute(run, routes), deadlineWall])`. Those same literals are
+ * written in THIS file, and this file is one of the sampled source files. A
+ * broken block extractor could therefore find them here and report PASS while
+ * index.js was never actually sampled — which is exactly what happened: `blockOf`
+ * fell back to a loose `includes` match, landed on a line of this file's own
+ * source, and the gate stayed green with the real handler missing from the pack.
+ *
+ * The declaration `const deadlineWall = new Promise` exists only in index.js, so
+ * requiring it proves the block really is index.js.
+ */
+{
+  const ownSource = /realChecks = \{|deadlineWallBlock:/
+  if (ownSource.test(realBlock)) {
+    console.log('FAIL  blockOf(index.js) returned this sampler\'s own source — the gate would grade itself')
+    process.exit(1)
+  }
+  if (!/const deadlineWall = new Promise/.test(realBlock)) {
+    console.log('FAIL  the index.js block must contain the deadlineWall DECLARATION, not just its name in a string')
+    process.exit(1)
+  }
+}
 const realChecks = {
   realCallModelWhole: /关键区（第 \d+–\d+ 行，完整函数体） ---\n\s*async function callModel/.test(realBlock),
   realSeatClamps: realBlock.includes('Math.min(SEAT_START_TIMEOUT_MS, remaining())')

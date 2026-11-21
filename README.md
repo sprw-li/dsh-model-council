@@ -2,7 +2,7 @@
 
 > 仓库：<https://github.com/sprw-li/dsh-model-council>
 >
-> **Status: alpha** — 接口与行为仍可能变化，正式版等外部反馈后再定。已发布到 npm 的只有 `0.1.0`；仓库源码为 `0.2.34`（见文末「版本与发布」）。
+> **Status: alpha** — 接口与行为仍可能变化，正式版等外部反馈后再定。已发布到 npm 的只有 `0.1.0`；仓库源码为 `0.2.35`（见文末「版本与发布」）。
 
 DeepSeek Harness 的多模型理事会插件：一个入口把问题交给多个模型并行作答、匿名互评，可选主席汇总，并可把结论回投主聊天。结果常驻右侧栏 tab。
 
@@ -172,7 +172,8 @@ council_review({
 `council_review` 现在在对话里有自己的卡片，而不是塌成裸 JSON 输入。
 
 - 注册在 **`tool.call.toolview`**，`key` 必须**精确等于 wire 工具名** `council_review`（官方文档原话 "a typo never renders"——写错不报错、只是永远不渲染，退回通用行）。同时声明 `locale`，否则框架不注入 `t`。
-- 三个阶段各自渲染：`preparing`（单行，不 dump 不完整参数）→ `start`（问题摘要可展开、参与模型、主席开关、附件提示 + **实时阶段与每席位状态**）→ `result`（成功渲染输出文本；失败渲染 `name · code`）。
+- 三个阶段各自渲染：`preparing`（单行，不 dump 不完整参数）→ `start`（问题摘要可展开、参与模型、主席开关、附件提示 + **实时阶段、每席位状态，以及可展开的实时思考与正文**）→ `result`（成功渲染输出文本；失败渲染 `name · code`）。
+- **实时思考（0.2.35）**：provider 把思维链作为独立的 `reasoning-delta` 流推送，且**先于正文**到达。快照里每个席位带 `reasoning`（尾部窗口，最多 4000 字）与 `reasoningChars`（真实总字数）；`reasoningChars > reasoning.length` 时客户端明确写「仅显示最近 N 字（共 M 字）」，**不假装是全文**。展开席位即可看到流动的思考并在新内容到达时自动跟随（用户手动上滚则不抢）。实测这条链路的推理阶段可达 200+ 秒，所以「思考中…」不等于卡死。
 - **两个易错契约**（实测自 `dsh-client-ui-tool/lib/client.js` 与 `packages/util/values/src/partial-json.ts`）：
   - `block.args` 是**懒读器 `PartialArguments`，不是普通对象** → 必须 `.text(key)` / `.value(key)`，`block.args.question` 取不到值。
   - `result` 的 `block.call` 只有 `{ name, argsRaw }`（或 `null`），**没有 `.args`**；参数视图始终是 `block.args`。`preparing` 的 block **没有 `argsRaw`**。
@@ -286,7 +287,7 @@ else
 
 ## 安装
 
-npm 上的发布版本为 **0.1.0**（dist-tags `latest` / `alpha`）；本仓库源码版本 **0.2.34**，尚未发布到 npm——发布 0.2.x 需要新的 granular token（旧的已吊销）。
+npm 上的发布版本为 **0.1.0**（dist-tags `latest` / `alpha`）；本仓库源码版本 **0.2.35**，尚未发布到 npm——发布 0.2.x 需要新的 granular token（旧的已吊销）。
 
 ```sh
 # 从 npm
@@ -379,6 +380,6 @@ node <workspace>\tmp\push-council.mjs <本目录> sprw-li/dsh-model-council main
 ## 发布记录与后续
 
 - GitHub：<https://github.com/sprw-li/dsh-model-council>，release 有 `v0.1.0-alpha` 与 `v0.2.0`（pre-release）。
-- npm：<https://www.npmjs.com/package/dsh-model-council>（已发布 `0.1.0`；仓库源码 `0.2.34` **尚未发布**——`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
+- npm：<https://www.npmjs.com/package/dsh-model-council>（已发布 `0.1.0`；仓库源码 `0.2.35` **尚未发布**——`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
 
 发新版本：更新 `CHANGELOG.md` 与 `package.json` 版本 → `npm run verify` → commit/tag → `npm publish --tag alpha`（npm 新包首次发布会进入 staged 审核，通常几分钟内变为可安装）→ `npm pack` + `gh release create vX.Y.Z --prerelease --notes-file CHANGELOG.md <tarball>`。

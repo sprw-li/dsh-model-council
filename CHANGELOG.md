@@ -1,3 +1,85 @@
+# 0.2.35
+
+起因：用户要"**展开实时可见思考**"。实现过程中连带挖出**三个**真问题，其中一个说明**旧的验收门禁一直在骗自己**。
+
+## 1. `reasoning-delta` 被完全丢弃（"看不到思考"的直接原因）
+
+DSH 的 LLM 把思维链作为**独立的 chunk 流**推送（`{type:'reasoning-delta', index, text}`），而且**先于** `text-delta` 到达。`callModel` 只处理了 `text-delta`，所以推理阶段（这条链路上实测 **200+ 秒**）卡片上只有一个状态点。
+
+现在：累积 `reasoning` → 节流推给快照 → `answers[]` / `reviews[]` / `chairman` 各带
+
+- `reasoning`：**尾部窗口**，最多 `REASONING_TAIL = 4000` 字
+- `reasoningChars`：真实总字数（`> reasoning.length` 表示被截断）
+
+尾部窗口是刻意的：SSE 每帧都带完整快照，发全文会让线耗随思考长度线性膨胀。客户端据此显示「仅显示最近 N 字（共 M 字）」，**不假装是全文**。
+
+**实测**（2 席，201 秒）：
+
+```
++15s  modelA 思考=1156 正文=584   ← 思考先流出，正文才开始
+      GLM     思考=2628 正文=45
++201s done
+思考链内容真实（组合数 C(6,3)=20 的推导过程）
+```
+
+## 2. 浮窗在有未完成席位时**必然抛异常**
+
+`seatStatusText` 只在 `CouncilTab` 内部定义，`CouncilStatusOverlay`（浮窗）却直接调用它 → 只要浮窗渲染到任一**未完成**席位就 `ReferenceError: seatStatusText is not defined`。
+
+也就是说"浮窗能看到状态"在"有席位在跑"时其实是崩的——而那正是唯一需要浮窗的时刻。已提升为模块级共享函数。
+
+## 3. 验收门禁在**给自己的源码打分**（最严重）
+
+`dev/tune-sampler.mjs` 断言"deadline 问题的 pack 必须含 `deadlineWall`"。它找的字面量是
+
+```js
+'Promise.race([execute(run, routes), deadlineWall])'
+```
+
+而**这行字面量本身就写在这个 sampler 的源码里**，且 sampler 自己也是被采样的源文件之一。
+
+`blockOf()` 的取块逻辑是：
+
+```js
+line.endsWith('/' + fileName + ' ---')   // ← Windows 路径是 '\'，永远匹配不上
+→ 回退到 line.includes(fileName + ' ---')  // ← 取全文第一个"提到"该文件名的行
+```
+
+于是回退落到了 **sampler 自己源码里提到 `index.js ---` 的那一行**，块从那里开始、到下一个文件头结束——`deadlineWall` 的断言因此在**自己的字符串里**找到了匹配。**门禁绿了很久，而 index.js 的真实代码从未进入 pack。**
+
+这次修 `blockOf`（要求分隔符 + 拒绝"提及"）之后，假绿立刻变成 `MISS realWall`，暴露出下面这个真 bug。
+
+## 4. 文件排序用**路径**而非内容（真 bug）
+
+```js
+const score = (file) => { const lower = file.path.toLowerCase() ... }
+```
+
+路径里几乎不含问题中的标识符（`callModel`、`deadlineWall`），所以**每个文件都是 0 分** → 平局按 `b.size - a.size` 排序 → **最大的文件拿到 primary 名额与 80% 字符预算**。实测：一个点名 4 个 `index.js` 符号的验收问题里，`client.js`（内容命中 3）拿走了 80% 预算，`index.js`（命中 8）只剩 `CODE_FILE_CHARS = 12000`，`deadlineWall` 因此被裁掉。
+
+改为**按内容命中数排序**（最多扫 40 个候选文件，每文件 200KB 上限，所以不会退化成全树读）。修完后 `deadline-question pack` 恢复 `4/4`，且这次是**真的**：探针确认 `const deadlineWall = new Promise` 与 `Promise.race(...)` 都在 **index.js 块**内。
+
+## 5. 顺带修掉两处让"点名标识符"掉出预算的原因
+
+- identifier 窗口按 **hint 在问题里出现的顺序**排，预算裁剪把**最后一个** hint 的窗口切掉。改为：每个 hint 的**第一个窗口**先各拿一份，再谈第二个。
+- hint 的"第一处匹配"可能落在**注释**里（我新写的注释提到 `deadlineWall`），窗口就建在注释上。现在跳过以 `*`/`//`/`/*` 开头的行。
+- 另加"公平预算"：按剩余预算给每个 hint 的第一个窗口分配份额，保证它们全部装得下（400 字下限）。
+
+## 6. 防止门禁再骗自己
+
+`tune-sampler.mjs` 新增守卫：`blockOf(index.js)` 的结果必须含 `const deadlineWall = new Promise`（**声明**，只存在于 index.js），且不得含 sampler 自己的源码特征（`realChecks = {`）。变异测试：把排序改回路径排序 → `FAIL the index.js block must contain the deadlineWall DECLARATION`。
+
+## 7. 客户端（同轮交付）
+
+- 对话卡片与浮窗的席位行**可展开**：思考（含截断提示）+ 正文 + `error`；两者皆空显示「等待首个 token…（推理模型可能 >200 秒）」；`reasoning` 有而 `text` 无时标「思考中…」。
+- **自动跟随**：展开时新内容滚到底部；用户手动上滚则不抢，回底后恢复。
+- 该功能由 subagent 交付，本人复核了 harness（新增 23 组断言）与 3 条变异测试。
+
+## 8. 测试
+
+- `npm run verify` exit 0（19/19、**4/4**、9/9）。
+- 变异测试（本文件内说明的）+ 上一轮的 4 条，全部 exit 1 并已还原。
+
 # 0.2.34
 
 起因：一次跨模型评审**没开成**的复盘。用户报告三条：`council_review` 的 run 在 provider 阶段直接 cancelled；二次调用时该工具在本会话已不再绑定；改用指定多模型的 `subagent` 则全部返回 `route is not allowed for this Session`。
