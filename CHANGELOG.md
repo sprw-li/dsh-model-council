@@ -1,3 +1,62 @@
+# 0.2.34
+
+起因：一次跨模型评审**没开成**的复盘。用户报告三条：`council_review` 的 run 在 provider 阶段直接 cancelled；二次调用时该工具在本会话已不再绑定；改用指定多模型的 `subagent` 则全部返回 `route is not allowed for this Session`。
+
+查证结论：**三条是三个不同原因，其中第一条是运维操作造成的，不是插件缺陷**。
+
+## 1. run 被 cancelled + 工具不再绑定 = **重载插件杀掉了在途运行**
+
+`council_review` 注册在**插件根**上。禁用→启用插件会销毁该实例：
+
+- `runs` Map 全丢，每个在途运行落盘为 **`Host 重启，运行中断`**；
+- 正在调用该工具的 agent 手里那个工具**不再能解析**——同一 turn 里再调就失败。
+
+**证据**：持久化文件里连续三条 `Host 重启，运行中断`（`cmwqct46ioyes0` / `cmwqcujyxryrom` / `cmwqd0tk2qukml`），时间正对上我在改 SSE 心跳和超时时做的两次 disable→enable。
+
+这是我的操作失误，不是插件的 bug。但**可诊断性可以做得更好**，所以：
+
+- `GET /council/` 健康探针新增 **`runningRuns`**。重载前查一下，非 0 就不要重载——让"能不能重载"在动手**前**可查，而不是事后只能看到"运行中断"。
+
+## 2. `route is not allowed for this Session` = DSH 的 subagent 路由策略，不是 council
+
+依据 `@deepseek-ai/dsh-tool-subagent/lib/model-selection-settings.js`：
+
+```js
+if (policy === undefined)
+  allowed = provider === parent.provider && model === parent.model   // 无策略：只允许父路由自己
+else
+  allowed = policy.routes.some(r => r.provider === provider && r.model === model)
+```
+
+服务 `subagentModelSelection`，`enabled` 默认 **false**、`allowedModels` 默认 **[]**，本机 profile 里没有配置 → 策略为 `undefined` → **只能继承父会话那一条路由**。所以用户指定的 `modelD`/`modelB`/`modelE`/`modelA` 全被拒，活下来的那条必然是主席同款——与用户观察完全一致。
+
+另外该策略在**会话第一帧**写入 session projection，**改设置后必须新开会话才生效**。
+
+**council 不受这条限制**：默认 `seatMode = 'llm'`，走 `ctx.llm.stream({provider, model})`，不经过 `assertAllowedModelSelection`。只有 `seatMode: 'subagent'` 才会撞上它，且 council 会逐席降级回 llm（`seat.fallbackFrom = 'subagent'`），不会让整轮失败。
+
+## 3. 跨模型 council 实测：**能跑成**
+
+为了不再停留在"应该可以"，直接跑：
+
+```
+models: providerA/modelA + providerA/modelB + providerA/modelD
+耗时 383 秒 → status=done，三席全部产出
+modelA / modelB / modelD 各自给出不同措辞的回答
+```
+
+**383 秒这个数字本身就验证了 0.2.33 的超时修复**：旧的 `CALL_TIMEOUT_MS = 300000`（5 分钟）会在这一轮里把它掐死。
+
+> 同期 `providerC` 的席位报 `余额不足 (QUOTA)`——账号余额问题。要跑多模型评审，要么给该 provider 充值，要么用 `providerA` / `providerB` 下的模型。
+
+## 4. 文档
+
+README 新增两节：**「运维注意：重载插件会杀掉在途运行」**（含重载前的检查命令）与 **「跨模型：council 用 llm 模式，不受 subagent 路由策略限制」**（含该策略的源码位置、默认值、以及"改完要新开会话"这个坑）。
+
+## 5. 测试
+
+- `dev/verify-host.mjs`：健康探针必须报 `runningRuns`（number 且非负）、`toolEnabled`/`panelEnabled` 为 boolean。
+- 全套 `npm run verify` exit 0。
+
 # 0.2.33
 
 起因仍然是那张卡片：`council_review` 停在「独立作答 0/5，5 席全部运行中」，而 Host 快照已经是 **3/5 完成、3 席失败**。查下去发现三条独立缺陷——一条让**卡片冻结**，两条让**整轮失败且不可诊断**。

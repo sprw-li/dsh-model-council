@@ -2647,7 +2647,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v64', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v65', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -2658,11 +2658,23 @@ export function apply(ctx, config) {
         if (req.method === 'GET' && path === '/') {
           /* Health probe: never gated, and it reports both entry switches so a
              human or the client can see which side is off. */
+          let runningCount = 0
+          for (const run of runs.values()) if (run.status === 'running') runningCount += 1
           sendJson(res, 200, {
             ok: true,
-            build: 'v64',
+            build: 'v65',
             toolEnabled: toolEnabled(liveConfig),
             panelEnabled: panelEnabled(liveConfig),
+            /*
+             * In-flight runs. A plugin disable→enable cycle destroys this plugin
+             * instance together with every run in `runs`, and each of them lands
+             * in the persisted file as "Host 重启，运行中断". Measured: two
+             * reloads during a live council killed three runs, and the agent
+             * that had called `council_review` was left holding a tool that no
+             * longer resolves. Exposing the count makes "is it safe to reload?"
+             * answerable BEFORE the fact instead of only diagnosable after it.
+             */
+            runningRuns: runningCount,
           })
           return
         }

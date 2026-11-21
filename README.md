@@ -2,7 +2,7 @@
 
 > 仓库：<https://github.com/sprw-li/dsh-model-council>
 >
-> **Status: alpha** — 接口与行为仍可能变化，正式版等外部反馈后再定。已发布到 npm 的只有 `0.1.0`；仓库源码为 `0.2.33`（见文末「版本与发布」）。
+> **Status: alpha** — 接口与行为仍可能变化，正式版等外部反馈后再定。已发布到 npm 的只有 `0.1.0`；仓库源码为 `0.2.34`（见文末「版本与发布」）。
 
 DeepSeek Harness 的多模型理事会插件：一个入口把问题交给多个模型并行作答、匿名互评，可选主席汇总，并可把结论回投主聊天。结果常驻右侧栏 tab。
 
@@ -177,6 +177,48 @@ council_review({
   - `block.args` 是**懒读器 `PartialArguments`，不是普通对象** → 必须 `.text(key)` / `.value(key)`，`block.args.question` 取不到值。
   - `result` 的 `block.call` 只有 `{ name, argsRaw }`（或 `null`），**没有 `.args`**；参数视图始终是 `block.args`。`preparing` 的 block **没有 `argsRaw`**。
 
+## 运维注意：重载插件会杀掉在途运行
+
+`council_review` 是在**插件根**上注册的。禁用→启用插件会销毁该实例，随之：
+
+- `runs` Map 全丢，每个在途运行落盘为 **`Host 重启，运行中断`**；
+- 正在调用 `council_review` 的 agent 手里那个工具**不再能解析**（同一个 turn 里再调会失败）。
+
+**实测**：一次对话里重载两次，杀掉 3 个运行，并让调用方在同一个 turn 里失去了工具绑定。
+
+所以重载前先查：
+
+```powershell
+(Invoke-WebRequest http://127.0.0.1:<port>/council/ -UseBasicParsing).Content | ConvertFrom-Json | Select toolEnabled, panelEnabled, runningRuns
+```
+
+`runningRuns = 0` 才安全。这个字段就是为这件事加的——**让"能不能重载"在动手前可查，而不是事后只能看到 `运行中断`**。
+
+## 跨模型：council 用 llm 模式，不受 subagent 路由策略限制
+
+DSH 的 `subagent` 工具有一条**会话级路由白名单**（`@deepseek-ai/dsh-tool-subagent/lib/model-selection-settings.js` 的 `subagentModelSelection` 服务，`enabled` 默认 **false**、`allowedModels` 默认 **[]**）：
+
+```js
+if (policy === undefined)
+  allowed = provider === parent.provider && model === parent.model   // 无策略：只允许父路由自己
+else
+  allowed = policy.routes.some(r => r.provider === provider && r.model === model)
+```
+
+也就是说**未配置策略时，subagent 只能继承父会话同一条路由**；指定别的模型会得到
+`child LLM route "x/y" is not allowed for this Session`。要在 subagent 里跨模型，必须把该服务
+`enabled: true` 且 `allowedModels` 填上允许的路由——而且策略是在**会话第一帧**写进 session projection 的，
+**改完要新开会话才生效**。
+
+**council 的默认 `seatMode` 是 `llm`，走 `ctx.llm.stream({provider, model})`，完全不经过这条策略**，
+所以跨模型评审不需要动 `subagentModelSelection`。`seatMode: 'subagent'` 才会撞上它；
+那种情况下 council 会逐席降级回 llm 模式（`seat.fallbackFrom = 'subagent'`），不会让整轮失败，
+但**降级后的席位就不再是子代理了**——快照里能看出来。
+
+> 实测（2026-11-21，`providerA` 的 `modelA` + `modelB` + `modelD`，3 个不同模型）：
+> `status=done`，三席全部产出，耗时 383 秒。同一时期 `providerC` 的席位报
+> `余额不足 (QUOTA)`——那是账号余额，不是插件问题。
+
 ## 运行状态浮窗
 
 调用 `council_review`（或面板发起）时，对话区右下角会出现一个浮动状态卡：阶段（作答／互评／主席）、已完成席位比例、每个席位（模型名 + 运行/完成/失败）、问题摘要与错误。
@@ -244,7 +286,7 @@ council_review({
 
 ## 安装
 
-npm 上的发布版本为 **0.1.0**（dist-tags `latest` / `alpha`）；本仓库源码版本 **0.2.33**，尚未发布到 npm——发布 0.2.x 需要新的 granular token（旧的已吊销）。
+npm 上的发布版本为 **0.1.0**（dist-tags `latest` / `alpha`）；本仓库源码版本 **0.2.34**，尚未发布到 npm——发布 0.2.x 需要新的 granular token（旧的已吊销）。
 
 ```sh
 # 从 npm
@@ -337,6 +379,6 @@ node <workspace>\tmp\push-council.mjs <本目录> sprw-li/dsh-model-council main
 ## 发布记录与后续
 
 - GitHub：<https://github.com/sprw-li/dsh-model-council>，release 有 `v0.1.0-alpha` 与 `v0.2.0`（pre-release）。
-- npm：<https://www.npmjs.com/package/dsh-model-council>（已发布 `0.1.0`；仓库源码 `0.2.33` **尚未发布**——`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
+- npm：<https://www.npmjs.com/package/dsh-model-council>（已发布 `0.1.0`；仓库源码 `0.2.34` **尚未发布**——`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
 
 发新版本：更新 `CHANGELOG.md` 与 `package.json` 版本 → `npm run verify` → commit/tag → `npm publish --tag alpha`（npm 新包首次发布会进入 staged 审核，通常几分钟内变为可安装）→ `npm pack` + `gh release create vX.Y.Z --prerelease --notes-file CHANGELOG.md <tarball>`。

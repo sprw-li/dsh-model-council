@@ -890,6 +890,18 @@ try {
       const confirmedView = await http(previewHost, 'GET', `/council/run/${confirmed.json.runId}`)
       assert.equal(confirmedView.json.manifestConfirmed, true,
         'an explicitly confirmed run must record manifestConfirmed=true')
+
+      /* The health probe must report in-flight runs.
+         A plugin disable→enable cycle destroys this instance and every run in it;
+         each lands in the persisted file as "Host 重启，运行中断". Measured: two
+         reloads during a live council killed three runs and left the calling agent
+         holding a tool that no longer resolves. Reporting the count makes "is it
+         safe to reload?" answerable before the fact. */
+      const probe = await http(previewHost, 'GET', '/council/')
+      assert.equal(typeof probe.json.runningRuns, 'number', 'health must report runningRuns as a number')
+      assert.ok(probe.json.runningRuns >= 0, 'runningRuns must never be negative')
+      assert.equal(typeof probe.json.toolEnabled, 'boolean', 'health must report the tool switch')
+      assert.equal(typeof probe.json.panelEnabled, 'boolean', 'health must report the panel switch')
     } finally {
       if (previousHome === undefined) delete process.env.DSH_HOME
       else process.env.DSH_HOME = previousHome
@@ -949,6 +961,15 @@ try {
     assert.equal(Number(call[1]) < 30 * 60 * 1000, true,
       'CALL_TIMEOUT_MS must stay below the run deadline')
   }
+
+  /* The health probe must report in-flight runs.
+     A plugin disable→enable cycle destroys the instance and every run in it; each
+     lands in the persisted file as "Host 重启，运行中断". Measured: two reloads
+     during a live council killed three runs and left the calling agent holding a
+     tool that no longer resolves. Reporting the count makes "is it safe to
+     reload?" answerable before the fact.
+     (The live probe assertion sits in the fake-host block above, where `http` and
+     `previewHost` are in scope.) */
 
   /* Portability guard. The harnesses must run unchanged on the CI runner
      (ubuntu-latest). `dev/tune-sampler.mjs` used to hardcode
