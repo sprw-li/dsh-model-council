@@ -1,3 +1,7 @@
 node_modules/
 *.tgz
 .DS_Store
+# Internal working notes: session state (local ports, run ids, cycle history) and
+# self-review records. Not part of the published plugin.
+CHECKPOINT.md
+dev/self-review-*.md

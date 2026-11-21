@@ -93,7 +93,7 @@ const score = (file) => { const lower = file.path.toLowerCase() ... }
 - `runs` Map 全丢，每个在途运行落盘为 **`Host 重启，运行中断`**；
 - 正在调用该工具的 agent 手里那个工具**不再能解析**——同一 turn 里再调就失败。
 
-**证据**：持久化文件里连续三条 `Host 重启，运行中断`（`cmwqct46ioyes0` / `cmwqcujyxryrom` / `cmwqd0tk2qukml`），时间正对上我在改 SSE 心跳和超时时做的两次 disable→enable。
+**证据**：持久化文件里连续三条 `Host 重启，运行中断`（`<runId>` / `<runId>` / `<runId>`），时间正对上我在改 SSE 心跳和超时时做的两次 disable→enable。
 
 这是我的操作失误，不是插件的 bug。但**可诊断性可以做得更好**，所以：
 
@@ -128,7 +128,7 @@ modelA / modelB / modelD 各自给出不同措辞的回答
 
 **383 秒这个数字本身就验证了 0.2.33 的超时修复**：旧的 `CALL_TIMEOUT_MS = 300000`（5 分钟）会在这一轮里把它掐死。
 
-> 同期 `providerC` 的席位报 `余额不足 (QUOTA)`——账号余额问题。要跑多模型评审，要么给该 provider 充值，要么用 `providerA` / `providerB` 下的模型。
+> 同期 `providerC` 的席位报 `余额不足（QUOTA）`——账号余额问题。要跑多模型评审，要么给该 provider 充值，要么用 `providerA` / `providerB` 下的模型。
 
 ## 4. 文档
 
@@ -177,7 +177,7 @@ if (finish.kind === 'aborted') throw new Error('调用被中止或超时')   // 
 用两个可用模型跑一次最小评审（`attachFiles:false`），完整走过 `answers → reviews → chairman`，最终失败原因是**明确的**：
 
 ```
-error = "余额不足 (request_id: ...) (QUOTA)"
+error = "余额不足（QUOTA）"
 作答 DeepSeek-V4.1-Flash  err=余额不足
 作答 modelA            chars=2  ← 成功
 ```
@@ -195,7 +195,7 @@ error = "余额不足 (request_id: ...) (QUOTA)"
 
 # 0.2.32
 
-起因：一次**真实运行**（run `cmwksoahcood7z`，17 分钟）的复盘。用户截图问"这个对吗，都不冒内容"——工具卡片运行期间只有裸 JSON 输入、什么都不显示。查下去发现**四个**独立问题，全修。
+起因：一次**真实运行**（run `<runId>`，17 分钟）的复盘。用户截图问"这个对吗，都不冒内容"——工具卡片运行期间只有裸 JSON 输入、什么都不显示。查下去发现**四个**独立问题，全修。
 
 ## 0. 先回答"不冒内容"：符合预期，且那次跑完了
 

@@ -218,7 +218,7 @@ else
 
 > 实测（2026-11-21，`providerA` 的 `modelA` + `modelB` + `modelD`，3 个不同模型）：
 > `status=done`，三席全部产出，耗时 383 秒。同一时期 `providerC` 的席位报
-> `余额不足 (QUOTA)`——那是账号余额，不是插件问题。
+> `余额不足（QUOTA）`——那是账号余额，不是插件问题。
 
 ## 运行状态浮窗
 
@@ -234,7 +234,7 @@ else
 
 ## 已验证（2026-11-11，本机 DSH 0.2.2-rc.1）
 
-- **路径附件**：问题写 `D/dev/Project6-skill-Opt_of_Cpndition`（原样 typo）跑通，`filesState=ok`、`filesChars=23614`，模型回答里出现只有读到文件才知道的 `condopt` 架构 / 18 算法 / 18 门禁细节。
+- **路径附件**：问题写 `D/dev/workspace-project`（原样 typo）跑通，`filesState=ok`、`filesChars=23614`，模型回答里出现只有读到文件才知道的 `condopt` 架构 / 18 算法 / 18 门禁细节。
   > **2026-11-16 起需注意**：那是**工作区之外**的路径。默认已收紧为 fail-closed（只允许工作区与调用方目录），复现这条需要先把该目录加进 `attachRoots`，或临时置 `allowExternalPaths: true`。见下方「附件安全」。
 - **工作区识别**：问题不写路径、只说「总览当前工作区项目」，`GET /council/workspace` 从 `SessionHeader.cwd` 解析出 `workspaceId`，自动附带当前工作区（`filesChars=20182`），模型正确说出工作区里的真实内容；快照 `structure` 输出 `roles.answerers/reviewers/arbiter` 与 `stages=['answers','reviews']`。
 - **只读 subagent 席位**：`seatMode='subagent'` 实测 `status=done`，两个席位都真的用工具读了工作区的 `README.md`、`grep`、`glob` 后才作答（不是靠注入文本）。
