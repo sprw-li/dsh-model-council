@@ -287,18 +287,27 @@ else
 
 ## 安装
 
-npm 上的发布版本为 **0.1.0**（dist-tags `latest` / `alpha`）；本仓库源码版本 **0.2.36**，尚未发布到 npm——发布 0.2.x 需要新的 granular token（旧的已吊销）。
+npm 上的发布版本**停在 `0.1.0`**（dist-tags `latest` / `alpha`）——发布 0.2.x 需要新的 granular token（旧的已吊销）。
+所以 **npm 这条路拿到的是 0.1.0**：它没有 0.2.x 的安全硬化（附件 fail-closed、内容级密钥脱敏、
+junction 逃逸修复、出站清单确认）与可靠性修复（SSE 心跳、超时可重试、终态只写一次）。**不要从 npm 装。**
+
+当前源码版本 **0.2.36**；可安装的最新构建在 GitHub Releases 上：
 
 ```sh
-# 从 npm
-npx --yes @deepseek-ai/dsh@latest plugin --profile <name> add dsh-model-council@alpha
-
-# 或从 GitHub Release 的 tarball
+# 推荐：从 GitHub Release 的 tarball 装最新构建（当前 v0.2.36）
 npx --yes @deepseek-ai/dsh@latest plugin --profile <name> add `
-  https://github.com/sprw-li/dsh-model-council/releases/download/v0.1.0-alpha/dsh-model-council-0.1.0.tgz
+  https://github.com/sprw-li/dsh-model-council/releases/download/v0.2.36/dsh-model-council-0.2.36.tgz
+
+# 不推荐：npm 上的 0.1.0（见上）
+npx --yes @deepseek-ai/dsh@latest plugin --profile <name> add dsh-model-council@alpha
 ```
 
-安装或升级后刷新 DSH Web 页面；Host 半场可用插件行 disable → enable 重载。
+> 每次发版都会把对应 tarball 传到 Releases（资产名 `dsh-model-council-<版本>.tgz`）。装之前先看一眼
+> <https://github.com/sprw-li/dsh-model-council/releases> 的最新 tag，把上面命令里的版本号换成它——
+> 本 README 引用的源码版本由 `npm run verify` 的文档契约断言守着（`dev/verify-host.mjs` 会比对 `package.json`）。
+
+安装或升级后刷新 DSH Web 页面；Host 半场可用插件行 disable → enable 重载——**重载前先查 `GET /council/` 的
+`runningRuns`，非 0 就不要重载**（重载会杀掉在途运行并使调用方当轮失去工具绑定，见上文「运维注意」）。
 
 ## 开发与测试
 
