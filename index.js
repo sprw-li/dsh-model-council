@@ -2795,7 +2795,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v66', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v67', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -2810,7 +2810,7 @@ export function apply(ctx, config) {
           for (const run of runs.values()) if (run.status === 'running') runningCount += 1
           sendJson(res, 200, {
             ok: true,
-            build: 'v66',
+            build: 'v67',
             toolEnabled: toolEnabled(liveConfig),
             panelEnabled: panelEnabled(liveConfig),
             /*
