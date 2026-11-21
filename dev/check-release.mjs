@@ -5,11 +5,13 @@
  * 存在的理由：README 的安装命令曾经指向 `v0.1.0-alpha` 的 tarball，而 Releases 里已经有 v0.2.36 ——
  * 照 README 装的人拿到的是落后几十个版本的构建。**改一行 README 不解决问题，门禁才解决。**
  *
- * 一条命令，四个判据，任何一条不成立就 exit 1：
+ * 一条命令，五项判据（后两项在官方 registry 可达时追加），任何一条不成立就 exit 1：
  *   1. README 声明「仓库源码版本」== package.json 的 version
  *   2. README 的安装命令指向 **本版本** 的 Release 资产 URL
  *   3. README 不再指向任何旧版（如 v0.1.0-alpha）的 tarball —— 这是那次事故的回归守卫
  *   4. 最新 git tag == v<version>（远端优先，远端不可达时退回本地 tag）
+ *   5. README 陈述的 npm 版本 == 官方 registry 的 latest；npm 落后时 README 必须显式劝阻从 npm 安装
+ *      （registry 不可达 → SKIP，不算失败：环境失败 ≠ 逻辑失败）
  *
  * 用法：
  *   node dev/check-release.mjs
@@ -46,8 +48,33 @@ check(
   staleMatches.length ? staleMatches.map((m) => m[0]).join(', ') : '无旧版链接',
 )
 
-/* README 仍须如实说明 npm 上的发布版本停在 0.1.0（不能假装 npm 是最新） */
-check('README 如实说明 npm 上的发布版本（0.1.0）', /npm[^\n]*0\.1\.0/.test(readme), 'npm 0.1.0')
+/* README 对 npm 现状的陈述必须与**官方 registry** 一致。
+   分两种情形，且区分「环境失败」与「逻辑失败」：registry 不可达 → SKIP（不算失败）。 */
+const readmeNpmVersion = (readme.match(/npm[^\n]*?`(\d+\.\d+\.\d+)`/) || [])[1]
+let registryTags = null
+let registryWhy = ''
+try {
+  const res = await fetch('https://registry.npmjs.org/-/package/dsh-model-council/dist-tags', {
+    signal: AbortSignal.timeout(15000),
+  })
+  if (res.ok) registryTags = await res.json()
+  else registryWhy = `HTTP ${res.status}`
+} catch (err) {
+  registryWhy = String(err?.message ?? err).split('\n')[0]
+}
+
+if (registryTags === null) {
+  checks.push({ name: 'npm 现状与 README 一致', ok: true, skip: true, detail: `SKIP — registry 不可达（${registryWhy}）` })
+} else {
+  const latest = registryTags.latest
+  check('README 陈述的 npm 版本 == registry 的 latest', readmeNpmVersion === latest,
+    `README=${readmeNpmVersion ?? '(未陈述)'} registry.latest=${latest}`)
+  if (latest !== version) {
+    check('npm 落后于源码时，README 必须显式劝阻从 npm 安装', /不要从 npm 装/.test(readme), '已给出警示')
+  } else {
+    check('npm 已是本版本时，README 不得再劝阻从 npm 安装', !/不要从 npm 装/.test(readme), 'npm 已是最新')
+  }
+}
 
 /* 4：最新 tag 必须是本版本 */
 let tags = []

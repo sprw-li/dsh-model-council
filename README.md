@@ -388,7 +388,31 @@ node <workspace>\tmp\push-council.mjs <本目录> sprw-li/dsh-model-council main
 
 ## 发布记录与后续
 
-- GitHub：<https://github.com/sprw-li/dsh-model-council>，release 有 `v0.1.0-alpha` 与 `v0.2.0`（pre-release）。
-- npm：<https://www.npmjs.com/package/dsh-model-council>（已发布 `0.1.0`；仓库源码 `0.2.36` **尚未发布**——`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate）。
+- GitHub：<https://github.com/sprw-li/dsh-model-council>。每个版本都有对应的 pre-release 与 tarball 资产
+  （当前最新 `v0.2.36`，资产名 `dsh-model-council-0.2.36.tgz`）——**这是目前唯一可安装的路径**，见上文「安装」。
+- npm：<https://www.npmjs.com/package/dsh-model-council>。`latest` / `alpha` 都停在 **`0.1.0`**，
+  仓库源码 `0.2.36` **尚未发布**。`0.0.0-stage` 是 npm staged publishing 的过渡占位版本，已 deprecate。
 
-发新版本：更新 `CHANGELOG.md` 与 `package.json` 版本 → `npm run verify` → commit/tag → `npm publish --tag alpha`（npm 新包首次发布会进入 staged 审核，通常几分钟内变为可安装）→ `npm pack` + `gh release create vX.Y.Z --prerelease --notes-file CHANGELOG.md <tarball>`。
+### 发布到 npm（当前受阻：需要新 token）
+
+**实测（2026-11-22）**：`~/.npmrc` 里那个 `//registry.npmjs.org/:_authToken` 已经失效——
+`npm whoami --registry=https://registry.npmjs.org` 返回 `E401 Unauthorized`。所以 0.2.x 一直没上去。
+换一个新 granular token 之后是三条命令：
+
+```powershell
+# 1. 本机默认 registry 是镜像（registry.npmmirror.com），发布必须显式指向官方 registry，否则必然失败
+npm publish --registry=https://registry.npmjs.org --tag alpha
+
+# 2. 让不带 tag 的安装也拿到最新版（否则 `npm i dsh-model-council` 仍是 0.1.0）
+npm dist-tag add dsh-model-council@0.2.36 latest --registry=https://registry.npmjs.org
+
+# 3. 核对
+npm view dsh-model-council dist-tags --registry=https://registry.npmjs.org --json
+```
+
+> 账户若开了 2FA，第 1 条会要 OTP（追加 `--otp=<6 位>`）。
+> **发布后必须同步 README 的 npm 段落**：`dev/check-release.mjs` 会直接拉官方 registry 的 dist-tags 比对，
+> 落后或说错都会变红（registry 不可达时记 SKIP，不算失败——环境失败 ≠ 逻辑失败）。
+
+常规发版流程：更新 `CHANGELOG.md` 与 `package.json` 版本 → `npm run verify` → `node dev/check-release.mjs`
+→ commit/tag → 上面的三条 npm 命令 → `npm pack` + 建 release 传资产 → 更新 README 的 npm 段落。
