@@ -2844,7 +2844,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v67', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v68', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -2859,7 +2859,7 @@ export function apply(ctx, config) {
           for (const run of runs.values()) if (run.status === 'running') runningCount += 1
           sendJson(res, 200, {
             ok: true,
-            build: 'v67',
+            build: 'v68',
             toolEnabled: toolEnabled(liveConfig),
             panelEnabled: panelEnabled(liveConfig),
             /*
@@ -2870,6 +2870,12 @@ export function apply(ctx, config) {
              * that had called `council_review` was left holding a tool that no
              * longer resolves. Exposing the count makes "is it safe to reload?"
              * answerable BEFORE the fact instead of only diagnosable after it.
+             *
+             * `build` is bumped by hand on every behaviour change so that a
+             * reload is verifiable: if it still reads the previous marker, the
+             * host is running the old code and the new snapshot fields are not
+             * there — which is exactly the silent failure this file keeps trying
+             * to make visible.
              */
             runningRuns: runningCount,
           })
