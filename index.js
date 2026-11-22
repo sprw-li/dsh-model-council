@@ -507,19 +507,49 @@ export function selectCouncilRoutes(cat, requested, defaultSpecs) {
 }
 
 /**
- * Chairman route: the configured `defaultChairman` when it resolves AND is one of
- * the participants; otherwise the first participant (the historical election).
- * A chairman outside the roster is refused because a run only carries routes for
- * participating seats.
+ * Chairman route plus the reason a configured chairman was dropped.
+ * The configured `defaultChairman` is elected only when it resolves against the
+ * catalog AND is one of the participants; anything else falls back to the first
+ * participant (the historical election) and reports WHY. A run only carries
+ * routes for participating seats, so an outside-the-roster chairman cannot be
+ * used — but swapping it silently is what hid a misconfigured chairman from its
+ * user, so the reason travels with the election.
+ * @returns `{ route, problem }`; `problem` is '' when nothing was misconfigured.
+ */
+export function chairmanSelection(cat, selected, spec) {
+  const fallback = Array.isArray(selected) ? selected[0] : undefined
+  const raw = typeof spec === 'string' ? spec.trim() : ''
+  /* No chairman configured: the first participant IS the documented election,
+     not a misconfiguration to report. */
+  if (raw === '') return { route: fallback, problem: '' }
+  const parsed = parseRouteSpec(raw)
+  if (parsed === undefined) {
+    return { route: fallback, problem: `主席 "${raw}" 无法解析为 provider/model，已回退到第一个参与者` }
+  }
+  const route = findCatalogRoute(cat, parsed.provider, parsed.model)
+  if (route === undefined) {
+    return {
+      route: fallback,
+      problem: `主席 "${parsed.provider}/${parsed.model}" 不在当前模型目录中，已回退到第一个参与者`,
+    }
+  }
+  const participant = selected.find((row) => row.key === route.key)
+  if (participant === undefined) {
+    return {
+      route: fallback,
+      problem: `主席 "${parsed.provider}/${parsed.model}" 不在本次参与者名单里，已回退到第一个参与者`,
+    }
+  }
+  return { route: participant, problem: '' }
+}
+
+/**
+ * Chairman route: `chairmanSelection().route`, kept byte-for-byte compatible
+ * with the historical election. The reason a configured chairman was dropped
+ * lives in `chairmanSelection` and lands on the run as `chairmanProblem`.
  */
 export function pickChairmanRoute(cat, selected, spec) {
-  const fallback = Array.isArray(selected) ? selected[0] : undefined
-  const parsed = parseRouteSpec(spec)
-  if (parsed === undefined) return fallback
-  const route = findCatalogRoute(cat, parsed.provider, parsed.model)
-  if (route === undefined) return fallback
-  const participant = selected.find((row) => row.key === route.key)
-  return participant === undefined ? fallback : participant
+  return chairmanSelection(cat, selected, spec).route
 }
 
 /** Clip one answer before it enters another prompt. */
@@ -2082,6 +2112,14 @@ export function apply(ctx, config) {
       fallbackLimit: MAX_FALLBACKS_PER_RUN,
       resumed: run.resumed === undefined ? '' : run.resumed,
       useChairman: run.useChairman !== false,
+      /* Was this run started by the `council_review` tool (vs the /council panel)?
+         And how did the roster and the chairman resolve? The client needs these
+         to tell a tool-originated run from a human one and to surface a silent
+         roster/chairman fallback instead of re-delivering a finished conclusion. */
+      toolRun: run.toolRun === true,
+      modelSource: typeof run.modelSource === 'string' ? run.modelSource : '',
+      defaultModelProblems: Array.isArray(run.defaultModelProblems) ? run.defaultModelProblems : [],
+      chairmanProblem: typeof run.chairmanProblem === 'string' ? run.chairmanProblem : '',
       answers: run.answers.map((answer) => ({
         key: answer.key,
         provider: answer.provider,
@@ -2220,9 +2258,12 @@ export function apply(ctx, config) {
 
   /**
    * Deliver one finished run back to its session.
-   * `silent` uses `agent.inject()`: the conclusion becomes model-facing context
-   * claimed at the next pre-step, so it never occupies an inbox queue slot and
-   * never opens a turn. `wake` is a subagent-style parent delivery (`followup`).
+   * Both modes land in the agent's inbox, on different slots (`InboxTarget =
+   * 'next-turn' | 'next-step'`):
+   * `silent` uses `agent.inject()` → the `next-step` slot: claimed at the next
+   * pre-step, no wake, and nothing counted in the UI's queued badge.
+   * `wake` is a subagent-style parent delivery (`followup`) → the `next-turn`
+   * slot: queued and it wakes the agent.
    * @param run - completed run owning the target session.
    * @param mode - 'silent' or 'wake'.
    */
@@ -2501,7 +2542,12 @@ export function apply(ctx, config) {
   /** Conclusion text returned to the calling agent. */
   function toolConclusion(run) {
     const usable = run.answers.filter((answer) => answer.text !== '')
-    const modelsLine = `（参与模型：${run.answers.map((answer) => answer.name).join('、')}；runId: ${run.id}）`
+    /* A chairman that could not be honoured is reported in the conclusion itself
+       (not in `defaultModelProblems`, which is about the participant roster), so
+       the calling agent and the user both see it instead of a silent swap. */
+    const chairmanNote = typeof run.chairmanProblem === 'string' && run.chairmanProblem !== ''
+      ? `（注意：${run.chairmanProblem}）` : ''
+    const modelsLine = `（参与模型：${run.answers.map((answer) => answer.name).join('、')}；runId: ${run.id}）${chairmanNote}`
     if (run.status === 'error') {
       const kept = usable.map((answer) => `### ${answer.name}\n${answer.text}`).join('\n\n')
       const reason = run.stopReason === 'watchdog' ? '（原因：整轮超时）'
@@ -2608,7 +2654,8 @@ export function apply(ctx, config) {
       const selected = selection.routes
       if (selected.length === 0) throw new Error('no models available for the council')
       const useChairman = input.chairman !== false
-      const chairman = pickChairmanRoute(cat, selected, readSetting(liveConfig.defaultChairman, ''))
+      const chairmanChoice = chairmanSelection(cat, selected, readSetting(liveConfig.defaultChairman, ''))
+      const chairman = chairmanChoice.route
       /* The calling agent owns the workspace and the cancellation signal. */
       const caller = exec !== null && typeof exec === 'object' ? exec.agent : undefined
       const callerId = caller !== undefined && caller !== null && typeof caller.id === 'string' ? caller.id : ''
@@ -2649,6 +2696,8 @@ export function apply(ctx, config) {
         /* Which branch picked the roster, and what it had to drop. */
         modelSource: selection.source,
         defaultModelProblems: selection.problems,
+        /* Why the configured chairman was not elected, when it was not. */
+        chairmanProblem: chairmanChoice.problem,
         seatMode: 'llm',
         subagentSeats: 0,
         cwd: workspace.cwd,
@@ -2975,10 +3024,21 @@ export function apply(ctx, config) {
               if (seatParent !== undefined && seatParent !== null) seatMode = 'subagent'
             }
           }
+          /* Chairman for a panel-started run. Same single decision point as the
+             tool path, and for the same reason: a pick that cannot resolve, or
+             that is not one of the participants, used to be swapped in silence.
+             An empty pick is the documented election (first participant) and is
+             not reported; anything else travels out on `chairmanProblem` so the
+             user can see that their choice did not take effect. */
           let chairman = selected[0]
+          let chairmanProblem = ''
           if (body.chairman !== null && typeof body.chairman === 'object') {
-            const chosen = findRoute(cat, String(body.chairman.provider || ''), String(body.chairman.model || ''))
-            if (chosen !== undefined && selected.some((route) => route.key === chosen.key)) chairman = chosen
+            const provider = String(body.chairman.provider || '')
+            const model = String(body.chairman.model || '')
+            const spec = provider === '' || model === '' ? '' : `${provider}/${model}`
+            const choice = chairmanSelection(cat, selected, spec)
+            chairman = choice.route
+            chairmanProblem = choice.problem
           }
           /* Optional reviewer group, defaulting to every answerer (subagent/group style roster). */
           const reviewerRoutes = []
@@ -3046,6 +3106,10 @@ export function apply(ctx, config) {
             createdAt: Date.now(),
             sessionId,
             useChairman,
+            /* Panel path: a chairman the user picked but that could not serve
+               (unresolvable, or not among the participants) is reported here
+               instead of being replaced without a trace. */
+            chairmanProblem,
             seatMode,
             subagentSeats: seatMode === 'subagent' && seatParent !== undefined
               ? (requestedSeats === undefined ? selected.length : Math.min(requestedSeats, selected.length))

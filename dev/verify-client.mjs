@@ -1032,7 +1032,7 @@ for (const expected of ['评审失败', 'CouncilRunError', 'COUNCIL_FAILED']) {
   const councilDicts = dictionaries.find((entry) => entry.namespace === 'council')
   const enDict = councilDicts !== undefined && councilDicts.dicts !== undefined ? councilDicts.dicts.en : undefined
   if (enDict === undefined) throw new Error('council en dictionary is missing')
-  for (const key of ['seat.reasoning', 'seat.answer', 'seat.reviewer', 'seat.chairman', 'seat.chars', 'seat.window', 'seat.thinking', 'seat.waitingToken', 'seat.stageWaiting', 'seat.expand', 'seat.collapse']) {
+  for (const key of ['seat.reasoning', 'seat.answer', 'seat.reviewer', 'seat.chairman', 'seat.chars', 'seat.window', 'seat.thinking', 'seat.waitingToken', 'seat.stageWaiting', 'seat.expand', 'seat.collapse', 'feedback.toolDelivered', 'chairman.fallback', 'toolview.modelsFromSettings', 'toolview.modelsFromArgs']) {
     if (typeof enDict[key] !== 'string' || enDict[key] === '') throw new Error(`en dictionary is missing "${key}"`)
   }
 
@@ -2062,11 +2062,380 @@ function checkboxByLabel(text) {
   restore.props.onChange()
 }
 
+/* ---- Tool-originated runs are not posted back; /council runs still are ---- *
+ * The `council_review` tool hands the conclusion to its caller as the
+ * `tool/result`, so a panel poll/stream that also posted it spliced a second,
+ * duplicate conclusion into the same session. These cases drive BOTH shipped
+ * transports (SSE `/council/run/<id>/stream` and the poller `GET
+ * /council/run/<id>`) and assert the delivery decision itself, plus the card
+ * copy that explains a skip. */
+{
+  /* Every case below settles a synthetic run through the real poller. The
+     returned slice is this case's own traffic, so the resume decision is read
+     per case even though every case reuses the `run-live` snapshot id (the
+     fake host's `resumeCalls` ledger only records `run-<n>` ids). */
+  async function runToSnapshot(snapshot) {
+    liveRunOverride = snapshot
+    liveRunState = 'done'
+    nextRunId = 'run-live'
+    setQuestion('交付决策问题')
+    const button = findRunButton(build(tabBody({ t })))
+    if (button === undefined) throw new Error('run button missing while driving a delivery case')
+    const before = fetchCalls.length
+    button.props.onClick()
+    await new Promise((resolve) => setTimeout(resolve, 900))
+    const added = fetchCalls.slice(before)
+    if (!added.some((call) => call.method === 'GET' && String(call.url) === '/council/run/run-live')) {
+      throw new Error(`the delivery case never polled its finished run: ${JSON.stringify(added.map((call) => `${call.method} ${call.url}`))}`)
+    }
+    return added
+  }
+
+  /** The POST /council/run/<id>/resume calls inside one case's traffic. */
+  const resumePostsOf = (calls) => calls.filter((call) => /\/council\/run\/[^/]+\/resume$/.test(String(call.url)))
+  /** Observed resume decisions, printed at the end of this block. */
+  const deliveryDecisions = []
+  /** The `mode` of a delivery POST, or '' when it is malformed. */
+  const postedMode = (call) => {
+    try {
+      const body = JSON.parse(call.body)
+      return typeof body.mode === 'string' ? body.mode : ''
+    } catch {
+      return ''
+    }
+  }
+
+  const wakeRadio = findRadioByLabel(build(tabBody({ t })), '直接唤醒主聊天')
+  if (wakeRadio === undefined) throw new Error('wake feedback option is missing before the delivery cases')
+  wakeRadio.props.onChange()
+
+  /* The stream transport (`/council/run/<id>/stream`) shares the same decision
+     and is the one a live panel actually uses, so it is pinned too: a gate that
+     only covered the poller would let the duplicate conclusion back in. */
+  const streamInstances = []
+  class DeliveryEventSource {
+    constructor(url) {
+      this.url = String(url)
+      this.readyState = 1
+      this.onmessage = null
+      this.onerror = null
+      this.closed = false
+      this.handlers = new Map()
+      streamInstances.push(this)
+    }
+    addEventListener(type, listener) {
+      const set = this.handlers.get(type) || new Set()
+      set.add(listener)
+      this.handlers.set(type, set)
+    }
+    removeEventListener() {}
+    close() {
+      this.closed = true
+      this.readyState = 2
+    }
+    emit(payload) {
+      if (typeof this.onmessage === 'function') {
+        this.onmessage({ type: 'message', data: JSON.stringify(payload) })
+      }
+    }
+  }
+  fakeWindow.EventSource = DeliveryEventSource
+
+  /** Start one run and hand back the stream it opened, plus its own traffic. */
+  async function startStreamedRun(snapshot) {
+    liveRunOverride = snapshot
+    liveRunState = 'done'
+    nextRunId = 'run-live'
+    setQuestion('交付决策问题')
+    const before = fetchCalls.length
+    const button = findRunButton(build(tabBody({ t })))
+    if (button === undefined) throw new Error('run button missing while driving a stream case')
+    button.props.onClick()
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    const stream = streamInstances[streamInstances.length - 1]
+    if (stream === undefined) throw new Error('the stream delivery case did not open an EventSource')
+    return { stream, before }
+  }
+
+  try {
+    /* A2. stream: done + toolRun => no resume. */
+    const streamed = await startStreamedRun(Object.assign({}, LIVE_RUN_DONE, { toolRun: true }))
+    streamed.stream.emit(liveRunOverride)
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    const streamedCalls = fetchCalls.slice(streamed.before)
+    if (resumePostsOf(streamedCalls).length !== 0) {
+      throw new Error(`a tool-originated run must not be posted back through the stream either: ${JSON.stringify(streamedCalls.map((call) => `${call.method} ${call.url}`))}`)
+    }
+    if (!render(React.createElement(tabBody, { t })).includes('结论已作为工具结果交回调用方')) {
+      throw new Error('a stream-skipped tool-run delivery must say why on the card')
+    }
+    deliveryDecisions.push('stream/toolRun=no-resume')
+
+    /* A3. stream regression: without `toolRun` the stream still delivers. */
+    const streamedPanel = await startStreamedRun(Object.assign({}, LIVE_RUN_DONE))
+    streamedPanel.stream.emit(liveRunOverride)
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    const streamedResumes = resumePostsOf(fetchCalls.slice(streamedPanel.before))
+    if (streamedResumes.length !== 1 || postedMode(streamedResumes[0]) !== 'wake') {
+      throw new Error(`the stream path must still deliver a panel run: ${JSON.stringify(streamedResumes.map(postedMode))}`)
+    }
+    deliveryDecisions.push(`stream/panel=${postedMode(streamedResumes[0])}`)
+  } finally {
+    delete fakeWindow.EventSource
+  }
+
+  /* A. done + toolRun:true + wake => NO resume (this is the reported duplicate:
+        a `tool/result` plus a spliced `agent/inbox/spliced` conclusion). The
+        guard reads the POSTs themselves, so a failed resume cannot hide. */
+  const toolCalls = await runToSnapshot(Object.assign({}, LIVE_RUN_DONE, { toolRun: true }))
+  if (resumePostsOf(toolCalls).length !== 0) {
+    throw new Error(`a tool-originated run must not POST /council/run/<id>/resume at all: ${JSON.stringify(toolCalls.map((call) => `${call.method} ${call.url}`))}`)
+  }
+  const toolHtml = render(React.createElement(tabBody, { t }))
+  if (!toolHtml.includes('结论已作为工具结果交回调用方')) {
+    throw new Error(`a skipped tool-run delivery must say why on the card: ${toolHtml.slice(0, 600)}`)
+  }
+  deliveryDecisions.push('poll/toolRun=no-resume')
+
+  /* B. Regression guard: without `toolRun` the same finished run IS delivered,
+        exactly as before (`/council` panel runs follow the setting). */
+  const panelCalls = await runToSnapshot(Object.assign({}, LIVE_RUN_DONE))
+  const panelResumes = resumePostsOf(panelCalls)
+  if (panelResumes.length !== 1 || postedMode(panelResumes[0]) !== 'wake') {
+    throw new Error(`a panel run must still be posted back in wake mode: ${JSON.stringify(panelResumes.map(postedMode))}`)
+  }
+  const panelHtml = render(React.createElement(tabBody, { t }))
+  if (panelHtml.includes('结论已作为工具结果交回调用方')) {
+    throw new Error('a panel-originated run must not claim it was delivered as a tool result')
+  }
+  deliveryDecisions.push(`poll/panel=${postedMode(panelResumes[0])}`)
+
+  /* C. Regression guard: silent + no `toolRun` still resumes in silent mode. */
+  const silentRadio = findRadioByLabel(build(tabBody({ t })), '静默放进上下文')
+  if (silentRadio === undefined) throw new Error('silent feedback option is missing before the silent regression')
+  silentRadio.props.onChange()
+  const silentCalls = await runToSnapshot(Object.assign({}, LIVE_RUN_DONE))
+  const silentResumes = resumePostsOf(silentCalls)
+  if (silentResumes.length !== 1 || postedMode(silentResumes[0]) !== 'silent') {
+    throw new Error(`silent delivery regressed: ${JSON.stringify(silentResumes.map(postedMode))}`)
+  }
+  deliveryDecisions.push(`poll/silent=${postedMode(silentResumes[0])}`)
+
+  /* The card-meta cases below must not deliver a conclusion. */
+  const offRadio = findRadioByLabel(build(tabBody({ t })), '不做（只留在右侧栏）')
+  if (offRadio === undefined) throw new Error('feedback-off option is missing before the card-meta cases')
+  offRadio.props.onChange()
+
+  const cardArgs = { question: '卡片元信息', models: [], chairman: true, attachFiles: false }
+  const cardProps = { t, phase: 'start', block: { args: cardArgs, argsRaw: JSON.stringify(cardArgs) } }
+
+  /* D. `modelSource` (run snapshot) names where the roster came from, so the
+        old "由 Host 自动挑选" is not read as "my settings were ignored". */
+  await runToSnapshot(Object.assign({}, LIVE_RUN_DONE, { modelSource: 'default' }))
+  const settingsHtml = render(React.createElement(toolview, cardProps))
+  if (!settingsHtml.includes('参与模型：来自设置（2 个）')) {
+    throw new Error(`modelSource=default must name the saved settings: ${settingsHtml.slice(0, 500)}`)
+  }
+
+  await runToSnapshot(Object.assign({}, LIVE_RUN_DONE, { modelSource: 'explicit' }))
+  const explicitHtml = render(React.createElement(toolview, cardProps))
+  if (!explicitHtml.includes('参与模型：来自工具参数（2 个）')) {
+    throw new Error(`modelSource=explicit must name the tool arguments: ${explicitHtml.slice(0, 500)}`)
+  }
+
+  await runToSnapshot(Object.assign({}, LIVE_RUN_DONE, { modelSource: 'auto' }))
+  const autoHtml = render(React.createElement(toolview, cardProps))
+  if (!autoHtml.includes('参与模型：由 Host 自动挑选')) {
+    throw new Error(`modelSource=auto must keep the automatic wording: ${autoHtml.slice(0, 500)}`)
+  }
+
+  /* E. Missing snapshot field (old Host / no run) keeps the previous wording. */
+  await runToSnapshot(Object.assign({}, LIVE_RUN_DONE))
+  const noFieldHtml = render(React.createElement(toolview, cardProps))
+  if (!noFieldHtml.includes('参与模型：由 Host 自动挑选')) {
+    throw new Error(`a missing modelSource must keep the previous wording: ${noFieldHtml.slice(0, 500)}`)
+  }
+  if (noFieldHtml.includes('来自设置') || noFieldHtml.includes('来自工具参数')) {
+    throw new Error('a missing modelSource must not invent a roster source')
+  }
+
+  /* F. A dropped configured chairman is a warning line carrying the reason. */
+  const chairmanReason = '主席 "p1/m1" 不在本次参与者名单里，已回退到第一个参与者'
+  await runToSnapshot(Object.assign({}, LIVE_RUN_DONE, { chairmanProblem: chairmanReason }))
+  const problemTree = build(React.createElement(toolview, cardProps))
+  const problemWarn = findNode(problemTree, (node) => node !== null && typeof node === 'object'
+    && node.props !== undefined && node.props !== null
+    && String(node.props.className || '').includes('dsc-warn')
+    && textOf(node.children).includes('配置的主席不在参与者名单'))
+  if (problemWarn === undefined) {
+    throw new Error('a fallen-back chairman must render as a warning line on the card')
+  }
+  if (!textOf(problemWarn.children).includes(chairmanReason)) {
+    throw new Error(`the chairman warning must carry the Host reason: ${textOf(problemWarn.children)}`)
+  }
+  /* A clean snapshot clears it: the warning is per run, not sticky. */
+  await runToSnapshot(Object.assign({}, LIVE_RUN_DONE))
+  const cleanTree = build(React.createElement(toolview, cardProps))
+  const strayWarn = findNode(cleanTree, (node) => node !== null && typeof node === 'object'
+    && node.props !== undefined && node.props !== null
+    && String(node.props.className || '').includes('dsc-warn')
+    && textOf(node.children).includes('配置的主席不在参与者名单'))
+  if (strayWarn !== undefined) {
+    throw new Error('the chairman warning must not outlive its run snapshot')
+  }
+
+  liveRunOverride = null
+  liveRunState = 'running'
+
+  /* Raw evidence of the resume decisions this block locked. */
+  console.log(`  delivery decisions: ${deliveryDecisions.join(' | ')}`)
+}
+
 for (const cleanup of cleanups.reverse()) {
   try {
     cleanup()
   } catch (error) {
     throw new Error(`cleanup threw: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+/* ---- Legacy migration: `useFeedback:true` must mean 'silent', not 'wake' ---- *
+ * The old boolean used to become 'wake', which queues a follow-up turn on the
+ * main agent — so a user who never opened the panel kept getting a new chat
+ * turn spliced in after a tool run. A second, throwaway VM instance is the only
+ * way to observe the load-time migration: the shipped store is built once, from
+ * the storage contents that existed when its module loaded. Nothing here touches
+ * the first instance. */
+{
+  /** Boot one fresh client instance over chosen localStorage contents. */
+  function loadStoreInstance(stored) {
+    const values = new Map()
+    values.set(LS_KEY, JSON.stringify(stored))
+    let captured
+    const regs = []
+    let dicts = null
+    const win = {
+      __ModuleLoader__: { load(argument) { captured = argument } },
+      localStorage: {
+        getItem: (key) => (values.has(key) ? values.get(key) : null),
+        setItem: (key, value) => values.set(key, String(value)),
+      },
+      fetch: async () => ({
+        ok: true,
+        json: async () => ({ contextMaxChars: 6000, filesMaxChars: 20000, providers: [] }),
+      }),
+      /* This instance must arm no real timer: the check renders the panel
+         directly and never flushes its effects. */
+      setTimeout: () => 0,
+      clearTimeout: () => {},
+      setInterval: () => 0,
+      clearInterval: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      navigator: { clipboard: { writeText: async () => {} } },
+      location: { origin: 'http://127.0.0.1:63033' },
+    }
+    const doc = {
+      createElement: () => ({ tagName: 'STYLE', dataset: {}, style: {}, textContent: '', remove() {} }),
+      querySelector: () => null,
+      head: { appendChild() {} },
+      body: { appendChild() {}, removeChild() {} },
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    }
+    const vmContext = {
+      window: win,
+      document: doc,
+      console,
+      Map, Set, WeakMap, Promise, Date, Math, JSON, String, Number, Object, Array,
+      ArrayBuffer, Uint8Array, URL, AbortController, AbortSignal,
+      encodeURIComponent, decodeURIComponent, setTimeout, clearTimeout,
+      navigator: win.navigator,
+    }
+    vm.createContext(vmContext)
+    vm.runInContext(source, vmContext, { filename: 'client.js' })
+    if (captured === undefined) throw new Error('the migration instance did not load client.js')
+    const instance = captured.factory((specifier) => {
+      if (specifier === 'react') return React
+      if (specifier === 'react-dom') return ReactDom
+      throw new Error(`unexpected require("${specifier}")`)
+    })
+    const translater = (key, params) => {
+      const dict = dicts !== null && dicts.zh !== undefined ? dicts.zh : {}
+      let text = dict[key] !== undefined ? dict[key] : key
+      if (params !== undefined && params !== null) {
+        for (const [name, value] of Object.entries(params)) text = text.replaceAll(`{${name}}`, String(value))
+      }
+      return text
+    }
+    const makeScope = () => ({
+      get: () => undefined,
+      effect(fn) { fn(); return () => {} },
+      commandUi: { register: () => () => {} },
+    })
+    instance.apply({
+      get: () => undefined,
+      effect(fn) { fn(); return () => {} },
+      inject: (names, callback) => { callback(makeScope()); return () => {} },
+      locale: {
+        register(namespace, dictionariesForNamespace) {
+          dicts = dictionariesForNamespace
+          return () => {}
+        },
+        bind: () => (key, params) => translater(key, params),
+      },
+      slots: {
+        inject: (name, callback) => { callback(); return () => {} },
+        register(options, component) { regs.push({ key: options.name, options, component }); return () => {} },
+      },
+    })
+    return {
+      regs,
+      t: (key, params) => translater(key, params),
+      teardown() {
+        const fn = win.__dshCouncilTeardown
+        if (typeof fn === 'function') fn()
+      },
+    }
+  }
+
+  /** The checked state of one feedback radio in a fresh instance's panel. */
+  function panelRadio(instance, label) {
+    const tabReg = instance.regs.find((entry) => entry.options !== undefined && entry.options.name === 'sidebar.right.pane.tab')
+    if (tabReg === undefined) throw new Error('the migration instance did not register the panel tab')
+    const tree = build(React.createElement(tabReg.component, { t: instance.t }))
+    return findRadioByLabel(tree, label)
+  }
+
+  const legacy = loadStoreInstance({ useFeedback: true })
+  try {
+    const legacySilent = panelRadio(legacy, '静默放进上下文')
+    if (legacySilent === undefined || legacySilent.props.checked !== true) {
+      throw new Error("legacy useFeedback:true must migrate to feedbackMode 'silent'")
+    }
+    const legacyWake = panelRadio(legacy, '直接唤醒主聊天')
+    if (legacyWake === undefined || legacyWake.props.checked !== false) {
+      throw new Error("legacy useFeedback:true must NOT migrate to 'wake': that queues a follow-up turn on the main agent")
+    }
+  } finally {
+    legacy.teardown()
+  }
+
+  /* Regression: an absent/false flag still means "off" (no delivery at all). */
+  for (const stored of [{}, { useFeedback: false }]) {
+    const instance = loadStoreInstance(stored)
+    try {
+      const off = panelRadio(instance, '不做（只留在右侧栏）')
+      if (off === undefined || off.props.checked !== true) {
+        throw new Error(`useFeedback absent/false must stay 'off', got a checked state of ${JSON.stringify(stored)}`)
+      }
+      const silent = panelRadio(instance, '静默放进上下文')
+      if (silent === undefined || silent.props.checked !== false) {
+        throw new Error('useFeedback absent/false must not silently turn delivery on')
+      }
+    } finally {
+      instance.teardown()
+    }
   }
 }
 

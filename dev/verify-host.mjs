@@ -16,7 +16,7 @@ import { existsSync, readFileSync } from 'node:fs'
    `npm install --no-save --no-package-lock @deepseek-ai/schemastery` — the DSH
    installation also routes a linked plugin's declared peerDependencies, but a plain
    `node dev/verify-host.mjs` has no such router. */
-import { TRANSIENT_FAILURE, SEAT_RESULT_TIMEOUT_MS, SEAT_START_TIMEOUT_MS, PROVIDER_CONCURRENCY, MAX_FALLBACKS_PER_RUN, RUN_TIMEOUT_MS, CODE_FILE_CHARS, CODE_MAX_CHARS, CODE_WALK_ENTRIES, looksLikeDeliberatePath, reasoningTail, collectSourceFiles, defaultRoutesFromCatalog, candidatePaths, collectCodeContext, collectPathContext, documentOnlyReview, isPathInside, readTextFile, runLimited, withTimeout, apply, Config, toolEnabled, panelEnabled, parseRouteSpec, resolveConfiguredRoutes, selectCouncilRoutes, pickChairmanRoute, readSetting } from '../index.js'
+import { TRANSIENT_FAILURE, SEAT_RESULT_TIMEOUT_MS, SEAT_START_TIMEOUT_MS, PROVIDER_CONCURRENCY, MAX_FALLBACKS_PER_RUN, RUN_TIMEOUT_MS, CODE_FILE_CHARS, CODE_MAX_CHARS, CODE_WALK_ENTRIES, looksLikeDeliberatePath, reasoningTail, collectSourceFiles, defaultRoutesFromCatalog, candidatePaths, collectCodeContext, collectPathContext, documentOnlyReview, isPathInside, readTextFile, runLimited, withTimeout, apply, Config, toolEnabled, panelEnabled, parseRouteSpec, resolveConfiguredRoutes, selectCouncilRoutes, pickChairmanRoute, chairmanSelection, readSetting } from '../index.js'
 
 const root = await mkdtemp(join(tmpdir(), 'council-host-'))
 try {
@@ -632,7 +632,8 @@ try {
     assert.ok(capped.routes.length <= 6, `MAX_MODELS cap: ${capped.routes.length}`)
   }
 
-  /* defaultChairman: honoured only when it is one of the participants. */
+  /* defaultChairman: honoured only when it is one of the participants, and a
+     fallback is reported rather than silently swapped. */
   {
     const selected = resolveConfiguredRoutes(settingsCatalog, ['deepseek/pro', 'providerA/glm']).routes
     assert.equal(pickChairmanRoute(settingsCatalog, selected, '').key, 'deepseek|pro',
@@ -645,6 +646,41 @@ try {
       'a chairman outside the roster falls back')
     assert.equal(pickChairmanRoute(settingsCatalog, selected, 'providerA').key, 'deepseek|pro',
       'a malformed chairman falls back')
+
+    /* pickChairmanRoute stays a thin wrapper: same route for the very inputs
+       asserted above, so the new problem reporting cannot drift the election. */
+    for (const spec of ['', 'providerA/glm', 'nope/x', 'providerA/modelA', 'providerA']) {
+      assert.equal(pickChairmanRoute(settingsCatalog, selected, spec).key,
+        chairmanSelection(settingsCatalog, selected, spec).route.key,
+        `pickChairmanRoute must mirror chairmanSelection for ${JSON.stringify(spec)}`)
+    }
+
+    /* The three branches of chairmanSelection. The reason matters as much as the
+       route: a silent swap is what hid a misconfigured chairman from its user. */
+    const inside = chairmanSelection(settingsCatalog, selected, 'providerA/glm')
+    assert.equal(inside.route.key, 'providerA|glm', 'a chairman inside the roster is elected')
+    assert.equal(inside.problem, '', 'an honoured chairman reports no problem')
+
+    const offRoster = chairmanSelection(settingsCatalog, selected, 'providerA/modelA')
+    assert.equal(offRoster.route.key, 'deepseek|pro',
+      'a chairman in the catalog but outside the roster falls back to the first participant')
+    assert.equal(offRoster.problem, '主席 "providerA/modelA" 不在本次参与者名单里，已回退到第一个参与者',
+      'a chairman outside the roster must be reported, not silently swapped')
+
+    const offCatalog = chairmanSelection(settingsCatalog, selected, 'nope/x')
+    assert.equal(offCatalog.route.key, 'deepseek|pro', 'a chairman absent from the catalog falls back')
+    assert.equal(offCatalog.problem, '主席 "nope/x" 不在当前模型目录中，已回退到第一个参与者',
+      'a chairman absent from the catalog must be reported')
+
+    /* Unset is the documented election, not a misconfiguration; malformed is a
+       misconfiguration and is named. */
+    const unset = chairmanSelection(settingsCatalog, selected, '')
+    assert.equal(unset.route.key, 'deepseek|pro', 'an empty defaultChairman keeps electing the first participant')
+    assert.equal(unset.problem, '', 'an unset chairman must not raise a problem')
+    const malformed = chairmanSelection(settingsCatalog, selected, 'providerA')
+    assert.equal(malformed.route.key, 'deepseek|pro', 'a malformed chairman falls back')
+    assert.ok(malformed.problem.includes('无法解析'),
+      `a malformed chairman spec must be reported as unparsable, got ${JSON.stringify(malformed.problem)}`)
   }
 
   /* The reader behind both switches: plain values and live sources behave alike,
@@ -780,6 +816,89 @@ try {
       const run = (await http(chaired, 'GET', '/council/runs?sessionId=')).json.runs[0]
       assert.equal(run.chairman.key, 'providerA|glm', 'defaultChairman must become the chairman')
       assert.equal(run.structure.roles.arbiter, 'providerA|glm', 'the arbiter role must follow the chairman')
+
+      /* The snapshot must expose the four fields the client uses to tell a
+         tool-started run from a panel one and to show a roster/chairman
+         fallback: without `toolRun` the panel re-delivers a conclusion the tool
+         already returned, and without `chairmanProblem` a silent swap is hidden. */
+      assert.equal(run.toolRun, true, 'a tool-started run must snapshot toolRun=true')
+      assert.equal(run.modelSource, 'default', 'the snapshot must expose which branch picked the roster')
+      assert.deepEqual(run.defaultModelProblems, [], 'a clean defaultModels must report no problems')
+      assert.equal(run.chairmanProblem, '', 'an honoured chairman must report no problem')
+
+      /* A configured chairman that cannot be honoured is no longer silent: the
+         run records the reason and the tool's own conclusion carries it. */
+      const badChair = fakeHost(Config({
+        defaultModels: ['deepseek/pro', 'providerA/glm'],
+        defaultChairman: 'nope/x',
+      }))
+      const badResult = await badChair.tool.execute({ question: 'chairman probe', attachFiles: false }, {})
+      assert.deepEqual(badResult.models, ['deepseek/pro', 'providerA/glm'],
+        'the fallback chairman must not change the participant roster')
+      const badRun = (await http(badChair, 'GET', '/council/runs?sessionId=')).json.runs[0]
+      assert.equal(badRun.chairman.key, 'deepseek|pro', 'the fallback chairman must be the first participant')
+      assert.equal(badRun.chairmanProblem, '主席 "nope/x" 不在当前模型目录中，已回退到第一个参与者',
+        'the run snapshot must carry the chairman problem')
+      assert.ok(badResult.conclusion.includes('（注意：主席 "nope/x" 不在当前模型目录中，已回退到第一个参与者）'),
+        `the tool conclusion must surface the chairman problem; got ${JSON.stringify(badResult.conclusion)}`)
+
+      /* A panel-created run leaves all four fields unset, so it pins the snapshot
+         defaults (never `undefined`). */
+      const panelCreated = await http(chaired, 'POST', '/council/run', JSON.stringify({
+        question: 'panel probe',
+        models: [{ provider: 'deepseek', model: 'pro' }, { provider: 'providerA', model: 'glm' }],
+        attachFiles: false,
+      }))
+      assert.equal(panelCreated.status, 200, `a panel run must start; body=${JSON.stringify(panelCreated.json)}`)
+      const panelRun = (await http(chaired, 'GET', `/council/run/${panelCreated.json.runId}`)).json
+      assert.equal(panelRun.toolRun, false, 'a panel-created run must snapshot toolRun=false')
+      assert.equal(panelRun.modelSource, '', 'an unset modelSource must snapshot as ""')
+      assert.deepEqual(panelRun.defaultModelProblems, [], 'an unset defaultModelProblems must snapshot as []')
+      assert.equal(panelRun.chairmanProblem, '', 'an unset chairmanProblem must snapshot as ""')
+
+      /* A panel-started run that picks a chairman outside its own roster must not
+         swap it in silence either: the reason lands on the same `chairmanProblem`
+         field the tool path uses, while the fallback election is unchanged and
+         `toolRun` stays false so the panel still delivers its conclusion. */
+      const panelChair = await http(chaired, 'POST', '/council/run', JSON.stringify({
+        question: 'panel chairman probe',
+        models: [{ provider: 'deepseek', model: 'pro' }, { provider: 'providerA', model: 'glm' }],
+        chairman: { provider: 'providerA', model: 'modelA' },
+        attachFiles: false,
+      }))
+      assert.equal(panelChair.status, 200, `a panel run with a chairman must start; body=${JSON.stringify(panelChair.json)}`)
+      const panelChairRun = (await http(chaired, 'GET', `/council/run/${panelChair.json.runId}`)).json
+      assert.equal(panelChairRun.toolRun, false, 'a panel-created run must stay toolRun=false')
+      assert.equal(panelChairRun.chairman.key, 'deepseek|pro',
+        'a chairman outside the roster must still fall back to the first participant')
+      assert.equal(panelChairRun.chairmanProblem,
+        '主席 "providerA/modelA" 不在本次参与者名单里，已回退到第一个参与者',
+        'a panel chairman outside the roster must be reported, not swapped in silence')
+
+      /* An unresolvable panel chairman is reported on the same field. */
+      const panelGhost = await http(chaired, 'POST', '/council/run', JSON.stringify({
+        question: 'panel ghost chairman',
+        models: [{ provider: 'deepseek', model: 'pro' }, { provider: 'providerA', model: 'glm' }],
+        chairman: { provider: 'ghost', model: 'x' },
+        attachFiles: false,
+      }))
+      assert.equal(panelGhost.status, 200, 'a panel run with an unknown chairman must still start')
+      const panelGhostRun = (await http(chaired, 'GET', `/council/run/${panelGhost.json.runId}`)).json
+      assert.equal(panelGhostRun.chairmanProblem,
+        '主席 "ghost/x" 不在当前模型目录中，已回退到第一个参与者',
+        'an unresolvable panel chairman must be reported')
+
+      /* Regression: an honoured panel chairman reports nothing. */
+      const panelHonoured = await http(chaired, 'POST', '/council/run', JSON.stringify({
+        question: 'panel honoured chairman',
+        models: [{ provider: 'deepseek', model: 'pro' }, { provider: 'providerA', model: 'glm' }],
+        chairman: { provider: 'providerA', model: 'glm' },
+        attachFiles: false,
+      }))
+      assert.equal(panelHonoured.status, 200, 'a panel run with a valid chairman must start')
+      const panelHonouredRun = (await http(chaired, 'GET', `/council/run/${panelHonoured.json.runId}`)).json
+      assert.equal(panelHonouredRun.chairman.key, 'providerA|glm', 'an honoured panel chairman must serve')
+      assert.equal(panelHonouredRun.chairmanProblem, '', 'an honoured panel chairman must report no problem')
 
       /* panelEnabled=false refuses every change-class route with 403 + a
          structured code, before any run lookup (the ids do not exist). */

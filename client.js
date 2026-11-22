@@ -72,6 +72,12 @@ window.__ModuleLoader__.load({
       'panel.feedbackWakeSent': '已唤醒主聊天',
       /* A follower tab does not POST the conclusion; the leader does. */
       'panel.feedbackOtherTab': '结论由另一个标签页回投（本页不重复提交）',
+      /* A tool-originated run already handed the conclusion to the caller as
+         its `tool/result`, so the panel intentionally skips the post-back. */
+      'feedback.toolDelivered': '结论已作为工具结果交回调用方，未回投（/council 发起的运行仍按设置回投）',
+      /* The configured chairman was not among the participants and the Host
+         fell back to another seat; `problem` is the Host's own reason text. */
+      'chairman.fallback': '配置的主席不在参与者名单，已回退：{problem}',
       'panel.privacy': '接上下文时，最近约 {chars} 字会话内容会发送至所选模型提供商；回投会再发一条消息。',
       'panel.cost': '预计 {count} 次模型调用',
       'panel.partialFailure': '{failed}/{total} 个模型失败，其余结果仍有效',
@@ -93,6 +99,11 @@ window.__ModuleLoader__.load({
       'toolview.showFull': '展开全文',
       'toolview.showLess': '收起',
       'toolview.models': '参与模型（{count} 个）',
+      /* Where the roster came from, from the run snapshot's `modelSource`:
+         saved defaultModels vs the tool's own `models` argument. Without the
+         snapshot the card keeps its previous wording (see modelsAuto). */
+      'toolview.modelsFromSettings': '参与模型：来自设置（{count} 个）',
+      'toolview.modelsFromArgs': '参与模型：来自工具参数（{count} 个）',
       'toolview.modelsAuto': '参与模型：由 Host 自动挑选',
       'toolview.chairmanOn': '主席汇总：开',
       'toolview.chairmanOff': '主席汇总：关',
@@ -229,6 +240,8 @@ window.__ModuleLoader__.load({
       'panel.feedbackSilentSent': 'Placed into context (not queued)',
       'panel.feedbackWakeSent': 'Posted and woke the main Agent',
       'panel.feedbackOtherTab': 'Another tab posted the conclusion (not re-sent here)',
+      'feedback.toolDelivered': 'The conclusion went back to the caller as the tool result, so it was not posted back (/council runs still follow the setting)',
+      'chairman.fallback': 'The configured chairman is not among the participants; fell back: {problem}',
       'panel.privacy': 'With context on, about {chars} characters of this chat are sent to the selected model providers; posting back adds one more message.',
       'panel.cost': 'About {count} model calls',
       'panel.partialFailure': '{failed}/{total} models failed; the other results still stand',
@@ -250,6 +263,8 @@ window.__ModuleLoader__.load({
       'toolview.showFull': 'Show full question',
       'toolview.showLess': 'Collapse',
       'toolview.models': 'Participants ({count})',
+      'toolview.modelsFromSettings': 'Participants: from settings ({count})',
+      'toolview.modelsFromArgs': 'Participants: from tool arguments ({count})',
       'toolview.modelsAuto': 'Participants: chosen automatically by the Host',
       'toolview.chairmanOn': 'Chairman synthesis: on',
       'toolview.chairmanOff': 'Chairman synthesis: off',
@@ -509,9 +524,15 @@ const RUN_DISCOVERY_MS = 4000
         seatSplit: Number.isSafeInteger(persisted.seatSplit) && persisted.seatSplit >= 1 && persisted.seatSplit <= 5
           ? persisted.seatSplit
           : 2,
+        /* Legacy migration: the 1.x boolean `useFeedback` used to become
+           'wake', which pushes a follow-up turn onto the main agent's queue and
+           wakes it. A user who never touched the panel therefore kept getting a
+           new chat turn spliced in after every finished run. The old flag now
+           maps to 'silent' (context only: no queue entry, no wake), which is
+           what the panel's own "静默放进上下文" option does. */
         feedbackMode: persisted.feedbackMode === 'silent' || persisted.feedbackMode === 'wake'
           ? persisted.feedbackMode
-          : persisted.useFeedback === true ? 'wake' : 'off',
+          : persisted.useFeedback === true ? 'silent' : 'off',
         useChairman: persisted.useChairman !== false,
         sessionId: '',
         feedbackRunId: '',
@@ -925,9 +946,11 @@ const RUN_DISCOVERY_MS = 4000
         store.publish({ run: data, running })
         if (!running) {
           stopEventStream()
-          if (data.status === 'done' && store.state.feedbackMode !== 'off') {
-            void resumeRun(runId, store.state.feedbackMode)
-          }
+          const mode = autoDeliverMode(data)
+          /* `tool-run` is a deliberate skip, not a silent one: the card names
+             the reason. The setting itself is left untouched. */
+          if (mode === 'tool-run') store.publish({ feedbackNote: 'tool-delivered' })
+          else if (mode !== '') void resumeRun(runId, mode)
         }
       }
       /* Host heartbeat (`event: beat`, `data: {"seq":N}`, every ~3s while the
@@ -1252,8 +1275,10 @@ const RUN_DISCOVERY_MS = 4000
           } else {
             schedulePoll(runId)
           }
-        } else if (data.status === 'done' && store.state.feedbackMode !== 'off') {
-          void resumeRun(runId, store.state.feedbackMode)
+        } else {
+          const mode = autoDeliverMode(data)
+          if (mode === 'tool-run') store.publish({ feedbackNote: 'tool-delivered' })
+          else if (mode !== '') void resumeRun(runId, mode)
         }
       } catch (error) {
         if (store.state.runId !== runId) return
@@ -1416,6 +1441,24 @@ const RUN_DISCOVERY_MS = 4000
       } catch {
         /* the next poll reports the settled state */
       }
+    }
+
+    /**
+     * Decide how a finished run may be posted back into the chat.
+     *
+     * Returns the delivery mode, `''` for "deliver nothing", or `'tool-run'`
+     * when the delivery is skipped *because the run was started by the
+     * `council_review` tool*: that tool already hands the conclusion to its
+     * caller as the `tool/result` (host side), so the panel's poll/stream would
+     * otherwise splice a second, duplicate conclusion into the same session.
+     * A `/council` panel run has no tool result, so it keeps following the
+     * user's own setting. Read from the run snapshot, never from a guess.
+     */
+    function autoDeliverMode(data) {
+      if (data === null || typeof data !== 'object' || data.status !== 'done') return ''
+      if (store.state.feedbackMode === 'off') return ''
+      if (data.toolRun === true) return 'tool-run'
+      return store.state.feedbackMode
     }
 
     /**
@@ -1811,6 +1854,9 @@ const RUN_DISCOVERY_MS = 4000
         run: snapshot.run,
         running: snapshot.running,
         runId: snapshot.runId,
+        /* The card must be able to say "not posted back, and why": a
+           tool-originated run is skipped on purpose, not silently dropped. */
+        feedbackMode: snapshot.feedbackMode,
         /* Only this card's open row: expanding a row here must not move the
            conversation card, and vice versa. */
         seatOpenFloat: snapshot.seatOpenFloat,
@@ -1871,6 +1917,16 @@ const RUN_DISCOVERY_MS = 4000
         ),
         run !== null && typeof run.question === 'string' && run.question !== ''
           ? h('div', { className: 'dsc-float-q', title: run.question }, run.question)
+          : null,
+        /* A configured chairman that was dropped is a warning, not a silent
+           detail: the user's choice did not take effect. */
+        run !== null && typeof run.chairmanProblem === 'string' && run.chairmanProblem !== ''
+          ? h('div', { className: 'dsc-warn' }, t('chairman.fallback', { problem: run.chairmanProblem }))
+          : null,
+        /* The conclusion already went back as the tool result. Shown while the
+           delivery setting is on, i.e. exactly when the skip is a decision. */
+        run !== null && run.status === 'done' && run.toolRun === true && state.feedbackMode !== 'off'
+          ? h('div', { className: 'dsc-note' }, t('feedback.toolDelivered'))
           : null,
         seats.items.length > 0
           ? h('div', { className: 'dsc-float-seats' },
@@ -2661,6 +2717,12 @@ const RUN_DISCOVERY_MS = 4000
                     run.status === 'done' && resumedMode === '' && state.feedbackNote === 'another-tab'
                       ? h('span', { className: 'dsc-note' }, t('panel.feedbackOtherTab'))
                       : null,
+                    run.status === 'done' && resumedMode === '' && state.feedbackNote === 'tool-delivered'
+                      ? h('span', { className: 'dsc-note' }, t('feedback.toolDelivered'))
+                      : null,
+                    typeof run.chairmanProblem === 'string' && run.chairmanProblem !== ''
+                      ? h('span', { className: 'dsc-warn' }, t('chairman.fallback', { problem: run.chairmanProblem }))
+                      : null,
                   ),
                   h('div', { className: 'dsc-grid' },
                     run.answers.map((answer) => h('div', { className: 'dsc-card', key: answer.key },
@@ -2797,6 +2859,9 @@ const RUN_DISCOVERY_MS = 4000
         run: snapshot.run,
         running: snapshot.running,
         runId: snapshot.runId,
+        /* Needed to tell a deliberate skip of the post-back (setting on, tool
+           run) from a run that was never going to be delivered. */
+        feedbackMode: snapshot.feedbackMode,
         /* Which live seat row is open on THIS card. View state only: the
            shipped store subscription repaints the card, run fields are not
            touched, and the floating card keeps its own open row. */
@@ -2872,6 +2937,25 @@ const RUN_DISCOVERY_MS = 4000
       }
       const stage = liveVisible && stageNames[run.stage] !== undefined ? stageNames[run.stage] : stageNames.answers
 
+      /* Where the roster came from, per the run snapshot's `modelSource`:
+         'default' = the saved defaultModels, 'explicit' = the tool's own
+         `models` argument, 'auto' = the Host picked. The snapshot is
+         authoritative because the tool arguments alone cannot tell "no models
+         passed" from "the saved defaults were used". Without a snapshot (or
+         without the field, or without a count) the card keeps its previous
+         wording, so the old path is untouched. */
+      const modelSource = run !== null && typeof run.modelSource === 'string' ? run.modelSource : ''
+      const rosterCount = run !== null && Array.isArray(run.answers) && run.answers.length > 0
+        ? run.answers.length
+        : models.length
+      const participantsText = rosterCount > 0 && modelSource === 'default'
+        ? t('toolview.modelsFromSettings', { count: rosterCount })
+        : rosterCount > 0 && modelSource === 'explicit'
+          ? t('toolview.modelsFromArgs', { count: rosterCount })
+          : models.length > 0 ? t('toolview.models', { count: models.length }) : t('toolview.modelsAuto')
+      const toolDelivered = run !== null && run.status === 'done' && run.toolRun === true && live.feedbackMode !== 'off'
+      const chairmanProblem = run !== null && typeof run.chairmanProblem === 'string' ? run.chairmanProblem : ''
+
       return h('div', { className: 'dsc-tool' },
         h('div', { className: 'dsc-tool-head' },
           h('span', { className: 'dsc-tool-icon', 'aria-hidden': true }, '⚖'),
@@ -2896,12 +2980,20 @@ const RUN_DISCOVERY_MS = 4000
               models.map((label, index) => h('span', { className: 'dsc-tool-chip', key: `${index}:${label}` }, label)))
           : null,
         h('div', { className: 'dsc-tool-meta' },
-          models.length > 0
-            ? h('span', null, t('toolview.models', { count: models.length }))
-            : h('span', null, t('toolview.modelsAuto')),
+          h('span', null, participantsText),
           h('span', null, chairmanOn ? t('toolview.chairmanOn') : t('toolview.chairmanOff')),
           h('span', null, attachOn ? t('toolview.attachOn') : t('toolview.attachOff')),
         ),
+        /* A configured chairman that was dropped is a warning, not a silent
+           detail: the user's choice did not take effect. */
+        chairmanProblem !== ''
+          ? h('div', { className: 'dsc-warn' }, t('chairman.fallback', { problem: chairmanProblem }))
+          : null,
+        /* The conclusion already went back as this call's tool result; the
+           panel therefore did not post it again, and says so. */
+        toolDelivered
+          ? h('div', { className: 'dsc-note' }, t('feedback.toolDelivered'))
+          : null,
         liveVisible
           ? h('div', { className: 'dsc-tool-live' },
               h('div', { className: 'dsc-tool-live-head' },
