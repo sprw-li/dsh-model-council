@@ -53,11 +53,44 @@ if (!Number.isSafeInteger(STREAM_REBUILD_BASE_MS) || STREAM_REBUILD_BASE_MS <= 0
    sleeping STREAM_STALL_MS/… for real. */
 let timerSeq = 0
 const pendingTimers = new Map()
+/* Case-timer lookups where the discovery chain's re-arm happened to be armed
+   last. Non-zero is expected in a long run; it is only evidence, and it is the
+   exact condition that used to fire the wrong callback. */
+let discoveryNoiseHits = 0
+
+/**
+ * The discovery chain re-arms itself on an endless RUN_DISCOVERY_MS schedule,
+ * on its own clock. It is the only periodic timer the client owns, and it is
+ * also the only `window.setTimeout` callback whose source names
+ * `scheduleRunDiscovery`, so the harness tags it at arm time instead of
+ * guessing by delay: 4000ms is *also* a legitimate stream-rebuild backoff
+ * (1000 * 2**2), and matching on the delay alone both miscounted discovery arms
+ * and let a case's "fire the newest timer" hit the discovery callback by luck —
+ * which left the case's own timer armed and dead-ended a later assertion.
+ */
+function isDiscoveryChainTimer(fn) {
+  try {
+    return /scheduleRunDiscovery/.test(String(fn))
+  } catch {
+    return false
+  }
+}
 
 /** Newest timer still armed (optionally newer than a sequence watermark). */
 function newestPendingTimer(sinceSeq = 0) {
-  return [...pendingTimers.values()]
+  const armed = [...pendingTimers.values()]
     .filter((timer) => timer.seq > sinceSeq)
+    .sort((left, right) => right.seq - left.seq)
+  /* Evidence only: how often the discovery chain would have been mistaken for
+     the timer a case just armed. Surfaced through the failure dump. */
+  if (armed.length > 0 && armed[0].discovery === true) discoveryNoiseHits += 1
+  return armed.find((timer) => timer.discovery !== true)
+}
+
+/** Newest armed timer of exactly one delay (optionally newer than a watermark). */
+function newestTimerOfDelay(ms, sinceSeq = 0) {
+  return [...pendingTimers.values()]
+    .filter((timer) => timer.seq > sinceSeq && timer.ms === ms && timer.discovery !== true)
     .sort((left, right) => right.seq - left.seq)[0]
 }
 
@@ -71,28 +104,113 @@ function fireNewestPendingTimer(what, sinceSeq = 0) {
   return timer
 }
 
+/**
+ * Fire the newest armed stream watchdog.
+ *
+ * The discovery chain re-arms a DISCOVERY_MS timer on its own endless schedule,
+ * so a re-arm landing between a case arming its watchdog and the case firing
+ * "the newest timer" used to fire the discovery callback instead, leaving the
+ * watchdog armed and dead-ending the assertion. The watchdog is therefore fired
+ * by its own delay: no other code path arms STREAM_STALL_MS.
+ */
+function fireNewestWatchdog(what) {
+  const timer = newestTimerOfDelay(STREAM_STALL_MS)
+  if (timer === undefined) throw new Error(`no armed stream watchdog to fire for ${what}`)
+  pendingTimers.delete(timer.id)
+  clearTimeout(timer.id)
+  timer.fn(...timer.rest)
+  return timer
+}
+
 /* Count store publishes. The only `Object.assign({}, <state>, patch)` in
    client.js is store.publish, so tapping Object.assign inside the plugin's
    context lets a case assert "a beat must not publish" exactly: rendered HTML
    cannot reveal a publish that writes identical data. The store state is
    recognised by two of its own keys, which the other Object.assign in client.js
-   (fetch options) never has. */
+   (fetch options) never has.
+
+   The tap also keeps the last merged store state plus a short patch log: when a
+   case fails on state that a render should have reflected, the raw list of
+   publishes is the only way to tell a harness timing race from a real product
+   race, and a failure dump without it is guesswork. */
 let publishCount = 0
+let lastStoreState = null
+const storePublishLog = []
+const STORE_PUBLISH_LOG_MAX = 80
 const objectTap = new Proxy(Object, {
   get(target, key, receiver) {
     if (key !== 'assign') return Reflect.get(target, key, receiver)
     return function countingAssign(first, ...sources) {
       const state = sources[0]
-      if (sources.length >= 2
+      const isStore = sources.length >= 2
         && state !== null && typeof state === 'object'
         && Object.prototype.hasOwnProperty.call(state, 'catalog')
-        && Object.prototype.hasOwnProperty.call(state, 'feedbackMode')) {
+        && Object.prototype.hasOwnProperty.call(state, 'feedbackMode')
+      if (isStore) {
         publishCount += 1
+        const patch = sources[1] !== null && typeof sources[1] === 'object' ? sources[1] : {}
+        let detail = Object.keys(patch).join(',')
+        if (patch.run !== null && typeof patch.run === 'object') {
+          detail += `[${patch.run.id}/${patch.run.status}/${patch.run.stage}]`
+        }
+        storePublishLog.push({ seq: publishCount, detail, patch })
+        if (storePublishLog.length > STORE_PUBLISH_LOG_MAX) storePublishLog.shift()
       }
-      return Object.assign(first, ...sources)
+      const merged = Object.assign(first, ...sources)
+      if (isStore) lastStoreState = Object.assign({}, merged)
+      return merged
     }
   },
 })
+
+/** The store fields the outbound-manifest confirmation depends on. */
+function manifestStateDump() {
+  const state = lastStoreState !== null && typeof lastStoreState === 'object' ? lastStoreState : {}
+  const preview = state.preview !== null && state.preview !== undefined && typeof state.preview === 'object' ? state.preview : null
+  const key = `${typeof state.sessionId === 'string' ? state.sessionId : ''}\u0000${String(state.question || '').trim()}`
+  return JSON.stringify({
+    sessionId: state.sessionId,
+    question: state.question,
+    attachFiles: state.attachFiles,
+    previewLoading: state.previewLoading,
+    previewError: state.previewError,
+    preview: preview === null ? null : { keys: Object.keys(preview).join(','), question: preview.question },
+    previewKey: state.previewKey,
+    renderKey: key,
+    keyMatches: state.previewKey === key,
+    /* The run button is `running ? 运行中 : confirmed ? 确认并开始评审 : 开始评审`,
+       so an in-flight synthetic run is the other way this case can lose its
+       expected text. Both are dumped, never inferred. */
+    running: state.running,
+    runId: state.runId,
+    run: state.run !== null && typeof state.run === 'object'
+      ? { id: state.run.id, status: state.run.status, stage: state.run.stage }
+      : null,
+    discoveryNoiseHits,
+    publishSeq: publishCount,
+    lastPublishes: storePublishLog.slice(-12).map((entry) => `${entry.seq}:${entry.detail}`),
+  })
+}
+
+/**
+ * Poll the recorded store state until it settles, bounded and loud on expiry.
+ *
+ * A case must not render-and-assert on a fixed sleep and hope the async state
+ * landed: that is how a red can mean "the harness looked too early" instead of
+ * "the code is wrong". The predicate is this case's own precondition and the
+ * expected values are untouched; if the state never arrives, the timeout names
+ * what was awaited and dumps the store instead of guessing.
+ */
+async function waitForStore(predicate, what, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    if (lastStoreState !== null && predicate(lastStoreState) === true) return
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out after ${timeoutMs}ms waiting for ${what}; state: ${manifestStateDump()}`)
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+}
 
 const PACKAGE_NAME = 'dsh-model-council'
 const TAB_ID = 'dsh-model-council/panel'
@@ -127,6 +245,12 @@ let failNextResumeWith409 = null
 let failNextRunPolls = 0
 /* Fault injection for the outbound-manifest preview (fail-closed cases). */
 let failNextPreview = null
+
+/* The host's enforced refusal for a run it marked `toolRun` (index.js
+   `resumeGuard`, status 409, code 'tool-run'). Verbatim: the case below renders
+   this text, so a wording change on the host side must be a conscious edit. */
+const TOOL_RUN_409_TEXT = '这是工具发起的运行（council_review），结论已作为工具结果交回调用方，不再重复回投；'
+  + '确需强制投递请加 ?force=1（会在运行记录上留下强制痕迹，可审计）'
 
 /* A full `POST /council/preview` 200 body, in the documented shape. */
 const PREVIEW_RESPONSE = {
@@ -353,6 +477,13 @@ const fakeWindow = {
       nextRunId = null
       return { ok: true, json: async () => ({ runId }) }
     }
+    /* The enforced tool-run refusal is injected for ANY run id (the delivery
+       paths under test drive the `run-live` snapshot, whose id the generic
+       ledger below deliberately does not record). */
+    if (failNextResumeWith409 === 'tool-run' && /\/council\/run\/[^/]+\/resume$/.test(String(url))) {
+      failNextResumeWith409 = null
+      return { ok: false, status: 409, json: async () => ({ error: TOOL_RUN_409_TEXT, code: 'tool-run' }) }
+    }
     const resumeMatch = /\/council\/run\/(run-\d+)\/resume$/.exec(String(url))
     if (resumeMatch !== null) {
       const payload = JSON.parse(options === undefined || options === null || options.body === undefined ? '{}' : options.body)
@@ -387,8 +518,9 @@ const fakeWindow = {
       pendingTimers.delete(id)
       fn(...rest)
     }, ms)
-    pendingTimers.set(id, { id, seq, ms, fn, rest })
-    if (ms === DISCOVERY_MS) {
+    const discovery = isDiscoveryChainTimer(fn)
+    pendingTimers.set(id, { id, seq, ms, fn, rest, discovery })
+    if (discovery) {
       discoveryArms += 1
       discoveryTimerIds.push(id)
     }
@@ -1028,12 +1160,24 @@ for (const expected of ['评审失败', 'CouncilRunError', 'COUNCIL_FAILED']) {
   const resumeBeforeReasoning = resumeCalls.length
 
   /* Both dictionaries must carry the new copy: a key present only in zh renders
-     as a raw key in an English UI. */
+     as a raw key in an English UI. Parity is asserted over the WHOLE dictionary
+     (not just the keys listed here), so a future key cannot land in one locale
+     only. */
   const councilDicts = dictionaries.find((entry) => entry.namespace === 'council')
   const enDict = councilDicts !== undefined && councilDicts.dicts !== undefined ? councilDicts.dicts.en : undefined
   if (enDict === undefined) throw new Error('council en dictionary is missing')
-  for (const key of ['seat.reasoning', 'seat.answer', 'seat.reviewer', 'seat.chairman', 'seat.chars', 'seat.window', 'seat.thinking', 'seat.waitingToken', 'seat.stageWaiting', 'seat.expand', 'seat.collapse', 'feedback.toolDelivered', 'chairman.fallback', 'toolview.modelsFromSettings', 'toolview.modelsFromArgs']) {
+  const zhDict = councilDicts !== undefined && councilDicts.dicts !== undefined ? councilDicts.dicts.zh : undefined
+  if (zhDict === undefined) throw new Error('council zh dictionary is missing')
+  for (const key of Object.keys(zhDict)) {
+    if (!(key in enDict)) throw new Error(`en dictionary is missing "${key}"`)
+    if (typeof enDict[key] !== 'string' || enDict[key] === '') throw new Error(`en dictionary has no text for "${key}"`)
+  }
+  for (const key of Object.keys(enDict)) {
+    if (!(key in zhDict)) throw new Error(`zh dictionary is missing "${key}"`)
+  }
+  for (const key of ['seat.reasoning', 'seat.answer', 'seat.reviewer', 'seat.chairman', 'seat.chars', 'seat.window', 'seat.thinking', 'seat.waitingToken', 'seat.stageWaiting', 'seat.expand', 'seat.collapse', 'feedback.toolDelivered', 'chairman.fallback', 'toolview.modelsFromSettings', 'toolview.modelsFromArgs', 'plan.waves', 'plan.wavesPlain', 'plan.overProvider', 'plan.overSep', 'plan.sep', 'plan.budget', 'plan.budgetSpent', 'stop.chairmanSkipped', 'stop.watchdog', 'stop.cancelled', 'stop.stageError', 'stop.generic', 'stop.hostReason']) {
     if (typeof enDict[key] !== 'string' || enDict[key] === '') throw new Error(`en dictionary is missing "${key}"`)
+    if (typeof zhDict[key] !== 'string' || zhDict[key] === '') throw new Error(`zh dictionary is missing "${key}"`)
   }
 
   liveRunState = 'running'
@@ -1636,7 +1780,7 @@ function checkboxByLabel(text) {
   const pollRequests = () => fetchCalls.filter((call) => /^\/council\/run\/[^/]+$/.test(String(call.url))).length
   /** The newest armed timer has to be a fresh stall watchdog. */
   function requireWatchdog(what, sinceSeq) {
-    const timer = newestPendingTimer(sinceSeq)
+    const timer = newestTimerOfDelay(STREAM_STALL_MS, sinceSeq)
     if (timer === undefined || timer.ms !== STREAM_STALL_MS) {
       throw new Error(`${what}: expected a fresh ${STREAM_STALL_MS}ms watchdog, got ${timer === undefined ? 'no timer' : timer.ms + 'ms'}`)
     }
@@ -1718,7 +1862,7 @@ function checkboxByLabel(text) {
       const stream = await startWatchedRun()
       const pollsBefore = pollRequests()
       const streamsBefore = sseInstances.length
-      const fired = fireNewestPendingTimer('follower stream stall')
+      const fired = fireNewestWatchdog('follower stream stall')
       if (fired.ms !== STREAM_STALL_MS) {
         throw new Error(`the newest timer should be the ${STREAM_STALL_MS}ms watchdog, got ${fired.ms}ms`)
       }
@@ -1766,10 +1910,10 @@ function checkboxByLabel(text) {
     {
       const stream = await startWatchedRun()
       const pollsBefore = pollRequests()
-      fireNewestPendingTimer('backoff stall 1')
+      fireNewestWatchdog('backoff stall 1')
       const firstDelay = newestPendingTimer()
       fireNewestPendingTimer('backoff rebuild 1')
-      fireNewestPendingTimer('backoff stall 2')
+      fireNewestWatchdog('backoff stall 2')
       const secondDelay = newestPendingTimer()
       if (firstDelay === undefined || firstDelay.ms !== STREAM_REBUILD_BASE_MS) {
         throw new Error(`the first follower rebuild must wait ${STREAM_REBUILD_BASE_MS}ms, got ${firstDelay === undefined ? 'nothing' : firstDelay.ms + 'ms'}`)
@@ -1790,13 +1934,13 @@ function checkboxByLabel(text) {
       liveRunState = 'running'
       await startWatchedRun()
       for (let attempt = 1; attempt <= STREAM_REBUILD_MAX; attempt += 1) {
-        fireNewestPendingTimer(`cap stall ${attempt}`)
+        fireNewestWatchdog(`cap stall ${attempt}`)
         const retry = newestPendingTimer()
         if (retry === undefined) throw new Error(`rebuild attempt ${attempt} did not schedule a retry`)
         fireNewestPendingTimer(`cap rebuild ${attempt}`)
       }
       const timersBefore = timerSeq
-      fireNewestPendingTimer('cap stall after the rebuild budget')
+      fireNewestWatchdog('cap stall after the rebuild budget')
       if (timerSeq !== timersBefore) {
         throw new Error('the follower rebuild budget must cap retries: a further retry was armed past STREAM_REBUILD_MAX')
       }
@@ -1807,8 +1951,8 @@ function checkboxByLabel(text) {
       for (const id of rivalIntervals) clearInterval(id)
       rivalIntervals.length = 0
       dispatchWindowEvent('pageshow', { type: 'pageshow' })
-      const poll = newestPendingTimer()
-      if (poll === undefined || poll.ms !== 320) {
+      const poll = newestTimerOfDelay(320)
+      if (poll === undefined) {
         throw new Error('after the rebuild budget a leader must poll (no dead end left behind)')
       }
       liveRunState = 'done'
@@ -1823,11 +1967,11 @@ function checkboxByLabel(text) {
       const stream = await startWatchedRun()
       const pollsBefore = pollRequests()
       const streamsBefore = sseInstances.length
-      fireNewestPendingTimer('leader stream stall')
+      fireNewestWatchdog('leader stream stall')
       if (stream.closed !== true) throw new Error('a stalled leader stream must be closed')
-      const poll = newestPendingTimer()
-      if (poll === undefined || poll.ms !== 320) {
-        throw new Error(`a leader must convert a stall into the 320ms poll, got ${poll === undefined ? 'nothing' : poll.ms + 'ms'}`)
+      const poll = newestTimerOfDelay(320)
+      if (poll === undefined) {
+        throw new Error(`a leader must convert a stall into the 320ms poll (armed: ${[...pendingTimers.values()].map((timer) => `${timer.ms}ms${timer.discovery === true ? '/discovery' : ''}`).join(', ') || 'none'})`)
       }
       if (sseInstances.length !== streamsBefore) throw new Error('a leader must not re-open the stream on the stall path')
       if (pollRequests() !== pollsBefore) throw new Error('the leader poll must not have run yet')
@@ -1845,7 +1989,7 @@ function checkboxByLabel(text) {
       await startWatchedRun()
       /* First stall: the leader polls, and a running answer re-opens the stream
          (streamStalls is still 1). */
-      fireNewestPendingTimer('degrade stall 1')
+      fireNewestWatchdog('degrade stall 1')
       fireNewestPendingTimer('degrade poll 1')
       await new Promise((resolve) => setTimeout(resolve, 60))
       const healed = latestInstance()
@@ -1853,14 +1997,16 @@ function checkboxByLabel(text) {
       requireWatchdog('healed leader stream', 0)
       const streamsBefore = sseInstances.length
       /* Second stall: streamStalls is now 2, so polling wins for good. */
-      fireNewestPendingTimer('degrade stall 2')
+      fireNewestWatchdog('degrade stall 2')
       fireNewestPendingTimer('degrade poll 2')
       await new Promise((resolve) => setTimeout(resolve, 60))
       if (sseInstances.length !== streamsBefore) {
         throw new Error('streamStalls >= 2 must keep the leader on polling instead of re-opening the stream')
       }
-      const poll = newestPendingTimer()
-      if (poll === undefined || poll.ms !== 320) throw new Error('the degraded leader must keep its 320ms poll armed')
+      const poll = newestTimerOfDelay(320)
+      if (poll === undefined) {
+        throw new Error(`the degraded leader must keep its 320ms poll armed (armed: ${[...pendingTimers.values()].map((timer) => `${timer.ms}ms${timer.discovery === true ? '/discovery' : ''}`).join(', ') || 'none'})`)
+      }
       /* A done answer ends the chain. */
       liveRunState = 'done'
       fireNewestPendingTimer('degrade settle poll')
@@ -1874,7 +2020,16 @@ function checkboxByLabel(text) {
     for (const id of rivalIntervals) clearInterval(id)
     rivalIntervals.length = 0
     delete fakeWindow.EventSource
-    liveRunState = 'running'
+    /* Retire the synthetic run as FINISHED, not as running.
+       These cases leave a leader's poll/watchdog/rebuild chain able to fire one
+       more time after the block returns; with the mock still answering "running"
+       that stray frame revives `run-live` in the store, and every later case
+       then renders the panel in its run-in-flight shape — the outbound-manifest
+       case lost `确认并开始评审` exactly that way (button text is
+       `running ? 运行中… : confirmed ? 确认并开始评审 : 开始评审`). Answering with
+       the finished snapshot makes any stray channel terminate itself. Cases that
+       need a live run set their own `liveRunState`/`liveRunOverride`. */
+    liveRunState = 'done'
     nextRunId = null
   }
 
@@ -1891,7 +2046,15 @@ function checkboxByLabel(text) {
   const button = previewButtonNode()
   if (button === undefined) throw new Error('preview button is missing next to the run button')
   button.props.onClick()
-  await new Promise((resolve) => setTimeout(resolve, 200))
+  /* The confirm button is `running ? 运行中… : confirmed ? 确认并开始评审 : 开始评审`,
+     so this case can only observe its expected text once the preview has landed
+     AND no synthetic run is left in flight by an earlier case. Wait for that
+     state instead of sleeping 200ms and hoping; bounded, with a store dump on
+     expiry. The expected strings below are unchanged. */
+  await waitForStore(
+    (state) => state.previewLoading !== true && state.preview !== null && state.running !== true,
+    'the outbound manifest preview to settle with no run in flight',
+  )
   const calls = fetchCalls.filter((call) => call.url === '/council/preview')
   if (calls.length !== before + 1) {
     throw new Error(`preview button did not POST /council/preview (delta=${calls.length - before})`)
@@ -1914,7 +2077,9 @@ function checkboxByLabel(text) {
     '说明：抽样初审，不是全项目审查',
     '确认并开始评审',
   ]) {
-    if (!html.includes(expected)) throw new Error(`manifest is missing "${expected}": ${html.slice(0, 600)}`)
+    if (!html.includes(expected)) {
+      throw new Error(`manifest is missing "${expected}": ${html.slice(0, 600)}\n  state: ${manifestStateDump()}`)
+    }
   }
 }
 
@@ -1924,7 +2089,12 @@ function checkboxByLabel(text) {
   const button = previewButtonNode()
   if (button === undefined) throw new Error('preview button is missing before the confirm case')
   button.props.onClick()
-  await new Promise((resolve) => setTimeout(resolve, 200))
+  /* Same precondition as case 1: the confirm text needs a landed preview and no
+     run in flight. Bounded wait instead of a fixed sleep; expected value kept. */
+  await waitForStore(
+    (state) => state.previewLoading !== true && state.preview !== null && state.running !== true,
+    'the successful preview to settle with no run in flight',
+  )
   if (!render(React.createElement(tabBody, { t })).includes('确认并开始评审')) {
     throw new Error('a successful preview must switch the run button to its confirm state')
   }
@@ -2221,6 +2391,75 @@ function checkboxByLabel(text) {
   }
   deliveryDecisions.push(`poll/silent=${postedMode(silentResumes[0])}`)
 
+  /* --- The Host's enforced refusal for a tool-originated run
+         (`409 { code: 'tool-run' }`, index.js `resumeGuard`), if it ever
+         reaches this client. -----------------------------------------------
+     Reachability, established here rather than assumed: both `resumeRun` call
+     sites (client.js:994, client.js:1343) sit behind `autoDeliverMode`, which
+     returns `'tool-run'` — not a delivery mode — whenever the snapshot says
+     `toolRun === true` (client.js:1522); the Host always sends that field as a
+     boolean (index.js:2652) fixed when the run is created (index.js:3399), and
+     the panel has no manual "deliver" button at all (only run/preview/cancel/
+     copy, client.js:2895-2927). Cases A/A2/B above already pin the resulting
+     zero-POST decision, so a compliant client cannot make the Host answer
+     `tool-run`: the branch is defence-in-depth, not a route a user can click.
+     This case therefore drives the disagreement a skewed host/client pair (or
+     any other caller) could create, and pins what must stay true if it ever
+     happens: the refusal is never turned into a fake success, never retried,
+     never forced by the UI, and never wedges the panel. It deliberately pins
+     those invariants instead of the current copy or CSS slot, so replacing the
+     raw Host text with a friendlier line later does not have to weaken it. */
+  {
+    failNextResumeWith409 = 'tool-run'
+    const refusedCalls = await runToSnapshot(Object.assign({}, LIVE_RUN_DONE))
+    /* Broader than `resumePostsOf` on purpose: a forced retry would carry a
+       query string, and an assertion that cannot even see that URL would miss
+       exactly the violation it exists to catch. */
+    const anyResume = (calls) => calls.filter((call) => /\/council\/run\/[^/]+\/resume(?:\?|$)/.test(String(call.url)))
+    const refusedPosts = anyResume(refusedCalls)
+    const forcedAttempt = refusedPosts.find((call) => /force/i.test(String(call.url))
+      || /"force"\s*:|force\s*=\s*1|force=1/.test(String(call.body)))
+    if (forcedAttempt !== undefined) {
+      throw new Error(`the UI must never force a duplicate delivery on its own: ${String(forcedAttempt.url)} ${String(forcedAttempt.body)}`)
+    }
+    if (refusedPosts.length !== 1) {
+      throw new Error(`a refused delivery must be attempted exactly once (no retry storm): ${JSON.stringify(refusedPosts.map((call) => `${call.method} ${call.url}`))}`)
+    }
+    const refusedHtml = render(React.createElement(tabBody, { t }))
+    if (/HTTP 409/.test(refusedHtml)) {
+      throw new Error('the tool-run refusal must not surface as a bare transport error')
+    }
+    if (refusedHtml.includes('已静默放进上下文') || refusedHtml.includes('已唤醒主聊天')) {
+      throw new Error('a refusal must never be reported as a delivered conclusion (double message)')
+    }
+    if (!/重复回投/.test(refusedHtml)) {
+      throw new Error(`the user must be told why the conclusion was not posted back: ${refusedHtml.slice(-800)}`)
+    }
+    const refusedButton = findRunButton(build(tabBody({ t })))
+    if (refusedButton === undefined || refusedButton.props.disabled === true) {
+      throw new Error('the panel must stay usable after a refused delivery (no dead button)')
+    }
+    /* No false claim of delivery AND no wedged state: every case reuses the
+       `run-live` id, so a refusal that (wrongly) recorded the delivery token
+       would suppress this next, otherwise-identical delivery. */
+    const afterCalls = await runToSnapshot(Object.assign({}, LIVE_RUN_DONE))
+    const afterPosts = anyResume(afterCalls)
+    if (afterPosts.length !== 1 || postedMode(afterPosts[0]) !== 'silent') {
+      throw new Error(`a refused delivery must not wedge the next one: ${JSON.stringify(afterPosts.map(postedMode))}`)
+    }
+    if (!render(React.createElement(tabBody, { t })).includes('已静默放进上下文')) {
+      throw new Error('the panel must still report a successful delivery after a refusal')
+    }
+    /* Source-level pin: the forced duplicate is a human action, so the delivery
+       function must not even mention the escape hatch. */
+    const refusedSource = /async function resumeRun\(runId, mode\) \{([\s\S]*?)\n    \}/.exec(readFileSync(new URL('../client.js', import.meta.url), 'utf8'))
+    if (refusedSource === null) throw new Error('resumeRun not found while pinning the no-force rule')
+    if (/\bforce\b/i.test(refusedSource[1])) {
+      throw new Error('resumeRun must not mention force: only a human may force a duplicate delivery')
+    }
+    deliveryDecisions.push('refused/409-tool-run=explained,no-force,no-false-claim')
+  }
+
   /* The card-meta cases below must not deliver a conclusion. */
   const offRadio = findRadioByLabel(build(tabBody({ t })), '不做（只留在右侧栏）')
   if (offRadio === undefined) throw new Error('feedback-off option is missing before the card-meta cases')
@@ -2289,6 +2528,334 @@ function checkboxByLabel(text) {
 
   /* Raw evidence of the resume decisions this block locked. */
   console.log(`  delivery decisions: ${deliveryDecisions.join(' | ')}`)
+}
+
+/* ---- Plan copy, graceful degradation, and the reported stale card ----- *
+ * Three field complaints, one block:
+ *
+ * A. "Why is a council run 11–28 minutes?" The Host snapshot now carries
+ *    `providerWaves` (serial provider rounds per stage) and `budgetPlan` (stage
+ *    sub-budgets). All three surfaces must render them readably — and an old
+ *    snapshot that has neither field must keep its previous copy exactly, which
+ *    is asserted by absence, not by trusting the new code path.
+ * B. A run that settled through a graceful degradation (`stopReason`, e.g. a
+ *    skipped chairman stage) must say so instead of reading as a clean finish.
+ * C. The reported stale card ("Host says done, card still says 进行中 / 主席汇总
+ *    0/1"). The running→done snapshot sequence is driven through the shipped
+ *    poller on all three surfaces first. It settles correctly — the freeze that
+ *    was actually reachable is a channel gap: this tab is the poll leader, its
+ *    stream stalls (a poll is armed), it loses the lease to a rival tab before
+ *    that poll runs, and the follower then kept no channel at all. Both are
+ *    below: the sequence as a regression lock, the channel gap as the defect.
+ */
+{
+  /** The store's run snapshot, driven through the shipped poller. */
+  async function pollIntoStore(snapshot, question) {
+    liveRunOverride = snapshot
+    liveRunState = snapshot.status === 'running' ? 'running' : 'done'
+    nextRunId = 'run-live'
+    setQuestion(question)
+    const before = fetchCalls.length
+    clickRun()
+    await new Promise((resolve) => setTimeout(resolve, 900))
+    const added = fetchCalls.slice(before)
+    if (!added.some((call) => call.method === 'GET' && String(call.url) === '/council/run/run-live')) {
+      throw new Error(`the plan case never polled its run: ${JSON.stringify(added.map((call) => `${call.method} ${call.url}`))}`)
+    }
+  }
+
+  /** A done run with no delivery: the synthetic runs below must not post back. */
+  const offRadio = findRadioByLabel(build(tabBody({ t })), '不做（只留在右侧栏）')
+  if (offRadio === undefined) throw new Error('feedback-off option is missing before the plan cases')
+  offRadio.props.onChange()
+
+  const cardArgs = { question: '预算与降级', models: [], chairman: true, attachFiles: false }
+  const cardProps = { t, phase: 'start', block: { args: cardArgs, argsRaw: JSON.stringify(cardArgs) } }
+
+  /* The frozen Host contract, in the shape the other half declared:
+     providerWaves = {concurrency, maxWaves, advice, stages{stage:{seats,slots,
+     waves,byProvider[]}}} and budgetPlan = {totalMs, elapsedMs, remainingMs,
+     stages{stage:{share,budgetMs,usedMs,...,chairman.extra floorMs/skipped/
+     reason}}}. Only the fields the client reads are filled. */
+  const WAVES_OVER = {
+    concurrency: 4,
+    maxWaves: 2,
+    advice: '同 provider "bohrium" 5 席 > 槽位 4，每阶段将跑 2 波（ceil(5/4)）；掺入第二 provider 可降为一波。',
+    stages: {
+      answers: { seats: 5, slots: 4, waves: 2, byProvider: [{ provider: 'bohrium', providerName: 'Bohrium', seats: 5, slots: 4, waves: 2 }] },
+      reviews: { seats: 5, slots: 4, waves: 2, byProvider: [{ provider: 'bohrium', providerName: 'Bohrium', seats: 5, slots: 4, waves: 2 }] },
+      chairman: { seats: 1, slots: 4, waves: 1, byProvider: [{ provider: 'bohrium', providerName: 'Bohrium', seats: 1, slots: 4, waves: 1 }] },
+    },
+  }
+  const WAVES_ONE = {
+    concurrency: 4,
+    maxWaves: 1,
+    advice: '',
+    stages: {
+      answers: { seats: 4, slots: 4, waves: 1, byProvider: [{ provider: 'bohrium', providerName: 'Bohrium', seats: 4, slots: 4, waves: 1 }] },
+      reviews: { seats: 4, slots: 4, waves: 1, byProvider: [{ provider: 'bohrium', providerName: 'Bohrium', seats: 4, slots: 4, waves: 1 }] },
+      chairman: { seats: 1, slots: 4, waves: 1, byProvider: [{ provider: 'bohrium', providerName: 'Bohrium', seats: 1, slots: 4, waves: 1 }] },
+    },
+  }
+  const BUDGET = {
+    totalMs: 1800000,
+    elapsedMs: 123456,
+    remainingMs: 1676544,
+    stages: {
+      answers: { share: 0.45, budgetMs: 810000, usedMs: 120000, startedAt: 1, endedAt: 2, deadlineAt: 3, capped: false, cappedReason: '' },
+      reviews: { share: 0.35, budgetMs: 630000, usedMs: 0, startedAt: 0, endedAt: 0, deadlineAt: 0, capped: false, cappedReason: '' },
+      chairman: { share: 0.2, budgetMs: 360000, usedMs: 0, startedAt: 0, endedAt: 0, deadlineAt: 0, floorMs: 120000, skipped: false, reason: '' },
+    },
+  }
+
+  /* A. Both fields: every surface explains the waves and the split. */
+  await pollIntoStore(Object.assign({}, LIVE_RUN_DONE, { providerWaves: WAVES_OVER, budgetPlan: BUDGET, stopReason: 'completed' }), '预算与降级')
+  const planWavesText = '预计每阶段 2 波（Bohrium 5 席 > 槽位 4）'
+  const planBudgetText = '预算分配：独立作答 45% / 交叉互评 35% / 主席汇总 20%（已用 2m3s / 30m）'
+  const planHtml = {
+    card: render(React.createElement(toolview, cardProps)),
+    panel: render(React.createElement(tabBody, { t })),
+    float: render(React.createElement(overlayReg.component, { t })),
+  }
+  for (const [surface, html] of Object.entries(planHtml)) {
+    for (const expected of [planWavesText, planBudgetText]) {
+      if (!html.includes(expected)) {
+        throw new Error(`${surface} surface must render the plan copy "${expected}": ${html.slice(0, 600)}`)
+      }
+    }
+  }
+  /* The two parts are composed with the locale separator, in that order. */
+  if (!planHtml.panel.includes(`${planWavesText}｜${planBudgetText}`)) {
+    throw new Error('the plan line must carry the waves part before the budget part')
+  }
+  console.log('  plan copy: waves + budget split rendered on card/panel/float')
+
+  /* A2. Only `providerWaves`: the budget part is NOT invented. */
+  await pollIntoStore(Object.assign({}, LIVE_RUN_DONE, { providerWaves: WAVES_OVER }), '预算与降级')
+  const wavesOnly = render(React.createElement(tabBody, { t }))
+  if (!wavesOnly.includes(planWavesText)) throw new Error('a waves-only snapshot must still render the wave plan')
+  if (wavesOnly.includes('预算分配：')) throw new Error('a snapshot without budgetPlan must not invent a budget split')
+
+  /* A3. A one-wave plan says exactly that, with no over-subscription clause. */
+  await pollIntoStore(Object.assign({}, LIVE_RUN_DONE, { providerWaves: WAVES_ONE }), '预算与降级')
+  const oneWave = render(React.createElement(tabBody, { t }))
+  if (!oneWave.includes('预计每阶段 1 波')) throw new Error(`a one-wave plan must be readable: ${oneWave.slice(0, 600)}`)
+  if (oneWave.includes('席 > 槽位')) throw new Error('a plan with no over-subscribed provider must not name one')
+
+  /* A4. Old snapshot (neither field): the previous copy is untouched, and no
+         plan text appears anywhere — this is the "old Host" contract. */
+  await pollIntoStore(Object.assign({}, LIVE_RUN_DONE, { stopReason: 'completed' }), '预算与降级')
+  const oldHtml = {
+    card: render(React.createElement(toolview, cardProps)),
+    panel: render(React.createElement(tabBody, { t })),
+    float: render(React.createElement(overlayReg.component, { t })),
+  }
+  for (const [surface, html] of Object.entries(oldHtml)) {
+    if (html.includes('预计每阶段') || html.includes('预算分配：')) {
+      throw new Error(`${surface} surface must not render plan copy for a snapshot without the Host plan fields`)
+    }
+  }
+  /* The pre-existing wording still works on the same render. */
+  if (!oldHtml.panel.includes('当前阶段：已完成')) throw new Error('the panel lost its stage copy on an old snapshot')
+  if (!oldHtml.card.includes('参与模型：由 Host 自动挑选')) throw new Error('the card lost its roster copy on an old snapshot')
+
+  /* B. Graceful degradation: a skipped chairman stage is stated, not implied. */
+  const SKIP_REASON = '主席阶段预算不足（剩余 89s，下限 120s），已跳过（无主席模式）'
+  const skippedBudget = JSON.parse(JSON.stringify(BUDGET))
+  skippedBudget.stages.chairman.skipped = true
+  skippedBudget.stages.chairman.reason = SKIP_REASON
+  await pollIntoStore(Object.assign({}, LIVE_RUN_DONE, {
+    providerWaves: WAVES_OVER,
+    budgetPlan: skippedBudget,
+    stopReason: 'chairman-budget-skipped',
+  }), '预算与降级')
+  const skipNote = '主席阶段预算不足，已跳过：本轮没有主席汇总（结论按无主席模式给出）'
+  const skipDetail = `Host 原因：${SKIP_REASON}`
+  const skipHtml = {
+    card: render(React.createElement(toolview, cardProps)),
+    panel: render(React.createElement(tabBody, { t })),
+    float: render(React.createElement(overlayReg.component, { t })),
+  }
+  for (const [surface, html] of Object.entries(skipHtml)) {
+    for (const expected of [skipNote, skipDetail]) {
+      if (!html.includes(expected)) {
+        throw new Error(`${surface} surface must state the graceful degradation "${expected}": ${html.slice(0, 700)}`)
+      }
+    }
+  }
+  /* It is a warning of its own, not one of the muted hints. */
+  const skipTree = build(React.createElement(overlayReg.component, { t }))
+  const degradedNode = findNode(skipTree, (node) => node !== null && typeof node === 'object'
+    && node.props !== undefined && node.props !== null
+    && String(node.props.className || '').includes('dsc-degraded')
+    && textOf(node.children).includes(skipNote))
+  if (degradedNode === undefined) throw new Error('the degradation note must render with its own dsc-degraded styling')
+  console.log(`  degradation: ${skipNote.slice(0, 12)}… rendered on card/panel/float`)
+
+  /* B2. A normal finish shows no degradation note; an unknown token is shown
+         verbatim instead of being replaced by an invented reason. */
+  await pollIntoStore(Object.assign({}, LIVE_RUN_DONE, { providerWaves: WAVES_OVER, budgetPlan: BUDGET, stopReason: 'completed' }), '预算与降级')
+  const cleanHtml = render(React.createElement(tabBody, { t }))
+  for (const stray of [skipNote, '整轮超时收尾', '阶段失败收尾']) {
+    if (cleanHtml.includes(stray)) throw new Error(`a normal finish must not claim "${stray}"`)
+  }
+  await pollIntoStore(Object.assign({}, LIVE_RUN_DONE, { stopReason: 'stage-timeout-x' }), '预算与降级')
+  const unknownHtml = render(React.createElement(tabBody, { t }))
+  if (!unknownHtml.includes('非正常收尾（stage-timeout-x）')) {
+    throw new Error(`an unknown stopReason must be shown verbatim, not guessed: ${unknownHtml.slice(0, 600)}`)
+  }
+
+  /* C1. The running→done sequence the user described: chairman streaming, the
+         Host finishes, and the card must follow within one snapshot. */
+  liveRunOverride = CHAIRMAN_RUN
+  liveRunState = 'running'
+  nextRunId = 'run-live'
+  setQuestion('stale 卡片复现')
+  clickRun()
+  await new Promise((resolve) => setTimeout(resolve, 700))
+  const chairmanStageCard = render(React.createElement(toolview, cardProps))
+  const chairmanStageFloat = render(React.createElement(overlayReg.component, { t }))
+  for (const expected of ['实时进度：主席汇总', '0/1', '进行中']) {
+    if (!chairmanStageCard.includes(expected)) {
+      throw new Error(`the live card must show the reported chairman progress "${expected}": ${chairmanStageCard.slice(0, 500)}`)
+    }
+  }
+  if (!chairmanStageFloat.includes('运行中 · 主席汇总')) {
+    throw new Error(`the floating card must show the reported chairman stage: ${chairmanStageFloat.slice(0, 500)}`)
+  }
+  liveRunState = 'done'
+  liveRunOverride = CHAIRMAN_RUN_DONE
+  await new Promise((resolve) => setTimeout(resolve, 700))
+  const settledCard = render(React.createElement(toolview, cardProps))
+  const settledPanel = render(React.createElement(tabBody, { t }))
+  const settledFloat = render(React.createElement(overlayReg.component, { t }))
+  if (settledCard.includes('进行中') || settledCard.includes('实时进度：')) {
+    throw new Error(`a done frame must end the live card section: ${settledCard.slice(0, 500)}`)
+  }
+  if (settledPanel.includes('进行中')) throw new Error('a done frame must end the panel spinner state')
+  if (!settledPanel.includes('当前阶段：已完成')) {
+    throw new Error(`the panel must follow the done frame: ${settledPanel.slice(0, 500)}`)
+  }
+  if (settledFloat.includes('进行中')) throw new Error('a done frame must end the floating card run state')
+  if (!settledFloat.includes('完成') || !settledFloat.includes('已完成')) {
+    throw new Error(`the floating card must show the settled run: ${settledFloat.slice(0, 500)}`)
+  }
+  console.log('  stale probe: running→done sequence settles on card/panel/float')
+
+  /* C2. The freeze that IS reachable: the poll leader loses the lease between
+         arming a poll and running it. A follower must not poll (that is the
+         rival's duty) but must not go dark either — with no channel left the
+         card sits on its last "running" snapshot while the Host is done. */
+  {
+    const channels = []
+    const streams = []
+    class ProbeBroadcastChannel {
+      constructor(name) {
+        this.name = name
+        this.onmessage = null
+        channels.push(this)
+      }
+      postMessage() {}
+      close() {}
+    }
+    class ProbeEventSource {
+      constructor(url) {
+        this.url = String(url)
+        this.readyState = 1
+        this.onmessage = null
+        this.onerror = null
+        this.closed = false
+        this.handlers = new Map()
+        streams.push(this)
+      }
+      addEventListener(type, listener) {
+        const set = this.handlers.get(type) || new Set()
+        set.add(listener)
+        this.handlers.set(type, set)
+      }
+      removeEventListener() {}
+      close() {
+        this.closed = true
+        this.readyState = 2
+      }
+      emit(payload) {
+        if (typeof this.onmessage === 'function') this.onmessage({ type: 'message', data: JSON.stringify(payload) })
+      }
+    }
+    /** Newest armed timer of exactly one delay (the discovery chain re-arms a
+        4s timer on its own schedule, so it is excluded here too). */
+    const timerOf = (ms) => [...pendingTimers.values()]
+      .filter((timer) => timer.ms === ms && timer.discovery !== true)
+      .sort((left, right) => right.seq - left.seq)[0]
+    const fireTimer = (timer) => {
+      pendingTimers.delete(timer.id)
+      clearTimeout(timer.id)
+      timer.fn(...timer.rest)
+    }
+    fakeWindow.BroadcastChannel = ProbeBroadcastChannel
+    fakeWindow.EventSource = ProbeEventSource
+    try {
+      dispatchWindowEvent('pageshow', { type: 'pageshow' })
+      /* One election tick claims the lease for this tab. */
+      await new Promise((resolve) => setTimeout(resolve, 700))
+      const pollRequests = () => fetchCalls.filter((call) => /^\/council\/run\/[^/]+$/.test(String(call.url))).length
+      liveRunOverride = CHAIRMAN_RUN
+      liveRunState = 'running'
+      nextRunId = 'run-live'
+      setQuestion('stale 卡片复现')
+      const pollsBefore = pollRequests()
+      clickRun()
+      await new Promise((resolve) => setTimeout(resolve, 80))
+      const stream = streams[streams.length - 1]
+      if (stream === undefined) throw new Error('the stale case did not open a stream for its run')
+      stream.emit(CHAIRMAN_RUN)
+      /* The stream stalls while this tab holds the lease: leader → poll armed. */
+      const stall = fireNewestWatchdog('stale-case stream stall')
+      if (stall.ms !== STREAM_STALL_MS) {
+        throw new Error(`the stale case expected the ${STREAM_STALL_MS}ms watchdog, got ${stall.ms}ms`)
+      }
+      const poll = timerOf(320)
+      if (poll === undefined) throw new Error('a stalled leader stream must arm its 320ms poll')
+      /* A lexicographically smaller rival takes the lease first. */
+      channels[channels.length - 1].onmessage({ data: { leader: 'a-rival-tab', sessionId: 'session-test' } })
+      fireTimer(poll)
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      /* The Host is done now; only a channel can tell this tab. */
+      liveRunState = 'done'
+      liveRunOverride = CHAIRMAN_RUN_DONE
+      if (pollRequests() !== pollsBefore) {
+        throw new Error('a follower must not poll: the lease-loss path sent a request')
+      }
+      const rebuild = timerOf(STREAM_REBUILD_BASE_MS)
+      if (rebuild === undefined) {
+        const staleFloat = render(React.createElement(overlayReg.component, { t }))
+        throw new Error('a follower whose poll could not run must re-open the read-only stream: with no channel left the card freezes on "进行中" although the Host run is done'
+          + ` (card now: ${staleFloat.slice(0, 200)})`)
+      }
+      fireTimer(rebuild)
+      const rebuilt = streams[streams.length - 1]
+      if (rebuilt === stream) throw new Error('the follower did not re-open a stream after losing the poll')
+      /* The Host writes its current snapshot as the catch-up on connect. */
+      rebuilt.emit(CHAIRMAN_RUN_DONE)
+      await new Promise((resolve) => setTimeout(resolve, 80))
+      const recoveredFloat = render(React.createElement(overlayReg.component, { t }))
+      if (recoveredFloat.includes('进行中')) {
+        throw new Error(`the rebuilt stream must settle the card: ${recoveredFloat.slice(0, 400)}`)
+      }
+      if (!recoveredFloat.includes('已完成')) {
+        throw new Error(`the rebuilt stream did not deliver the done snapshot to the card: ${recoveredFloat.slice(0, 400)}`)
+      }
+      if (pollRequests() !== pollsBefore) {
+        throw new Error('the follower recovery must not turn into a poller')
+      }
+      console.log('  stale probe: a follower that lost the poll re-opens the stream and settles')
+    } finally {
+      delete fakeWindow.EventSource
+      liveRunOverride = null
+      liveRunState = 'running'
+      nextRunId = null
+    }
+  }
 }
 
 for (const cleanup of cleanups.reverse()) {

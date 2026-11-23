@@ -160,6 +160,27 @@ window.__ModuleLoader__.load({
       'metrics.total': '总 {total}',
       'metrics.both': '首字 {ttft} · 总 {total}',
       'metrics.hint': '首字 = 从发起到第一个字符的耗时；总 = 该席位总耗时',
+      /* Why a run takes so long, straight from the Host snapshot fields
+         `providerWaves` / `budgetPlan`. Every one of these strings is rendered
+         ONLY when the field it describes is present, so an old Host (or an old
+         persisted run) keeps its previous copy instead of a guess. */
+      'plan.waves': '预计每阶段 {waves} 波（{over}）',
+      'plan.wavesPlain': '预计每阶段 {waves} 波',
+      'plan.overProvider': '{provider} {seats} 席 > 槽位 {slots}',
+      'plan.overSep': '、',
+      'plan.sep': '｜',
+      'plan.budget': '预算分配：{answers} {answersShare}% / {reviews} {reviewsShare}% / {chairman} {chairmanShare}%',
+      'plan.budgetSpent': '预算分配：{answers} {answersShare}% / {reviews} {reviewsShare}% / {chairman} {chairmanShare}%（已用 {spent} / {total}）',
+      /* A run that settled through a graceful degradation must say so out
+         loud: a skipped chairman stage otherwise looks exactly like a normal
+         finish. Known Host tokens are localized; an unknown token is shown
+         verbatim rather than replaced by an invented reason. */
+      'stop.chairmanSkipped': '主席阶段预算不足，已跳过：本轮没有主席汇总（结论按无主席模式给出）',
+      'stop.watchdog': '整轮超时收尾',
+      'stop.cancelled': '调用方取消收尾',
+      'stop.stageError': '阶段失败收尾',
+      'stop.generic': '非正常收尾（{reason}）',
+      'stop.hostReason': 'Host 原因：{reason}',
       'seat.activity.step': '思考中',
       'seat.activity.tool': '调用工具',
       'seat.activity.result': '工具返回',
@@ -319,6 +340,21 @@ window.__ModuleLoader__.load({
       'metrics.total': 'total {total}',
       'metrics.both': 'TTFT {ttft} · total {total}',
       'metrics.hint': 'TTFT = time from dispatch to the first character; total = this seat\'s full duration',
+      /* The same plan/degradation copy as the Chinese dictionary: rendered only
+         when the Host snapshot actually carries the field. */
+      'plan.waves': 'About {waves} wave(s) per stage ({over})',
+      'plan.wavesPlain': 'About {waves} wave(s) per stage',
+      'plan.overProvider': '{provider} {seats} seats > {slots} slots',
+      'plan.overSep': ', ',
+      'plan.sep': ' | ',
+      'plan.budget': 'Budget: {answers} {answersShare}% / {reviews} {reviewsShare}% / {chairman} {chairmanShare}%',
+      'plan.budgetSpent': 'Budget: {answers} {answersShare}% / {reviews} {reviewsShare}% / {chairman} {chairmanShare}% (used {spent} of {total})',
+      'stop.chairmanSkipped': 'The chairman stage ran out of budget and was skipped: this run has no chairman synthesis (the conclusion follows the no-chairman path)',
+      'stop.watchdog': 'Settled by the whole-run timeout',
+      'stop.cancelled': 'Settled after a caller cancel',
+      'stop.stageError': 'Settled by a stage failure',
+      'stop.generic': 'Settled off the normal path ({reason})',
+      'stop.hostReason': 'Host reason: {reason}',
       'seat.activity.step': 'Thinking',
       'seat.activity.tool': 'Using tools',
       'seat.activity.result': 'Tool returned',
@@ -396,6 +432,11 @@ const RUN_DISCOVERY_MS = 4000
 .dsc-toggle input{width:12px;height:12px;margin:0;accent-color:var(--dsw-alias-brand-primary)}
 .dsc-note{color:var(--dsw-alias-state-success-primary);font-size:11px}
 .dsc-warn{color:var(--dsw-alias-label-tertiary);font-size:11px;font-style:italic}
+/* Plan + degradation copy. The plan line answers "why is this slow"; the
+   degradation line must be able to stop a settled run from reading as a clean
+   finish, so it gets a rule of its own instead of the muted hint styling. */
+.dsc-plan{display:flex;flex-wrap:wrap;gap:2px 10px;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:1.5;word-break:break-word}
+.dsc-degraded{padding:4px 7px;border-left:3px solid var(--dsw-alias-state-warning-primary,var(--dsw-alias-brand-primary));border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-2,var(--dsw-alias-bg-layer-1));color:var(--dsw-alias-label-primary);font-size:11px;line-height:1.55;word-break:break-word}
 .dsc-menu{display:flex;flex-direction:column;min-width:168px;padding:4px;border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-overlay);box-shadow:var(--dsw-elevation-prominent)}
 .dsc-menu-item{display:flex;align-items:center;gap:7px;width:100%;padding:6px 9px;border:0;border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;text-align:left;cursor:pointer;white-space:nowrap}
 .dsc-menu-item:hover,.dsc-menu-item:focus-visible{background:var(--dsw-alias-interactive-bg-hover)}
@@ -1179,6 +1220,25 @@ const RUN_DISCOVERY_MS = 4000
       }
     }
 
+    /**
+     * A polling duty can stop being this tab's duty between arming the timer
+     * and the timer firing: a rival tab with a smaller id claims the lease.
+     * `pollRun` then refuses to poll (correctly), but with nothing re-armed
+     * this tab would hold no channel at all — no poll, no stream — and its card
+     * would sit on its last "running" snapshot forever while the Host run is
+     * already done. Observed exactly as "Host says done, card still says 进行中 /
+     * 主席汇总 0/1". Re-opening the read-only stream is the same bounded
+     * recovery every other lost-channel path uses (`scheduleStreamRebuild`:
+     * exponential backoff 1s→8s, at most STREAM_REBUILD_MAX attempts per run),
+     * so this cannot become the 0.2.16 idle loop: it costs zero HTTP until the
+     * backoff fires, and a follower still never sends a poll request.
+     */
+    function recoverLostPollDuty(runId) {
+      if (isPollLeader() === true) return false
+      scheduleStreamRebuild(runId)
+      return true
+    }
+
     function schedulePoll(runId) {
       /* Defensive: every poll is a leader duty. Call sites are already gated,
          but the invariant is easier to verify (and to trust) when the
@@ -1189,6 +1249,7 @@ const RUN_DISCOVERY_MS = 4000
         /* Clear the handle when it fires: a stale non-zero id made the
            takeover check in claim() believe a poll was still armed. */
         pollTimer = 0
+        if (recoverLostPollDuty(runId) === true) return
         void pollRun(runId)
       }, 320)
     }
@@ -1200,6 +1261,7 @@ const RUN_DISCOVERY_MS = 4000
       const delay = Math.min(8000, 320 * Math.pow(2, Math.min(5, attempt)))
       pollTimer = window.setTimeout(() => {
         pollTimer = 0
+        if (recoverLostPollDuty(runId) === true) return
         void pollRun(runId)
       }, delay)
     }
@@ -1255,10 +1317,10 @@ const RUN_DISCOVERY_MS = 4000
         return
       }
       if (isPollLeader() !== true) {
-        /* Followers do not poll and do not re-arm anything: poll → watchRun →
-           (stall guard) → poll was a 320ms idle loop that never fetched, so a
-           follower's UI sat on "running" forever. A follower waits for the
-           election; `claim()` re-arms a poll when it takes over. */
+        /* Followers do not poll: poll → watchRun → (stall guard) → poll was a
+           320ms idle loop that never fetched, so this stays a bare refusal.
+           The timer callbacks that drive this loop convert it into a read-only
+           stream rebuild instead of leaving the tab dark (see below). */
         return
       }
       try {
@@ -1771,6 +1833,193 @@ const RUN_DISCOVERY_MS = 4000
       return `${phase} · ${activity}${waiting}`
     }
 
+    /* ------------------------------------------------------------------ *
+     * Run plan and graceful-degradation copy                              *
+     *                                                                     *
+     * Both readers below take the `t` of the surface that is rendering,   *
+     * because the same numbers are shown on three surfaces. They are      *
+     * deliberately total and return '' / null for a snapshot that does    *
+     * not carry the Host field: an old Host, a persisted historic run or  *
+     * a prepare/start card without a run snapshot therefore renders its   *
+     * previous copy instead of an invented plan.                          *
+     * ------------------------------------------------------------------ */
+
+    /** A positive finite count from a snapshot field, or 0 when it is absent. */
+    function positiveCount(value) {
+      return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0
+    }
+
+    /** Compact duration for the budget line: 45s, 1m30s, 27m; '' when unknown. */
+    function durationText(ms) {
+      const total = positiveCount(ms)
+      if (total === 0) return ''
+      const seconds = Math.round(total / 1000)
+      if (seconds < 60) return `${seconds}s`
+      const minutes = Math.floor(seconds / 60)
+      const rest = seconds % 60
+      return rest === 0 ? `${minutes}m` : `${minutes}m${rest}s`
+    }
+
+    /** The Host's `budgetPlan` object of a run snapshot, or null. */
+    function budgetPlanOf(run) {
+      if (run === null || typeof run !== 'object') return null
+      const plan = run.budgetPlan
+      return plan !== null && plan !== undefined && typeof plan === 'object' ? plan : null
+    }
+
+    /** The Host's `providerWaves` object of a run snapshot, or null. */
+    function providerWavesOf(run) {
+      if (run === null || typeof run !== 'object') return null
+      const plan = run.providerWaves
+      return plan !== null && plan !== undefined && typeof plan === 'object' ? plan : null
+    }
+
+    /**
+     * "About 2 waves per stage (Bohrium 5 seats > 4 slots)": how many serial
+     * provider rounds every stage needs. Read from the Host's structured
+     * `providerWaves`; an over-subscribed provider is named only when the
+     * snapshot actually reports it (`waves > 1` on its own row), never inferred
+     * from the roster. '' when the field is missing.
+     */
+    function wavesLineOf(t, run) {
+      const plan = providerWavesOf(run)
+      if (plan === null) return ''
+      const maxWaves = positiveCount(plan.maxWaves)
+      if (maxWaves < 1) return ''
+      const stages = plan.stages !== null && plan.stages !== undefined && typeof plan.stages === 'object'
+        ? plan.stages : {}
+      const seen = new Set()
+      const over = []
+      for (const stageName of ['answers', 'reviews', 'chairman']) {
+        const stage = stages[stageName]
+        const rows = stage !== null && stage !== undefined && typeof stage === 'object' && Array.isArray(stage.byProvider)
+          ? stage.byProvider : []
+        for (const row of rows) {
+          if (row === null || typeof row !== 'object') continue
+          if (positiveCount(row.waves) < 2) continue
+          const label = typeof row.providerName === 'string' && row.providerName !== ''
+            ? row.providerName
+            : typeof row.provider === 'string' ? row.provider : ''
+          if (label === '' || seen.has(label)) continue
+          seen.add(label)
+          over.push(t('plan.overProvider', {
+            provider: label,
+            seats: positiveCount(row.seats),
+            slots: positiveCount(row.slots),
+          }))
+        }
+      }
+      return over.length === 0
+        ? t('plan.wavesPlain', { waves: maxWaves })
+        : t('plan.waves', { waves: maxWaves, over: over.join(t('plan.overSep')) })
+    }
+
+    /**
+     * "Budget: answers 45% / reviews 35% / chairman 20% (used 2m of 30m)": the
+     * stage sub-budgets the Host planned, with the run's own spend when the
+     * snapshot reports it. Every share must be present and sane; one missing
+     * share drops the whole line rather than printing a made-up percentage.
+     */
+    function budgetLineOf(t, run) {
+      const plan = budgetPlanOf(run)
+      if (plan === null) return ''
+      const stages = plan.stages !== null && plan.stages !== undefined && typeof plan.stages === 'object'
+        ? plan.stages : {}
+      const percent = {}
+      for (const stageName of ['answers', 'reviews', 'chairman']) {
+        const stage = stages[stageName]
+        const share = stage !== null && stage !== undefined && typeof stage === 'object' ? stage.share : undefined
+        if (typeof share !== 'number' || !Number.isFinite(share) || share < 0 || share > 1) return ''
+        percent[stageName] = Math.round(share * 100)
+      }
+      const params = {
+        answers: t('stage.answers'),
+        answersShare: percent.answers,
+        reviews: t('stage.reviews'),
+        reviewsShare: percent.reviews,
+        chairman: t('stage.chairman'),
+        chairmanShare: percent.chairman,
+      }
+      const spent = durationText(plan.elapsedMs)
+      const total = durationText(plan.totalMs)
+      if (spent === '' || total === '') return t('plan.budget', params)
+      return t('plan.budgetSpent', Object.assign({ spent, total }, params))
+    }
+
+    /**
+     * One readable line about the run's planned cost, or '' when the snapshot
+     * carries neither Host field. Composed from the two optional parts so a
+     * Host that ships only one of them still explains itself.
+     */
+    function planTextOf(t, run) {
+      const parts = []
+      const waves = wavesLineOf(t, run)
+      if (waves !== '') parts.push(waves)
+      const budget = budgetLineOf(t, run)
+      if (budget !== '') parts.push(budget)
+      return parts.join(t('plan.sep'))
+    }
+
+    /* Graceful-degradation stop reasons, as the Host names them in `stopReason`
+       (the field has existed since 0.2.x; this table only adds copy). */
+    const STOP_NOTE_KEYS = {
+      'chairman-budget-skipped': 'stop.chairmanSkipped',
+      watchdog: 'stop.watchdog',
+      cancelled: 'stop.cancelled',
+      'stage-error': 'stop.stageError',
+    }
+
+    /** The Host's own long reason for a skipped chairman stage, or ''. */
+    function chairmanSkipReasonOf(run) {
+      const plan = budgetPlanOf(run)
+      if (plan === null) return ''
+      const stages = plan.stages
+      const chairman = stages !== null && stages !== undefined && typeof stages === 'object'
+        ? stages.chairman : null
+      if (chairman === null || chairman === undefined || typeof chairman !== 'object') return ''
+      return typeof chairman.reason === 'string' ? chairman.reason : ''
+    }
+
+    /**
+     * Why a settled run did not finish its normal path, or '' when it did
+     * (`stopReason` empty or 'completed'). A known Host token is localized; an
+     * unknown one is printed verbatim behind generic copy, because showing the
+     * real token beats inventing a reason. Nothing is returned for a running
+     * run: `stopReason` is a terminal field.
+     */
+    function stopNoteOf(t, run) {
+      if (run === null || run === undefined || typeof run !== 'object') return ''
+      const stopReason = typeof run.stopReason === 'string' ? run.stopReason : ''
+      if (stopReason === '' || stopReason === 'completed') return ''
+      const key = STOP_NOTE_KEYS[stopReason]
+      return key !== undefined ? t(key) : t('stop.generic', { reason: stopReason })
+    }
+
+    /** The Host's own explanation under a degradation note, when it ships one. */
+    function stopDetailOf(t, run) {
+      if (run === null || run === undefined || typeof run !== 'object') return ''
+      if (run.stopReason !== 'chairman-budget-skipped') return ''
+      const reason = chairmanSkipReasonOf(run)
+      return reason === '' ? '' : t('stop.hostReason', { reason })
+    }
+
+    /**
+     * Plan + degradation nodes shared by the conversation card, the sidebar and
+     * the floating card. Returns [] when the snapshot has neither the new Host
+     * fields nor a degradation token, so all three surfaces keep their previous
+     * rendering byte for byte on an old snapshot.
+     */
+    function planNodesOf(t, run) {
+      const nodes = []
+      const plan = planTextOf(t, run)
+      if (plan !== '') nodes.push(h('div', { className: 'dsc-plan', key: 'plan' }, plan))
+      const note = stopNoteOf(t, run)
+      if (note !== '') nodes.push(h('div', { className: 'dsc-degraded', key: 'stop' }, note))
+      const detail = stopDetailOf(t, run)
+      if (detail !== '') nodes.push(h('div', { className: 'dsc-plan', key: 'stop-detail' }, detail))
+      return nodes
+    }
+
     /**
      * Expanded body of one seat: the live reasoning window, the growing answer,
      * the phase note, the "no token yet" note and the error.
@@ -1918,6 +2167,9 @@ const RUN_DISCOVERY_MS = 4000
         run !== null && typeof run.question === 'string' && run.question !== ''
           ? h('div', { className: 'dsc-float-q', title: run.question }, run.question)
           : null,
+        /* Why this run needs this long, and why it settled off the normal path.
+           Both are empty for a snapshot without the Host plan fields. */
+        ...planNodesOf(t, run),
         /* A configured chairman that was dropped is a warning, not a silent
            detail: the user's choice did not take effect. */
         run !== null && typeof run.chairmanProblem === 'string' && run.chairmanProblem !== ''
@@ -2724,6 +2976,10 @@ const RUN_DISCOVERY_MS = 4000
                       ? h('span', { className: 'dsc-warn' }, t('chairman.fallback', { problem: run.chairmanProblem }))
                       : null,
                   ),
+                  /* Planned waves / stage budgets and a degradation note, in
+                     the sidebar as well: the run card alone is not where a user
+                     waits out a 20-minute review. Empty for an old snapshot. */
+                  ...planNodesOf(t, run),
                   h('div', { className: 'dsc-grid' },
                     run.answers.map((answer) => h('div', { className: 'dsc-card', key: answer.key },
                       h('div', { className: 'dsc-card-head' },
@@ -2984,6 +3240,10 @@ const RUN_DISCOVERY_MS = 4000
           h('span', null, chairmanOn ? t('toolview.chairmanOn') : t('toolview.chairmanOff')),
           h('span', null, attachOn ? t('toolview.attachOn') : t('toolview.attachOff')),
         ),
+        /* Why this run needs this long, and why it settled off the normal path.
+           Outside the live block on purpose: the note must still be readable
+           once the run has settled. Both are empty for an old snapshot. */
+        ...planNodesOf(t, run),
         /* A configured chairman that was dropped is a warning, not a silent
            detail: the user's choice did not take effect. */
         chairmanProblem !== ''
