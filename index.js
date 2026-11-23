@@ -62,8 +62,57 @@ const SEAT_RESULT_TIMEOUT_MS = 240000
 const RUN_TIMEOUT_MS = 30 * 60 * 1000
 /** Concurrent subagent seats; the delegation runtime has a shared capacity pool (default 8). */
 const SEAT_CONCURRENCY = 3
-/** Global per-provider concurrency, enforced in the Host so tabs/chats cannot multiply it. */
-const PROVIDER_CONCURRENCY = 4
+/**
+ * Global per-provider concurrency, enforced in the Host so tabs/chats cannot
+ * multiply it. It is a SETTING (`providerConcurrency`); this constant is its
+ * default — 5 since 0.2.36 (was 4, see the CHANGELOG entry).
+ *
+ * Why 5: a stage runs `ceil(seats/slots)` WAVES per provider and the three stages
+ * are SERIAL, so the slot count multiplies wall time whenever a roster is not
+ * spread across providers. Measured: the user's 5-seat roster sat entirely on
+ * `bohrium`, and with 4 slots that was 2 waves per stage ≈ 5 waves per run
+ * (11m45s–27m46s observed). At 5 slots the same roster is 1 wave per stage ≈ 3
+ * waves, ~40% less wall time, with NO quality change: a wave is the same set of
+ * model calls, only admitted together instead of in two batches. Six seats are
+ * still 2 waves — the limit is bounded on purpose, not tuned to one roster.
+ * {@link providerWavePlan} reports the resulting waves per run.
+ *
+ * RISK, stated where the value is defined: raising this raises the INSTANTANEOUS
+ * request count on one provider. If a provider starts rate-limiting (429s/timeouts
+ * that the retry path cannot absorb), lower `providerConcurrency` in Settings — it
+ * is a live setting, so it applies to the next run without restarting the plugin.
+ * The per-provider counter stays global, so extra tabs/sessions cannot multiply it.
+ */
+const PROVIDER_CONCURRENCY = 5
+/** Output-budget bounds: a sane floor keeps "empty body / truncated answer" from
+ *  being a configurable outcome, the ceiling keeps a provider from being asked
+ *  for more than it will emit. Defaults are the historical constants above. */
+const OUTPUT_TOKENS_MIN = 4096
+const OUTPUT_TOKENS_MAX = 131072
+const PROVIDER_CONCURRENCY_MIN = 1
+const PROVIDER_CONCURRENCY_MAX = 16
+/**
+ * The whole-run budget may only be LOWERED, never raised: RUN_TIMEOUT_MS stays
+ * both the default and the ceiling, so the tool's external timeout backstop
+ * (`RUN_TIMEOUT_MS + 30000`) can never fire before the run's own deadline.
+ */
+const RUN_BUDGET_MIN_MS = 5 * 60 * 1000
+/**
+ * Stage shares of the whole-run budget (sub-budgets).
+ *
+ * The chairman is last, so it used to consume only "whatever the earlier stages
+ * left" — measured: one run died in the chairman stage with
+ * `整轮预算耗尽：调用超时（89s 内未完成）` after the answer stage ate the budget.
+ * Answers and reviews are hard-capped at 45% / 35%, which leaves the chairman at
+ * least 20% by construction instead of by luck.
+ */
+const STAGE_BUDGET_SHARE = Object.freeze({ answers: 0.45, reviews: 0.35, chairman: 0.2 })
+/** Below this much remaining budget the chairman call is SKIPPED (recorded, never
+ *  silent) rather than attempted with a budget that cannot produce an answer. */
+const CHAIRMAN_FLOOR_MS = 2 * 60 * 1000
+/** `stopReason` token for the graceful "no chairman" settlement. Frozen: the
+ *  browser maps it, so a reworded literal would become an unlabelled state. */
+const STOP_REASON_CHAIRMAN_SKIPPED = 'chairman-budget-skipped'
 /** Fallback quota per run; strictly below MAX_MODELS so the guard has real
  *  margin (a full 6-seat roster can never consume it all — circuit-breaker
  *  style, not one-per-seat). */
@@ -305,14 +354,303 @@ function sendJson(res, code, value) {
   res.end(JSON.stringify(value))
 }
 
+/**
+ * Whole-run budget frozen on a run at creation.
+ *
+ * Read from the run, not from the module constant, so a Settings-page change
+ * applies to the NEXT run while a running one keeps the budget its snapshot
+ * advertises. Anything outside [RUN_BUDGET_MIN_MS, RUN_TIMEOUT_MS] (or absent,
+ * e.g. a run loaded from disk) falls back to the ceiling.
+ */
+export function runBudgetOf(run) {
+  const budget = run !== null && typeof run === 'object' ? run.budgetMs : undefined
+  return Number.isSafeInteger(budget) && budget >= RUN_BUDGET_MIN_MS && budget <= RUN_TIMEOUT_MS
+    ? budget
+    : RUN_TIMEOUT_MS
+}
+
 /** Run deadline as one exported formula, so tests can assert the real path. */
 export function runDeadlineOf(run) {
-  return run.createdAt + RUN_TIMEOUT_MS
+  return run.createdAt + runBudgetOf(run)
+}
+
+/** Watchdog text. Composes the historical sentence verbatim for the default
+ *  budget, and states the real number once `runBudgetMs` is lowered. */
+export function watchdogMessage(run) {
+  return `运行超时（${Math.round(runBudgetOf(run) / 60000)} 分钟），已中止`
 }
 
 /** Human-readable message of any thrown value. */
 function errorText(error) {
   return error instanceof Error ? error.message : String(error)
+}
+
+/* ------------------------------------------------------------------ *
+ * Latency planning: provider waves and stage sub-budgets.             *
+ * Pure and exported so the harness locks the arithmetic, not a prose  *
+ * restatement of it.                                                  *
+ * ------------------------------------------------------------------ */
+
+/** Stage order and the Chinese label every user-visible message uses. */
+const STAGE_ORDER = ['answers', 'reviews', 'chairman']
+const STAGE_LABEL = { answers: '作答', reviews: '互评', chairman: '主席' }
+
+/**
+ * Expected waves per stage, from the per-provider slots.
+ *
+ * A stage starts every seat at once (`runLimited(..., seats.length)`), but
+ * `withProviderSlot` admits at most `slots` per provider, so the wall time of a
+ * stage is `ceil(seats/slots)` waves of its busiest provider × one model call.
+ * The three stages are serial, which is why a 5-seat single-provider roster with
+ * 4 slots is ~5 waves rather than ~3.
+ *
+ * @param roster - `{ answers: routes, reviews: routes, chairman: routes }`.
+ * @param concurrency - per-provider slots for this run.
+ * @returns `{ concurrency, maxWaves, stages: {name: {seats, slots, waves,
+ *           byProvider}}, advice }`; `advice` is '' unless a stage needs >1 wave.
+ */
+export function providerWavePlan(roster, concurrency) {
+  const requested = Number(concurrency)
+  const slots = Number.isFinite(requested) && requested > 0
+    ? Math.min(PROVIDER_CONCURRENCY_MAX, Math.max(PROVIDER_CONCURRENCY_MIN, Math.round(requested)))
+    : PROVIDER_CONCURRENCY
+  const source = roster !== null && typeof roster === 'object' ? roster : {}
+  const stages = {}
+  const offenders = []
+  let maxWaves = 0
+  for (const name of STAGE_ORDER) {
+    const list = Array.isArray(source[name])
+      ? source[name].filter((route) => route !== null && typeof route === 'object'
+        && typeof route.provider === 'string' && route.provider !== '')
+      : []
+    const grouped = new Map()
+    for (const route of list) {
+      const row = grouped.get(route.provider)
+      if (row === undefined) {
+        grouped.set(route.provider, {
+          provider: route.provider,
+          providerName: typeof route.providerName === 'string' && route.providerName !== '' ? route.providerName : route.provider,
+          seats: 1,
+        })
+      } else row.seats += 1
+    }
+    const byProvider = [...grouped.values()]
+      .map((row) => ({ ...row, slots, waves: Math.ceil(row.seats / slots) }))
+      .sort((a, b) => b.seats - a.seats || (a.provider < b.provider ? -1 : a.provider > b.provider ? 1 : 0))
+    /* Biggest group first, so the first row is also the wave count of the stage. */
+    const waves = byProvider.reduce((max, row) => Math.max(max, row.waves), 0)
+    stages[name] = { seats: list.length, slots, waves, byProvider }
+    maxWaves = Math.max(maxWaves, waves)
+    if (waves > 1) {
+      offenders.push({ name, provider: byProvider[0].provider, seats: byProvider[0].seats, waves })
+    }
+  }
+  let advice = ''
+  if (offenders.length > 0) {
+    const worst = offenders[0]
+    const stageNames = new Set(offenders.map((row) => row.name))
+    const where = stageNames.size > 1 ? '每阶段' : `${STAGE_LABEL[worst.name]}阶段`
+    advice = `同 provider "${worst.provider}" ${worst.seats} 席 > 槽位 ${slots}，${where}将跑 ${worst.waves} 波`
+      + `（ceil(${worst.seats}/${slots})）；掺入第二 provider 可降为一波。`
+  }
+  return { concurrency: slots, maxWaves, stages, advice }
+}
+
+/**
+ * Stage sub-budget skeleton for one run: answers ≤45%, reviews ≤35%,
+ * chairman ≥20% (and `floorMs`, the smallest remaining budget worth starting a
+ * chairman call with). One mutable tracker per stage; `snapshot()` renders it.
+ */
+export function stageBudgetPlan(totalMs) {
+  const requested = Number(totalMs)
+  const total = Number.isFinite(requested) && requested >= RUN_BUDGET_MIN_MS
+    ? Math.min(Math.round(requested), RUN_TIMEOUT_MS)
+    : RUN_TIMEOUT_MS
+  const stages = {}
+  for (const name of STAGE_ORDER) {
+    const share = STAGE_BUDGET_SHARE[name]
+    stages[name] = {
+      share,
+      budgetMs: Math.round(total * share),
+      usedMs: 0,
+      startedAt: 0,
+      endedAt: 0,
+      deadlineAt: 0,
+      capped: false,
+      cappedReason: '',
+    }
+  }
+  stages.chairman.floorMs = Math.min(CHAIRMAN_FLOOR_MS, Math.round(total * STAGE_BUDGET_SHARE.chairman))
+  stages.chairman.skipped = false
+  stages.chairman.reason = ''
+  return { startedAt: 0, totalMs: total, elapsedMs: 0, remainingMs: total, stages }
+}
+
+/** Render one stage's live state (usedMs counts to `now` while it is open). */
+function stageView(track, now) {
+  const startedAt = Number.isFinite(track.startedAt) ? track.startedAt : 0
+  const endedAt = Number.isFinite(track.endedAt) ? track.endedAt : 0
+  const view = {
+    share: track.share,
+    budgetMs: track.budgetMs,
+    usedMs: startedAt === 0 ? 0 : Math.max(0, (endedAt === 0 ? now : endedAt) - startedAt),
+    startedAt,
+    endedAt,
+    deadlineAt: Number.isFinite(track.deadlineAt) ? track.deadlineAt : 0,
+    capped: track.capped === true,
+    cappedReason: typeof track.cappedReason === 'string' ? track.cappedReason : '',
+  }
+  return view
+}
+
+/**
+ * Snapshot view of a run's budget plan: per-stage sub-budget, what each stage
+ * actually consumed, and how much of the whole-run budget is left. Always
+ * returns the full shape (a run with no plan gets the default plan), so a client
+ * never has to branch on `undefined`.
+ */
+export function budgetPlanSnapshot(plan, nowMs) {
+  const source = plan !== null && typeof plan === 'object' ? plan : stageBudgetPlan(RUN_TIMEOUT_MS)
+  const now = Number.isFinite(nowMs) ? nowMs : Date.now()
+  const totalMs = Number.isFinite(source.totalMs) ? source.totalMs : RUN_TIMEOUT_MS
+  const startedAt = Number.isFinite(source.startedAt) ? source.startedAt : 0
+  const stages = {}
+  for (const name of STAGE_ORDER) {
+    const track = source.stages !== null && typeof source.stages === 'object'
+      && source.stages[name] !== null && typeof source.stages[name] === 'object'
+      ? source.stages[name]
+      : stageBudgetPlan(totalMs).stages[name]
+    const view = stageView(track, now)
+    if (name === 'chairman') {
+      view.floorMs = Number.isFinite(track.floorMs) ? track.floorMs : CHAIRMAN_FLOOR_MS
+      view.skipped = track.skipped === true
+      view.reason = typeof track.reason === 'string' ? track.reason : ''
+    }
+    stages[name] = view
+  }
+  return {
+    startedAt,
+    totalMs,
+    elapsedMs: startedAt === 0 ? 0 : Math.max(0, now - startedAt),
+    remainingMs: startedAt === 0 ? totalMs : Math.max(0, startedAt + totalMs - now),
+    stages,
+  }
+}
+
+/**
+ * Why this stage was stopped by its own SUB-budget, if it was.
+ *
+ * Pure and exported: "the answer stage used its 45%" and "the whole run ran out"
+ * must never look alike, so the distinction is asserted directly instead of being
+ * inferred from a duration. Returns '' when the stage finished inside its budget,
+ * or when the RUN deadline (not the stage cap) is what bounded it — a chairman
+ * runs to the run deadline by design and is therefore never "capped".
+ */
+export function stageCapReason(name, track, runDeadlineAt, nowMs) {
+  const endedAt = Number.isFinite(nowMs) ? nowMs : Date.now()
+  const startedAt = Number.isFinite(track.startedAt) ? track.startedAt : 0
+  const deadlineAt = Number.isFinite(track.deadlineAt) ? track.deadlineAt : 0
+  const runDeadline = Number.isFinite(runDeadlineAt) ? runDeadlineAt : Infinity
+  if (startedAt === 0 || deadlineAt === 0) return ''
+  if (deadlineAt >= runDeadline) return ''
+  if (endedAt < deadlineAt) return ''
+  const label = STAGE_LABEL[name] === undefined ? name : STAGE_LABEL[name]
+  const share = Number.isFinite(track.share) ? Math.round(track.share * 100) : 0
+  return `${label}阶段用满子预算 ${Math.round(track.budgetMs / 1000)}s（整轮预算的 ${share}%），`
+    + '阶段内未完成的席位已停止'
+}
+
+/**
+ * Resolve the opt-member label of a NEW run: write-once by construction.
+ *
+ * Why this exists at all. The opt stage-7 evidence is assembled downstream from
+ * `{runId, opt_member}` records, and its checker validates structure and member
+ * coverage but CANNOT tell "8 records from 8 independent runs" from "one run's id
+ * reused 8 times under 8 different member labels" — measured: a real runId × 8
+ * members passed `council_records.py check` with exit 0. The plugin is the only
+ * party that can attach a member label to a run, so it must attach exactly one and
+ * never let it be rewritten: the label a caller gets back (snapshot, conclusion)
+ * is then the same label any downstream record must carry, and two records sharing
+ * a runId can only share one member.
+ *
+ * The rule is idempotent and never silent:
+ * - no request (`''`) keeps whatever the run already has;
+ * - the same label repeated is a no-op (a retried call is not a new member);
+ * - a DIFFERENT label on a labelled run is a conflict, reported instead of applied.
+ *
+ * @param existing - the run's current label.
+ * @param requested - the label the caller passed this time.
+ * @returns `{ value, conflict }`; `value` is what the run must hold, `conflict` is
+ *          '' or a human-readable reason the request was refused.
+ */
+export function optMemberFor(existing, requested) {
+  const current = typeof existing === 'string' ? existing.trim() : ''
+  const next = typeof requested === 'string' ? requested.trim() : ''
+  if (next === '') return { value: current, conflict: '' }
+  if (current === '') return { value: next, conflict: '' }
+  if (current === next) return { value: current, conflict: '' }
+  return {
+    value: current,
+    conflict: `该运行已标注为 opt 成员 "${current}"，不能改写为 "${next}"`
+      + '（一个 run 只属于一次工具调用；允许改写会让同一个 runId 冒充多个 opt 成员）',
+  }
+}
+
+/**
+ * The `/resume` gate for one run.
+ *
+ * Duplicate delivery used to be defended only by the CLIENT. The host refused a
+ * second resume of the same run, but it never looked at `toolRun` — so a stale tab,
+ * a revived page, or any other caller could POST `/resume` for a run whose
+ * conclusion the `council_review` tool had ALREADY handed back as a `tool/result`.
+ * The user then sees the same conclusion twice and cannot tell which copy is real.
+ * The host now refuses that by default and offers ONE explicit, recorded escape
+ * hatch (`?force=1` / `{force:true}`), so a forced duplicate is auditable instead
+ * of silent.
+ *
+ * Pure (no ctx, no I/O), so the route and the harness assert the same rule.
+ * The refusal deliberately precedes the `not-finished` / `already-resumed` checks:
+ * a tool-originated run can never be the right target for a resume, so "this is a
+ * tool run" is the actionable answer regardless of its state.
+ *
+ * @param run - the run the caller wants to deliver.
+ * @param force - explicit opt-in (`?force=1` or `{ force: true }`).
+ * @returns `{ ok, forced, status, code, error }`; when `ok === false` the route
+ *          sends `{ error, code }` with that status verbatim.
+ */
+export function resumeGuard(run, force) {
+  const forced = force === true
+  const isToolRun = run !== null && typeof run === 'object' && run.toolRun === true
+  if (isToolRun && !forced) {
+    return {
+      ok: false,
+      forced: false,
+      status: 409,
+      code: 'tool-run',
+      error: '这是工具发起的运行（council_review），结论已作为工具结果交回调用方，不再重复回投；'
+        + '确需强制投递请加 ?force=1（会在运行记录上留下强制痕迹，可审计）',
+    }
+  }
+  return { ok: true, forced, status: 200, code: '', error: '' }
+}
+
+/**
+ * Decide the chairman stage from the budget that is actually left.
+ *
+ * Pure on purpose: "remaining 89s < floor 120s" is the exact situation that used
+ * to hard-fail a finished council, and it must be assertable without a provider
+ * round-trip or a 30-minute wait.
+ */
+export function chairmanStageDecision(remainingMs, floorMs) {
+  const left = Number.isFinite(remainingMs) ? Math.max(0, Math.round(remainingMs)) : 0
+  const floor = Number.isFinite(floorMs) && floorMs > 0 ? Math.round(floorMs) : CHAIRMAN_FLOOR_MS
+  if (left >= floor) return { action: 'run', reason: '', remainingMs: left, floorMs: floor }
+  return {
+    action: 'skip',
+    reason: `主席阶段预算不足（剩余 ${Math.round(left / 1000)}s，下限 ${Math.round(floor / 1000)}s），已跳过（无主席模式）`,
+    remainingMs: left,
+    floorMs: floor,
+  }
 }
 
 /**
@@ -356,6 +694,31 @@ export const Config = z.object({
    */
   allowExternalPaths: z.boolean().default(false).volatile()
     .description('允许问题里写出的任意本机路径进入附件（默认 false，仅工作区/调用方目录）'),
+  /**
+   * Latency and budget surface.
+   *
+   * Each of these was a hard-coded constant, so the only way to trade answer
+   * length / provider parallelism / run budget for wall time was to edit this
+   * file. They are `.volatile()` (same live-source path as the entry switches),
+   * so a Settings-page write is observed by the NEXT run without restarting the
+   * plugin — and freezing the resolved values on the run keeps a running
+   * snapshot honest. All five defaults are the previous constants: no upgrade
+   * shortens an answer or a run behind the user's back.
+   */
+  answerMaxTokens: z.number().default(ANSWER_MAX_TOKENS).volatile()
+    .description('作答席位输出预算（tokens/席），默认 16384；调低可提速，但过低的预算会让长答案被截断'),
+  reviewMaxTokens: z.number().default(REVIEW_MAX_TOKENS).volatile()
+    .description('互评席位输出预算（tokens/席），默认 16384；调低可提速，但过低的预算会让长答案被截断'),
+  chairmanMaxTokens: z.number().default(CHAIRMAN_MAX_TOKENS).volatile()
+    .description('主席汇总输出预算（tokens），默认 16384；调低可提速，但过低的预算会让长答案被截断'),
+  providerConcurrency: z.number().default(PROVIDER_CONCURRENCY).volatile()
+    .description('每个 provider 的并发槽位，默认 5（5 席名单每阶段一波；多标签/多会话不会放大）；'
+      + '同一 provider 的席位数 N > 槽位 M 时每阶段跑 ceil(N/M) 波，'
+      + '把这个值调到不低于 N（或掺入第二个 provider）即可降为一波；'
+      + '提高并发会提高瞬时请求数，遇 provider 限流请调回 4'),
+  runBudgetMs: z.number().default(RUN_TIMEOUT_MS).volatile()
+    .description(`整轮预算（毫秒），默认 ${RUN_TIMEOUT_MS}（30 分钟），只可下调（下限 ${RUN_BUDGET_MIN_MS}）；`
+      + '作答/互评/主席按 45%/35%/20% 分配子预算，主席剩余不足 120s 时优雅跳过而不是硬失败'),
 })
 
 /** Auto-pick heterogeneous routes from a catalog: one provider and one model name each. */
@@ -550,6 +913,41 @@ export function chairmanSelection(cat, selected, spec) {
  */
 export function pickChairmanRoute(cat, selected, spec) {
   return chairmanSelection(cat, selected, spec).route
+}
+
+/**
+ * The ONE chairman decision point shared by the tool path and the HTTP panel.
+ *
+ * Why it exists: the panel path used to read `body.chairman` only and otherwise
+ * take `selected[0]` — it never looked at the `defaultChairman` SETTING. The tool
+ * path did. So the same configuration was honoured on one entry and silently
+ * ignored on the other, and because the panel only assigned `chairmanProblem`
+ * inside its `if (body.chairman …)` branch, the panel also reported "no problem"
+ * while delivering a chairman nobody asked for. That is the user's own report
+ * ("设置里填的 kimik3 啊？") — and the fix is not two copies of the rule but one.
+ *
+ * Precedence, in order:
+ *   1. an explicit request (the user's pick at run time) — highest;
+ *   2. the configured `defaultChairman`;
+ *   3. the documented election (first participant) with NO problem, because
+ *      "nothing configured" is not a misconfiguration.
+ * An empty/absent `defaultChairman` therefore keeps the historical behaviour
+ * exactly, and a configured-but-unusable one travels out on `problem` on BOTH
+ * entries instead of being swapped in silence.
+ *
+ * @param cat - live catalog.
+ * @param selected - the run's participant routes.
+ * @param requestedSpec - `"<provider>/<model>"` from this request, or ''.
+ * @param defaultSpec - the `defaultChairman` setting, or ''.
+ * @returns `{ route, problem }` (the shape `chairmanSelection` returns).
+ */
+export function chairmanForRequest(cat, selected, requestedSpec, defaultSpec) {
+  const requested = typeof requestedSpec === 'string' ? requestedSpec.trim() : ''
+  if (requested !== '') return chairmanSelection(cat, selected, requested)
+  const configured = typeof defaultSpec === 'string' ? defaultSpec.trim() : ''
+  /* `chairmanSelection('')` is the documented no-pick election (first participant,
+     no problem), so an unset setting needs no special case here. */
+  return chairmanSelection(cat, selected, configured)
 }
 
 /** Clip one answer before it enters another prompt. */
@@ -1534,6 +1932,23 @@ export function apply(ctx, config) {
    * `apply`.
    */
   const liveConfig = config !== null && typeof config === 'object' ? config : {}
+  /**
+   * One bounded numeric setting, read LIVE.
+   *
+   * `.volatile()` fields arrive as a `{ get() }` source written in place by the
+   * Settings page, so `readSetting` unwraps the current value; a value outside
+   * the declared range is clamped rather than honoured, so a typo can neither
+   * produce an empty answer budget nor a zero-slot provider.
+   */
+  function numericSetting(field, fallback, min, max) {
+    const raw = Number(readSetting(liveConfig[field], fallback))
+    if (!Number.isFinite(raw) || raw <= 0) return fallback
+    return Math.min(max, Math.max(min, Math.round(raw)))
+  }
+  /** Per-seat output budgets for the NEXT run (frozen onto it at creation). */
+  function outputBudget(field, fallback) {
+    return numericSetting(field, fallback, OUTPUT_TOKENS_MIN, OUTPUT_TOKENS_MAX)
+  }
   /** Escape hatch: read `attachRoots` as the only grant and restore pre-0.2.28 behaviour. */
   const externalPathsAllowed = () => readSetting(liveConfig.allowExternalPaths, false) === true
   const defaultAgentsHome = process.env.DSH_AGENTS_HOME || join(process.env.USERPROFILE || '', '.agents')
@@ -1647,14 +2062,37 @@ export function apply(ctx, config) {
   }
   loadPersistedRuns()
 
-  /** Write-once terminal state: late stage/seat results must not overwrite a stop. */
-  function finishRun(run, status, error, stopReason) {    if (run.finished === true) return false
+  /**
+   * Write-once terminal state: late stage/seat results must not overwrite a stop.
+   *
+   * The guard is kept on its own line, and the reason is the field right below it:
+   * the browser now branches on `stopReason` ('completed' | 'watchdog' |
+   * 'cancelled' | 'stage-error' | 'chairman-budget-skipped'), so "a second call
+   * cannot rewrite what the user is looking at" has to be checkable by reading this
+   * function — including for `POST /run/<id>/cancel` on a run that already settled.
+   */
+  function finishRun(run, status, error, stopReason) {
+    if (run.finished === true) return false
     run.finished = true
     run.status = status
     run.error = typeof error === 'string' ? error : ''
-    /* 'completed' | 'watchdog' | 'cancelled' | 'stage-error': why a run settled. */
+    /* 'completed' | 'watchdog' | 'cancelled' | 'stage-error' |
+       'chairman-budget-skipped': why a run settled. */
     run.stopReason = typeof stopReason === 'string' && stopReason !== '' ? stopReason
       : status === 'done' ? 'completed' : 'stage-error'
+    /* Close any stage left open, so its `usedMs` stops at the settlement instead of
+       growing with the wall clock every time the snapshot is re-rendered. */
+    const plan = run.budgetPlan !== null && typeof run.budgetPlan === 'object' ? run.budgetPlan : undefined
+    if (plan !== undefined) {
+      for (const name of STAGE_ORDER) {
+        const track = plan.stages !== null && typeof plan.stages === 'object' ? plan.stages[name] : undefined
+        if (track === undefined || track === null) continue
+        if (Number.isFinite(track.startedAt) && track.startedAt > 0
+          && !(Number.isFinite(track.endedAt) && track.endedAt > 0)) {
+          track.endedAt = Date.now()
+        }
+      }
+    }
     if (run.watchdog !== undefined) {
       clearTimeout(run.watchdog)
       run.watchdog = undefined
@@ -1904,9 +2342,20 @@ export function apply(ctx, config) {
   /** Resolve one requested route against the catalog. */
   const findRoute = findCatalogRoute
 
-  /** Global per-provider slot so tabs/chats cannot multiply provider concurrency. */
+  /**
+   * Global per-provider slot so tabs/chats cannot multiply provider concurrency.
+   *
+   * The slot COUNT is per run (`run.providerConcurrency`, frozen at creation from
+   * the `providerConcurrency` setting) because it is exactly what decides how many
+   * waves a stage needs; the ACTIVE counters stay global so two chats cannot
+   * multiply it.
+   */
   const providerActive = new Map()
-  async function withProviderSlot(provider, signal, run) {    while ((providerActive.get(provider) || 0) >= PROVIDER_CONCURRENCY) {
+  async function withProviderSlot(provider, signal, run) {    const slots = run !== null && typeof run === 'object'
+      && Number.isSafeInteger(run.providerConcurrency) && run.providerConcurrency >= PROVIDER_CONCURRENCY_MIN
+      ? Math.min(run.providerConcurrency, PROVIDER_CONCURRENCY_MAX)
+      : PROVIDER_CONCURRENCY
+    while ((providerActive.get(provider) || 0) >= slots) {
       if (signal !== undefined && signal.aborted) throw new Error('已取消')
       await new Promise((resolve) => setTimeout(resolve, 40))
     }
@@ -1919,12 +2368,96 @@ export function apply(ctx, config) {
   }
 
   /**
+   * Freeze this run's latency plan: output budgets, provider slots, the whole-run
+   * budget, the stage sub-budgets and the expected waves.
+   *
+   * Frozen per run on purpose. Reading the settings live per call would let a
+   * mid-run Settings write make the snapshot describe numbers the run is not
+   * actually using — the silent mismatch this plugin keeps having to fix.
+   */
+  function planRun(roster) {
+    const providerConcurrency = numericSetting(
+      'providerConcurrency', PROVIDER_CONCURRENCY, PROVIDER_CONCURRENCY_MIN, PROVIDER_CONCURRENCY_MAX,
+    )
+    const budgetMs = numericSetting('runBudgetMs', RUN_TIMEOUT_MS, RUN_BUDGET_MIN_MS, RUN_TIMEOUT_MS)
+    return {
+      answerMaxTokens: outputBudget('answerMaxTokens', ANSWER_MAX_TOKENS),
+      reviewMaxTokens: outputBudget('reviewMaxTokens', REVIEW_MAX_TOKENS),
+      chairmanMaxTokens: outputBudget('chairmanMaxTokens', CHAIRMAN_MAX_TOKENS),
+      providerConcurrency,
+      budgetMs,
+      providerWaves: providerWavePlan(roster, providerConcurrency),
+      budgetPlan: stageBudgetPlan(budgetMs),
+    }
+  }
+
+  /** The plan tracker of one stage of one run (never undefined). */
+  function stageTrack(run, name) {
+    const plan = run.budgetPlan !== null && typeof run.budgetPlan === 'object'
+      ? run.budgetPlan
+      : (run.budgetPlan = stageBudgetPlan(runBudgetOf(run)))
+    const track = plan.stages !== null && typeof plan.stages === 'object'
+      && plan.stages[name] !== null && typeof plan.stages[name] === 'object'
+      ? plan.stages[name]
+      : (plan.stages[name] = stageBudgetPlan(runBudgetOf(run)).stages[name])
+    return track
+  }
+
+  /**
+   * Open one stage: record its start and the budget deadline it may use.
+   *
+   * `capStage` is false for the chairman on purpose. Its 20% is a FLOOR guaranteed
+   * by the two caps above it, never a ceiling: with a fast answer+review (measured
+   * runs finish both well inside their shares) the chairman must still get the whole
+   * remainder of the run, exactly as before this change. Capping it at 20% would
+   * convert "the chairman is protected" into "the chairman is rushed" — a new
+   * timeout in place of the old starvation.
+   */
+  function beginStage(run, name, runDeadlineAt, capStage = true) {
+    const track = stageTrack(run, name)
+    track.startedAt = Date.now()
+    track.deadlineAt = capStage === false
+      ? runDeadlineAt
+      : Math.min(runDeadlineAt, track.startedAt + track.budgetMs)
+    return track
+  }
+
+  /**
+   * Close one stage and record whether its SUB-budget (not the run budget) is what
+   * stopped it. That distinction is the visible half of the fix: "the answer stage
+   * consumed its 45%" must never look like "the whole run ran out".
+   */
+  function endStage(run, name) {
+    const track = stageTrack(run, name)
+    track.endedAt = Date.now()
+    const reason = stageCapReason(name, track, runDeadlineOf(run), track.endedAt)
+    if (reason !== '') {
+      track.capped = true
+      track.cappedReason = reason
+    }
+    return track
+  }
+
+  /**
    * Stream one model call; retries transient provider failures with backoff.
    * `deadlineAt` is the run's absolute budget end: every attempt's timeout is
    * clamped to the remaining time, and a retry that cannot fit is refused, so
    * retries can never eat the whole run behind the watchdog's back.
    */
-  async function callModel(route, system, userText, maxTokens, signal, onDelta, seat, deadlineAt, onReasoning) {
+  /**
+   * Stream one model call; retries transient provider failures with backoff.
+   * `deadlineAt` is the budget end this call may use — the RUN deadline, or a
+   * STAGE sub-budget deadline when the caller passes one — every attempt's
+   * timeout is clamped to the remaining time, and a retry that cannot fit is
+   * refused, so retries can never eat a budget behind the watchdog's back.
+   *
+   * `budgetLabel` names WHICH budget ran out ('整轮' by default, else e.g.
+   * '作答阶段'). Measured failure being fixed: every message said
+   * `整轮预算耗尽：调用超时（89s 内未完成）` even when the run still had minutes
+   * left, because a stage cap was indistinguishable from the run deadline.
+   */
+  async function callModel(route, system, userText, maxTokens, signal, onDelta, seat, deadlineAt, onReasoning, budgetLabel) {
+    const label = typeof budgetLabel === 'string' && budgetLabel !== '' ? budgetLabel : '整轮'
     if (seat !== undefined && seat !== null && typeof seat.startedAt !== 'number') {
       seat.startedAt = Date.now()
       seat.phase = 'running'
@@ -1947,7 +2480,7 @@ export function apply(ctx, config) {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       if (signal.aborted) throw new Error('已取消')
       const left = remaining()
-      if (left <= 0) throw new Error(lastError instanceof Error ? `整轮预算耗尽：${lastError.message}` : '整轮预算耗尽')
+      if (left <= 0) throw new Error(lastError instanceof Error ? `${label}预算耗尽：${lastError.message}` : `${label}预算耗尽`)
       const attemptTimeout = Math.min(CALL_TIMEOUT_MS, left)
       const timeout = AbortSignal.timeout(attemptTimeout)
       const combined = typeof AbortSignal.any === 'function' ? AbortSignal.any([signal, timeout]) : timeout
@@ -1991,7 +2524,7 @@ export function apply(ctx, config) {
         if (signal.aborted) throw new Error('已取消')
         if (attempt < 2 && TRANSIENT_FAILURE.test(lastError.message)) {
           const backoff = Math.min(800 * (attempt + 1), remaining())
-          if (backoff <= 0) throw new Error(`整轮预算耗尽：${lastError.message}`)
+          if (backoff <= 0) throw new Error(`${label}预算耗尽：${lastError.message}`)
           await new Promise((resolve) => setTimeout(resolve, backoff))
           continue
         }
@@ -2017,7 +2550,7 @@ export function apply(ctx, config) {
           lastError = new Error(`调用超时（${Math.round(attemptTimeout / 1000)}s 内未完成）`)
           if (attempt < 2) {
             const backoff = Math.min(800 * (attempt + 1), remaining())
-            if (backoff <= 0) throw new Error(`整轮预算耗尽：${lastError.message}`)
+            if (backoff <= 0) throw new Error(`${label}预算耗尽：${lastError.message}`)
             await new Promise((resolve) => setTimeout(resolve, backoff))
             continue
           }
@@ -2031,7 +2564,7 @@ export function apply(ctx, config) {
           lastError = new Error(detail)
           if (attempt < 2 && TRANSIENT_FAILURE.test(detail)) {
             const backoff = Math.min(800 * (attempt + 1), remaining())
-            if (backoff <= 0) throw new Error(`整轮预算耗尽：${detail}`)
+            if (backoff <= 0) throw new Error(`${label}预算耗尽：${detail}`)
             await new Promise((resolve) => setTimeout(resolve, backoff))
             continue
           }
@@ -2120,6 +2653,30 @@ export function apply(ctx, config) {
       modelSource: typeof run.modelSource === 'string' ? run.modelSource : '',
       defaultModelProblems: Array.isArray(run.defaultModelProblems) ? run.defaultModelProblems : [],
       chairmanProblem: typeof run.chairmanProblem === 'string' ? run.chairmanProblem : '',
+      /* opt stage-7 member label (write-once, see optMemberFor). Always a string so
+         the caller can match it against what it passed in: a silent swap here would
+         be exactly the integrity hole this field exists to close. */
+      optMember: typeof run.optMember === 'string' ? run.optMember : '',
+      /* Why this run took as long as it did, and where its time went.
+         `providerWaves` says how many model-call waves each stage needs (a stage
+         is ceil(seats/slots) waves PER PROVIDER, and the stages are serial);
+         `budgetPlan` says what each stage was allowed and what it consumed.
+         Both are always present: a run with no frozen plan (loaded from disk, or
+         created before these fields existed) is described by the default plan for
+         its own roster instead of shipping `undefined` to the panel. */
+      providerWaves: (run.providerWaves !== null && typeof run.providerWaves === 'object'
+        ? run.providerWaves
+        : providerWavePlan({
+          answers: run.answers,
+          reviews: run.reviews,
+          chairman: typeof run.chairman.key === 'string' && run.chairman.key !== '' ? [run.chairman] : [],
+        }, PROVIDER_CONCURRENCY)),
+      budgetPlan: budgetPlanSnapshot(
+        run.budgetPlan !== null && typeof run.budgetPlan === 'object'
+          ? run.budgetPlan
+          : { ...stageBudgetPlan(runBudgetOf(run)), startedAt: run.createdAt },
+        Date.now(),
+      ),
       answers: run.answers.map((answer) => ({
         key: answer.key,
         provider: answer.provider,
@@ -2266,8 +2823,11 @@ export function apply(ctx, config) {
    * slot: queued and it wakes the agent.
    * @param run - completed run owning the target session.
    * @param mode - 'silent' or 'wake'.
+   * @param forced - the caller went through the explicit `?force=1` escape hatch.
+   *   Recorded on the run as `"<mode>(forced)"` so the snapshot distinguishes a
+   *   sanctioned duplicate from a normal delivery instead of hiding it.
    */
-  function resumeRun(run, mode) {
+  function resumeRun(run, mode, forced) {
     if (typeof run.sessionId !== 'string' || run.sessionId === '') throw new Error('该运行没有关联会话，无法回投')
     const agent = ctx.agents.get(run.sessionId)
     if (agent === undefined || agent === null) throw new Error('主会话当前没有活跃 Agent')
@@ -2279,14 +2839,15 @@ export function apply(ctx, config) {
     }
     if (mode === 'wake') agent.followup(message)
     else agent.inject(message)
-    run.resumed = mode
+    run.resumed = forced === true ? `${mode}(forced)` : mode
   }
 
   /** One read-only subagent seat, built on the same delegation runtime as the subagent tool. */
-  async function callSeatSubagent(parent, route, system, userText, maxTokens, signal, cwd, seat, liveSeats, deadlineAt) {
-    /** Seat budgets clamp to the run deadline so a seat can never outlive the run. */
+  async function callSeatSubagent(parent, route, system, userText, maxTokens, signal, cwd, seat, liveSeats, deadlineAt, budgetLabel) {
+    const label = typeof budgetLabel === 'string' && budgetLabel !== '' ? budgetLabel : '整轮'
+    /** Seat budgets clamp to the run/stage deadline so a seat cannot outlive it. */
     const remaining = () => (typeof deadlineAt === 'number' ? Math.max(0, deadlineAt - Date.now()) : Infinity)
-    if (remaining() <= 0) throw new Error('整轮预算耗尽，不再启动席位')
+    if (remaining() <= 0) throw new Error(`${label}预算耗尽，不再启动席位`)
     /* All three seat windows call remaining() at the point of use, so no
        window can be based on a stale snapshot (the first one used to reuse
        a `left` value captured before the guard). */
@@ -2362,6 +2923,11 @@ export function apply(ctx, config) {
     /* Absolute budget: every attempt and backoff is clamped to this instant,
        so retries settle before (not after) the run-level watchdog. */
     const deadlineAt = runDeadlineOf(run)
+    /* Output budgets and slots were frozen onto the run at creation (planRun),
+       so a Settings write mid-run cannot desync the plan from the behaviour. */
+    const answerMaxTokens = Number.isSafeInteger(run.answerMaxTokens) ? run.answerMaxTokens : ANSWER_MAX_TOKENS
+    const reviewMaxTokens = Number.isSafeInteger(run.reviewMaxTokens) ? run.reviewMaxTokens : REVIEW_MAX_TOKENS
+    const chairmanMaxTokens = Number.isSafeInteger(run.chairmanMaxTokens) ? run.chairmanMaxTokens : CHAIRMAN_MAX_TOKENS
     const baseQuestion = run.contextBlock === '' ? run.question : `${run.contextBlock}\n\n---\n\n问题：${run.question}`
     const workspaceLine = run.workspace !== undefined && typeof run.workspace.cwd === 'string' && run.workspace.cwd !== ''
       ? run.workspace.cwd
@@ -2390,16 +2956,16 @@ export function apply(ctx, config) {
      * the fast raw path so a six-model run cannot spend a whole subagent turn
      * per reviewer.
      */
-    const invokeAnswer = async (route, system, prompt, maxTokens, onDelta, seat, onReasoning) => {
+    const invokeAnswer = async (route, system, prompt, maxTokens, onDelta, seat, onReasoning, stageDeadline, label) => {
       if (!useSubagentSeats || subagentSeatCount >= subagentSeatLimit) {
         if (useSubagentSeats && subagentSeatCount >= subagentSeatLimit && seat !== undefined && seat !== null) {
           seat.phase = 'fast'
         }
-        return callModel(route, system, prompt, maxTokens, signal, onDelta, seat, deadlineAt, onReasoning)
+        return callModel(route, system, prompt, maxTokens, signal, onDelta, seat, stageDeadline, onReasoning, label)
       }
       subagentSeatCount += 1
       try {
-        return await callSeatSubagent(run.parent, route, system, prompt, maxTokens, signal, run.cwd, seat, run.liveSeats, deadlineAt)
+        return await callSeatSubagent(run.parent, route, system, prompt, maxTokens, signal, run.cwd, seat, run.liveSeats, stageDeadline, label)
       } catch (error) {
         if (signal.aborted) throw new Error('已取消')
         if (run.fallbacks >= MAX_FALLBACKS_PER_RUN) {
@@ -2411,30 +2977,35 @@ export function apply(ctx, config) {
           seat.fallback = true
           seat.fallbackFrom = 'subagent'
         }
-        return callModel(route, system, prompt, maxTokens, signal, onDelta, seat, deadlineAt, onReasoning)
+        return callModel(route, system, prompt, maxTokens, signal, onDelta, seat, stageDeadline, onReasoning, label)
       }
     }
     const concurrency = useSubagentSeats ? SEAT_CONCURRENCY : run.answers.length
     try {
-      /* Stage 1: independent answers. */
+      /* Stage 1: independent answers, hard-capped at the answers sub-budget so the
+         chairman stage cannot be starved by a slow roster (see STAGE_BUDGET_SHARE). */
       run.stage = 'answers'
+      const answersTrack = beginStage(run, 'answers', deadlineAt)
       publishRun(run)
       await runLimited(run.answers, concurrency, async (answer) => {
         try {
-          answer.text = await invokeAnswer(routes[answer.key], ANSWER_SYSTEM, questionBlock, ANSWER_MAX_TOKENS, (text) => {
-            answer.text = text
-            scheduleRunStreamTick(run)
-          }, answer.seat, (reasoning) => {
-            answer.reasoning = reasoning
-            answer.reasoningChars = reasoning.length
-            scheduleRunStreamTick(run)
-          })
+          answer.text = await invokeAnswer(
+            routes[answer.key], ANSWER_SYSTEM, questionBlock, answerMaxTokens, (text) => {
+              answer.text = text
+              scheduleRunStreamTick(run)
+            }, answer.seat, (reasoning) => {
+              answer.reasoning = reasoning
+              answer.reasoningChars = reasoning.length
+              scheduleRunStreamTick(run)
+            }, answersTrack.deadlineAt, `${STAGE_LABEL.answers}阶段`,
+          )
         } catch (error) {
           answer.error = errorText(error)
         }
         answer.done = true
         publishRun(run)
       })
+      endStage(run, 'answers')
       if (signal.aborted) throw new Error('已取消')
       const usable = run.answers.filter((answer) => answer.error === '' && answer.text !== '')
       if (usable.length === 0) {
@@ -2442,8 +3013,11 @@ export function apply(ctx, config) {
         return
       }
 
-      /* Stage 2: anonymous peer review and ranking. */
+      /* Stage 2: anonymous peer review and ranking, capped at the reviews
+         sub-budget. A capped review stage is advisory loss, not a lost run: the
+         seats that failed are recorded per seat and the run continues. */
       run.stage = 'reviews'
+      const reviewsTrack = beginStage(run, 'reviews', deadlineAt)
       publishRun(run)
       const labeled = run.answers
         .map((answer, index) => {
@@ -2464,20 +3038,23 @@ export function apply(ctx, config) {
       ].join('\n\n')
       await runLimited(run.reviews, run.reviews.length, async (review) => {
         try {
-          review.text = await callModel(routes[review.key], REVIEW_SYSTEM, reviewPrompt, REVIEW_MAX_TOKENS, signal, (text) => {
-            review.text = text
-            scheduleRunStreamTick(run)
-          }, review.seat, deadlineAt, (reasoning) => {
-            review.reasoning = reasoning
-            review.reasoningChars = reasoning.length
-            scheduleRunStreamTick(run)
-          })
+          review.text = await callModel(
+            routes[review.key], REVIEW_SYSTEM, reviewPrompt, reviewMaxTokens, signal, (text) => {
+              review.text = text
+              scheduleRunStreamTick(run)
+            }, review.seat, reviewsTrack.deadlineAt, (reasoning) => {
+              review.reasoning = reasoning
+              review.reasoningChars = reasoning.length
+              scheduleRunStreamTick(run)
+            }, `${STAGE_LABEL.reviews}阶段`,
+          )
         } catch (error) {
           review.error = errorText(error)
         }
         review.done = true
         publishRun(run)
       })
+      endStage(run, 'reviews')
 
       if (signal.aborted) throw new Error('已取消')
       if (run.useChairman === false) {
@@ -2486,9 +3063,28 @@ export function apply(ctx, config) {
         return
       }
 
-      /* Stage 3: chairman synthesis. */
+      /* Stage 3: chairman synthesis.
+       *
+       * The chairman is the stage that used to die: it runs LAST, so it only ever
+       * saw whatever the earlier stages left of the 30-minute run budget. Measured
+       * failure: `整轮预算耗尽：调用超时（89s 内未完成）` — the run had produced
+       * answers and reviews and then lost the synthesis. The sub-budget caps above
+       * leave it ≥20% by construction; if less than `floorMs` is left anyway (a
+       * configured small budget, or a run cut short elsewhere), it is SKIPPED and
+       * recorded — a no-chairman conclusion is a result, a hard failure is not.
+       */
       run.stage = 'chairman'
+      const chairmanTrack = beginStage(run, 'chairman', deadlineAt, false)
       publishRun(run)
+      const chairmanDecision = chairmanStageDecision(deadlineAt - Date.now(), chairmanTrack.floorMs)
+      if (chairmanDecision.action === 'skip') {
+        chairmanTrack.skipped = true
+        chairmanTrack.reason = chairmanDecision.reason
+        endStage(run, 'chairman')
+        run.stage = 'done'
+        finishRun(run, 'done', '', STOP_REASON_CHAIRMAN_SKIPPED)
+        return
+      }
       const answersBlock = run.answers
         .map((answer, index) => {
           if (answer.error !== '' || answer.text === '') return `【回答 ${letter(index)}｜${answer.name}】\n（失败）`
@@ -2511,7 +3107,7 @@ export function apply(ctx, config) {
         routes[run.chairman.key],
         CHAIRMAN_SYSTEM,
         chairmanPrompt,
-        CHAIRMAN_MAX_TOKENS,
+        chairmanMaxTokens,
         signal,
         (text) => {
           run.chairman.text = text
@@ -2524,7 +3120,9 @@ export function apply(ctx, config) {
           run.chairman.reasoningChars = reasoning.length
           scheduleRunStreamTick(run)
         },
+        `${STAGE_LABEL.chairman}阶段`,
       )
+      endStage(run, 'chairman')
       run.chairman.done = true
       run.stage = 'done'
       finishRun(run, 'done', '')
@@ -2547,21 +3145,54 @@ export function apply(ctx, config) {
        the calling agent and the user both see it instead of a silent swap. */
     const chairmanNote = typeof run.chairmanProblem === 'string' && run.chairmanProblem !== ''
       ? `（注意：${run.chairmanProblem}）` : ''
-    const modelsLine = `（参与模型：${run.answers.map((answer) => answer.name).join('、')}；runId: ${run.id}）${chairmanNote}`
+    /* The opt-member label rides in the SAME meta line as the runId, because those
+       two are the pair a downstream record must carry: putting them together means a
+       saved conclusion can be cross-checked against its record without trusting the
+       caller to remember which member it asked for. */
+    const optMemberNote = typeof run.optMember === 'string' && run.optMember !== ''
+      ? `；optMember: ${run.optMember}` : ''
+    const modelsLine = `（参与模型：${run.answers.map((answer) => answer.name).join('、')}；runId: ${run.id}${optMemberNote}）${chairmanNote}`
+    /* Every degradation this run took is spelled out one line at a time, in the
+       text the CALLER reads. The user's complaint was "council 不好用" with no way
+       to see why: a 5-seat roster on one provider pays ceil(5/slots) waves per
+       stage, and a chairman skipped for lack of budget is a decision, not a fault.
+       Silent degradation is the defect mode this plugin keeps re-introducing. */
+    const notices = []
+    const chairmanSkip = run.budgetPlan !== null && typeof run.budgetPlan === 'object'
+      && run.budgetPlan.stages !== null && typeof run.budgetPlan.stages === 'object'
+      && run.budgetPlan.stages.chairman !== null && typeof run.budgetPlan.stages.chairman === 'object'
+      ? run.budgetPlan.stages.chairman
+      : undefined
+    if (chairmanSkip !== undefined && chairmanSkip.skipped === true
+      && typeof chairmanSkip.reason === 'string' && chairmanSkip.reason !== '') {
+      notices.push(chairmanSkip.reason)
+    }
+    for (const name of STAGE_ORDER) {
+      const track = run.budgetPlan !== null && typeof run.budgetPlan === 'object'
+        && run.budgetPlan.stages !== null && typeof run.budgetPlan.stages === 'object'
+        ? run.budgetPlan.stages[name] : undefined
+      if (track !== undefined && track !== null && track.capped === true
+        && typeof track.cappedReason === 'string' && track.cappedReason !== '') {
+        notices.push(track.cappedReason)
+      }
+    }
+    const waves = run.providerWaves !== null && typeof run.providerWaves === 'object' ? run.providerWaves : undefined
+    if (waves !== undefined && typeof waves.advice === 'string' && waves.advice !== '') notices.push(waves.advice)
+    const noticeBlock = notices.length === 0 ? '' : `\n\n${notices.map((line) => `注意：${line}`).join('\n')}`
     if (run.status === 'error') {
       const kept = usable.map((answer) => `### ${answer.name}\n${answer.text}`).join('\n\n')
       const reason = run.stopReason === 'watchdog' ? '（原因：整轮超时）'
         : run.stopReason === 'cancelled' ? '（原因：调用方取消）'
         : run.stopReason === 'stage-error' ? `（原因：${kept === '' ? '阶段失败' : '部分席位失败后中止'}）` : ''
-      return `理事会运行失败：${run.error}${reason}${kept === '' ? '' : `\n\n已完成的答案：\n${kept}`}\n\n${modelsLine}`
+      return `理事会运行失败：${run.error}${reason}${kept === '' ? '' : `\n\n已完成的答案：\n${kept}`}\n\n${modelsLine}${noticeBlock}`
     }
-    if (run.chairman.text !== '') return `${run.chairman.text}\n\n${modelsLine}`
+    if (run.chairman.text !== '') return `${run.chairman.text}\n\n${modelsLine}${noticeBlock}`
     const parts = ['（无主席汇总：各模型答案如下）', '']
     for (const answer of run.answers) {
       parts.push(`### ${answer.name}`, answer.text !== '' ? answer.text : `（失败：${answer.error}）`, '')
     }
     parts.push(modelsLine)
-    return parts.join('\n')
+    return parts.join('\n') + noticeBlock
   }
 
   ctx.effect(() => ctx.tools.register({
@@ -2602,6 +3233,10 @@ export function apply(ctx, config) {
         attachFiles: {
           type: 'boolean',
           description: 'Attach the calling workspace (tree, key files, source pack). Default true.',
+        },
+        optMember: {
+          type: 'string',
+          description: 'opt 阶段 7 逐成员评审时，标记本次运行服务于哪个 opt 成员；留空表示非 opt 流程',
         },
       },
       required: ['question'],
@@ -2654,7 +3289,9 @@ export function apply(ctx, config) {
       const selected = selection.routes
       if (selected.length === 0) throw new Error('no models available for the council')
       const useChairman = input.chairman !== false
-      const chairmanChoice = chairmanSelection(cat, selected, readSetting(liveConfig.defaultChairman, ''))
+      /* Same decision point as the panel (see {@link chairmanForRequest}); this path
+         has no per-call pick, so the configured default is its only input. */
+      const chairmanChoice = chairmanForRequest(cat, selected, '', readSetting(liveConfig.defaultChairman, ''))
       const chairman = chairmanChoice.route
       /* The calling agent owns the workspace and the cancellation signal. */
       const caller = exec !== null && typeof exec === 'object' ? exec.agent : undefined
@@ -2688,16 +3325,34 @@ export function apply(ctx, config) {
       }
       const routes = {}
       for (const route of selected) routes[route.key] = route
+      /* Freeze the latency plan for THIS run: output budgets, provider slots and
+         the whole-run budget, plus the derived wave count and stage sub-budgets
+         that the snapshot and the tool conclusion report. */
+      const plan = planRun({
+        answers: selected,
+        reviews: selected,
+        chairman: useChairman ? [chairman] : [],
+      })
       const run = {
         id: `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`,
         createdAt: Date.now(),
         sessionId: callerId,
         useChairman,
+        /* Budget/latency plan, frozen (see planRun). */
+        budgetMs: plan.budgetMs,
+        answerMaxTokens: plan.answerMaxTokens,
+        reviewMaxTokens: plan.reviewMaxTokens,
+        chairmanMaxTokens: plan.chairmanMaxTokens,
+        providerConcurrency: plan.providerConcurrency,
+        providerWaves: plan.providerWaves,
+        budgetPlan: plan.budgetPlan,
         /* Which branch picked the roster, and what it had to drop. */
         modelSource: selection.source,
         defaultModelProblems: selection.problems,
         /* Why the configured chairman was not elected, when it was not. */
         chairmanProblem: chairmanChoice.problem,
+        /* opt stage-7 member label; set write-once just below (see optMemberFor). */
+        optMember: '',
         seatMode: 'llm',
         subagentSeats: 0,
         cwd: workspace.cwd,
@@ -2743,10 +3398,21 @@ export function apply(ctx, config) {
         fallbacks: 0,
         toolRun: true,
       }
+      /* The opt member label is WRITE-ONCE and refuses to be rewritten: a run that
+         could be relabelled would let one runId stand in for several members in the
+         downstream records (the exact integrity hole this field closes). See
+         {@link optMemberFor}. Thrown BEFORE the run is registered, so a refused
+         label leaves no half-created run behind. */
+      const optLabel = optMemberFor(run.optMember, input.optMember)
+      if (optLabel.conflict !== '') throw new Error(optLabel.conflict)
+      run.optMember = optLabel.value
+      /* The plan starts when the run does: elapsedMs/remainingMs are measured from
+         this instant, not from whenever a stage happens to open. */
+      run.budgetPlan.startedAt = run.createdAt
       run.watchdog = setTimeout(() => {
         if (run.status !== 'running') return
-        terminateRun(run, '运行超时（30 分钟），已中止')
-      }, RUN_TIMEOUT_MS)
+        terminateRun(run, watchdogMessage(run))
+      }, runBudgetOf(run))
       if (typeof run.watchdog.unref === 'function') run.watchdog.unref()
       const signal = exec !== null && typeof exec === 'object' ? exec.signal : undefined
       if (signal !== undefined) {
@@ -2817,7 +3483,23 @@ export function apply(ctx, config) {
 
         if (req.method === 'GET' && path === '/models') {
           const cat = await catalog()
-          sendJson(res, 200, { providers: cat.providers, contextMaxChars, filesMaxChars })
+          /* `defaultModels` / `defaultChairman` are a READ-ONLY echo of the settings,
+             added so the panel can pre-fill its pickers instead of guessing. Before
+             this, the panel had no way to know that a default chairman was
+             configured — which is how a configured chairman kept being replaced by
+             the first participant without anything on screen saying so. The existing
+             fields keep their meaning; these two are additive. */
+          const modelsSetting = readSetting(liveConfig.defaultModels, [])
+          const chairmanSetting = readSetting(liveConfig.defaultChairman, '')
+          sendJson(res, 200, {
+            providers: cat.providers,
+            contextMaxChars,
+            filesMaxChars,
+            defaultModels: Array.isArray(modelsSetting)
+              ? modelsSetting.filter((spec) => typeof spec === 'string' && spec !== '')
+              : [],
+            defaultChairman: typeof chairmanSetting === 'string' ? chairmanSetting : '',
+          })
           return
         }
         if (req.method === 'GET' && path === '/runs') {
@@ -2844,7 +3526,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v68', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v71', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -2859,7 +3541,7 @@ export function apply(ctx, config) {
           for (const run of runs.values()) if (run.status === 'running') runningCount += 1
           sendJson(res, 200, {
             ok: true,
-            build: 'v68',
+            build: 'v71',
             toolEnabled: toolEnabled(liveConfig),
             panelEnabled: panelEnabled(liveConfig),
             /*
@@ -3030,22 +3712,24 @@ export function apply(ctx, config) {
               if (seatParent !== undefined && seatParent !== null) seatMode = 'subagent'
             }
           }
-          /* Chairman for a panel-started run. Same single decision point as the
-             tool path, and for the same reason: a pick that cannot resolve, or
-             that is not one of the participants, used to be swapped in silence.
-             An empty pick is the documented election (first participant) and is
-             not reported; anything else travels out on `chairmanProblem` so the
-             user can see that their choice did not take effect. */
-          let chairman = selected[0]
-          let chairmanProblem = ''
-          if (body.chairman !== null && typeof body.chairman === 'object') {
-            const provider = String(body.chairman.provider || '')
-            const model = String(body.chairman.model || '')
-            const spec = provider === '' || model === '' ? '' : `${provider}/${model}`
-            const choice = chairmanSelection(cat, selected, spec)
-            chairman = choice.route
-            chairmanProblem = choice.problem
-          }
+          /* Chairman for a panel-started run, through the SAME decision point as the
+             tool path (see {@link chairmanForRequest}): an explicit pick in the body
+             wins, otherwise the `defaultChairman` SETTING is honoured — it used to be
+             ignored here, which is exactly how a configured chairman got silently
+             replaced by the first participant. A configured pick that cannot serve is
+             reported on `chairmanProblem` instead of disappearing. */
+          const chairmanPick = body.chairman !== null && typeof body.chairman === 'object' ? body.chairman : undefined
+          const pickProvider = chairmanPick === undefined ? '' : String(chairmanPick.provider || '').trim()
+          const pickModel = chairmanPick === undefined ? '' : String(chairmanPick.model || '').trim()
+          /* A half-empty pick (`{}`, or only a provider) counts as "no explicit
+             request", not as the literal spec "/" — otherwise the user would get an
+             unparsable-chairman warning for sending an empty picker. */
+          const requestedChairman = pickProvider !== '' && pickModel !== '' ? `${pickProvider}/${pickModel}` : ''
+          const chairmanChoice = chairmanForRequest(
+            cat, selected, requestedChairman, readSetting(liveConfig.defaultChairman, ''),
+          )
+          const chairman = chairmanChoice.route
+          const chairmanProblem = chairmanChoice.problem
           /* Optional reviewer group, defaulting to every answerer (subagent/group style roster). */
           const reviewerRoutes = []
           const requestedReviewers = Array.isArray(body.reviewers) ? body.reviewers : []
@@ -3107,11 +3791,27 @@ export function apply(ctx, config) {
             workspace,
             seatMode,
           }
+          /* Same frozen latency plan as the tool path — the panel path reviews may
+             be a SUBSET of the answerers, so its wave count is computed from the
+             actual reviewer list, not from `selected`. */
+          const plan = planRun({
+            answers: selected,
+            reviews: reviewers,
+            chairman: useChairman ? [chairman] : [],
+          })
           const run = {
             id: `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`,
             createdAt: Date.now(),
             sessionId,
             useChairman,
+            /* Budget/latency plan, frozen (see planRun). */
+            budgetMs: plan.budgetMs,
+            answerMaxTokens: plan.answerMaxTokens,
+            reviewMaxTokens: plan.reviewMaxTokens,
+            chairmanMaxTokens: plan.chairmanMaxTokens,
+            providerConcurrency: plan.providerConcurrency,
+            providerWaves: plan.providerWaves,
+            budgetPlan: plan.budgetPlan,
             /* Panel path: a chairman the user picked but that could not serve
                (unresolvable, or not among the participants) is reported here
                instead of being replaced without a trace. */
@@ -3178,10 +3878,11 @@ export function apply(ctx, config) {
           }
           const routes = {}
           for (const route of selected) routes[route.key] = route
+          run.budgetPlan.startedAt = run.createdAt
           run.watchdog = setTimeout(() => {
             if (run.status !== 'running') return
-            terminateRun(run, '运行超时（30 分钟），已中止')
-          }, RUN_TIMEOUT_MS)
+            terminateRun(run, watchdogMessage(run))
+          }, runBudgetOf(run))
           if (typeof run.watchdog.unref === 'function') run.watchdog.unref()
           runs.set(run.id, run)
           persistRuns()
@@ -3284,6 +3985,14 @@ export function apply(ctx, config) {
             sendJson(res, 400, { error: 'mode must be silent or wake' })
             return
           }
+          /* Host-side duplicate defence (see {@link resumeGuard}): a tool-originated
+             run needs the explicit, recorded escape hatch, never a client's goodwill. */
+          const force = url.searchParams.get('force') === '1' || body.force === true
+          const guard = resumeGuard(run, force)
+          if (guard.ok !== true) {
+            sendJson(res, guard.status, { error: guard.error, code: guard.code })
+            return
+          }
           if (run.status !== 'done') {
             sendJson(res, 409, { error: '运行尚未完成', code: 'not-finished' })
             return
@@ -3293,8 +4002,10 @@ export function apply(ctx, config) {
             return
           }
           try {
-            resumeRun(run, mode)
-            sendJson(res, 200, { ok: true, mode })
+            resumeRun(run, mode, guard.forced === true)
+            /* A normal delivery keeps the historical response shape byte for byte;
+               `forced` is added only when the escape hatch was actually used. */
+            sendJson(res, 200, guard.forced === true ? { ok: true, mode, forced: true } : { ok: true, mode })
           } catch (error) {
             sendJson(res, 409, { error: errorText(error) })
           }
@@ -3361,18 +4072,27 @@ export function apply(ctx, config) {
 /* Pure helpers and limits exported for the host harness (`dev/verify-host.mjs`).
    The limits are exported so a test can assert the README quotes them. */
 export {
+  CALL_TIMEOUT_MS,
+  CHAIRMAN_FLOOR_MS,
   CHAIRMAN_MAX_TOKENS,
   ANSWER_MAX_TOKENS,
   CODE_FILE_CHARS,
   CODE_MAX_CHARS,
   CODE_WALK_ENTRIES,
   MAX_FALLBACKS_PER_RUN,
+  OUTPUT_TOKENS_MAX,
+  OUTPUT_TOKENS_MIN,
   PROVIDER_CONCURRENCY,
+  PROVIDER_CONCURRENCY_MAX,
+  PROVIDER_CONCURRENCY_MIN,
   REVIEW_MAX_TOKENS,
+  RUN_BUDGET_MIN_MS,
   RUN_TIMEOUT_MS,
   SEAT_CONCURRENCY,
   SEAT_RESULT_TIMEOUT_MS,
   SEAT_START_TIMEOUT_MS,
+  STAGE_BUDGET_SHARE,
+  STOP_REASON_CHAIRMAN_SKIPPED,
   TRANSIENT_FAILURE,
   candidatePaths,
   collectCodeContext,

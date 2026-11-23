@@ -17,6 +17,7 @@ import { existsSync, readFileSync } from 'node:fs'
    installation also routes a linked plugin's declared peerDependencies, but a plain
    `node dev/verify-host.mjs` has no such router. */
 import { TRANSIENT_FAILURE, SEAT_RESULT_TIMEOUT_MS, SEAT_START_TIMEOUT_MS, PROVIDER_CONCURRENCY, MAX_FALLBACKS_PER_RUN, RUN_TIMEOUT_MS, CODE_FILE_CHARS, CODE_MAX_CHARS, CODE_WALK_ENTRIES, looksLikeDeliberatePath, reasoningTail, collectSourceFiles, defaultRoutesFromCatalog, candidatePaths, collectCodeContext, collectPathContext, documentOnlyReview, isPathInside, readTextFile, runLimited, withTimeout, apply, Config, toolEnabled, panelEnabled, parseRouteSpec, resolveConfiguredRoutes, selectCouncilRoutes, pickChairmanRoute, chairmanSelection, readSetting } from '../index.js'
+import { ANSWER_MAX_TOKENS, CALL_TIMEOUT_MS, REVIEW_MAX_TOKENS, CHAIRMAN_MAX_TOKENS, RUN_BUDGET_MIN_MS, OUTPUT_TOKENS_MIN, PROVIDER_CONCURRENCY_MIN, PROVIDER_CONCURRENCY_MAX, STAGE_BUDGET_SHARE, CHAIRMAN_FLOOR_MS, STOP_REASON_CHAIRMAN_SKIPPED, providerWavePlan, stageBudgetPlan, stageCapReason, budgetPlanSnapshot, chairmanStageDecision, runBudgetOf, runDeadlineOf, watchdogMessage, resumeGuard, optMemberFor, chairmanForRequest } from '../index.js'
 
 const root = await mkdtemp(join(tmpdir(), 'council-host-'))
 try {
@@ -281,10 +282,32 @@ try {
     assert.ok(terminate[1].includes('activation.dispose()'), 'terminateRun disposes live seats')
     /* The wall branch and both watchdogs go through it. */
     assert.ok(source.includes("terminateRun(run, '整轮预算耗尽')"), 'deadline wall must use terminateRun')
-    const watchdogCalls = (source.match(/terminateRun\(run, '运行超时（30 分钟），已中止'\)/g) || []).length
+    /* Both watchdogs pass the run through `watchdogMessage`, so the sentence states
+       the budget it actually enforces once `runBudgetMs` is lowered. Counting the
+       helper call sites keeps the coverage assertion (still exactly two) without
+       pinning it to a literal that would go stale with a configured budget. */
+    const watchdogCalls = (source.match(/terminateRun\(run, watchdogMessage\(run\)\)/g) || []).length
     assert.equal(watchdogCalls, 2, `both watchdogs (tool + HTTP) must use terminateRun, got ${watchdogCalls}`)
+    assert.equal(/terminateRun\(run, '运行超时/.test(source), false,
+      'both watchdogs must derive their message from the run budget, not a fixed literal')
+    /* The default budget keeps the historical sentence VERBATIM: a user who never
+       opened Settings must not see their watchdog message reworded. */
+    assert.equal(watchdogMessage({ createdAt: 0, budgetMs: RUN_TIMEOUT_MS }), '运行超时（30 分钟），已中止',
+      'the default run budget must produce the historical watchdog sentence')
+    assert.equal(watchdogMessage({ createdAt: 0, budgetMs: 10 * 60 * 1000 }), '运行超时（10 分钟），已中止',
+      'a lowered run budget must be stated in the watchdog message')
+    assert.equal(watchdogMessage({ createdAt: 0 }), '运行超时（30 分钟），已中止',
+      'a run with no frozen budget (loaded from disk) must fall back to the ceiling')
     assert.equal(/finishRun\(run, 'error', '整轮预算耗尽'/.test(source), false,
       'the wall branch must not settle without releasing resources')
+    /* The build marker is bumped by hand on every behaviour change so a reload is
+       verifiable ("if it still reads the previous marker, the host is running the
+       old code and the new snapshot fields are not there"). Both health surfaces
+       must therefore agree, or "which code is live?" becomes unanswerable. */
+    const buildMarkers = [...source.matchAll(/build: 'v(\d+)'/g)].map((match) => match[1])
+    assert.equal(buildMarkers.length, 2, 'both health surfaces must report a build marker')
+    assert.equal(new Set(buildMarkers).size, 1,
+      `the /diag and / health probes must report one build marker, got ${JSON.stringify(buildMarkers)}`)
   }
 
   /* A configured allowlist confines attachments to the workspace. */
@@ -440,6 +463,28 @@ try {
   assert.ok(readme.includes(`${PROVIDER_CONCURRENCY} 并发`), 'README must state the provider concurrency')
   assert.ok(readme.includes(`降级熔断 ${MAX_FALLBACKS_PER_RUN}`), 'README must state the fallback circuit-breaker quota')
 
+  /* The per-call timeout: the README claimed 300s while CALL_TIMEOUT_MS was 600000
+     (10 min) — drift nobody noticed because nothing compared the two. Parse the
+     number the README actually prints and compare it to the constant, so the next
+     change to either side has to be made together. */
+  const callTimeout = /单次调用超时 (\d+)s/.exec(readme)
+  assert.ok(callTimeout !== null, 'README must state the single-call timeout')
+  assert.equal(Number(callTimeout[1]), Math.round(CALL_TIMEOUT_MS / 1000),
+    'README 的「单次调用超时 Ns」必须等于 CALL_TIMEOUT_MS')
+
+  /* Every tuning knob the Config exposes must be documented, and every new
+     observable the plugin ships must be described: a Settings field or snapshot
+     field nobody wrote down is the same defect as an undocumented constant.
+     Matched on a whole identifier, NOT a substring: renaming `providerWaves` to
+     `providerWavesUndocumented` must fail, which a plain `includes` would miss. */
+  const documentsToken = (token) => new RegExp(`(?<![A-Za-z0-9_])${token}(?![A-Za-z0-9_])`).test(readme)
+  for (const name of ['answerMaxTokens', 'reviewMaxTokens', 'chairmanMaxTokens', 'providerConcurrency', 'runBudgetMs']) {
+    assert.ok(documentsToken(name), `README must document the ${name} setting (as a whole identifier)`)
+  }
+  for (const name of ['providerWaves', 'budgetPlan', 'optMember', 'chairman-budget-skipped']) {
+    assert.ok(documentsToken(name), `README must describe the ${name} observable (as a whole identifier)`)
+  }
+
   /* Behavioral contracts, not just numbers: the README must describe the
      shipped defaults and the actual delivery mechanism. */
   assert.ok(readme.includes('agent.inject()'), 'README must describe silent delivery as agent.inject()')
@@ -521,6 +566,311 @@ try {
     active -= 1
   })
   assert.ok(peak >= 2 && peak <= 3, `concurrency window: ${peak}`)
+
+  /* ------------------------------------------------------------------ *
+   * Latency and budget fairness.                                        *
+   *                                                                     *
+   * Measured baseline this locks in: 8 council runs took 11m45s–27m46s, *
+   * and one hard-failed IN THE CHAIRMAN STAGE with                     *
+   * `整轮预算耗尽：调用超时（89s 内未完成）`. Three causes: 16384-token  *
+   * seats, a 4-slot provider that turned a 5-seat roster into 2 waves   *
+   * per stage, and a chairman stage that only ever saw the run's         *
+   * leftovers. The knobs are settings now, the waves and stage budgets  *
+   * are reported, and the chairman degrades visibly instead of dying.    *
+   * ------------------------------------------------------------------ */
+  {
+    /* The five tuning knobs ship exactly the values that were hard-coded, so an
+       upgrade can never shorten an answer or a run behind the user's back. */
+    const defaults = Config(undefined)
+    assert.equal(readSetting(defaults.answerMaxTokens, -1), ANSWER_MAX_TOKENS,
+      'answerMaxTokens must default to the historical ANSWER_MAX_TOKENS')
+    assert.equal(readSetting(defaults.reviewMaxTokens, -1), REVIEW_MAX_TOKENS,
+      'reviewMaxTokens must default to the historical REVIEW_MAX_TOKENS')
+    assert.equal(readSetting(defaults.chairmanMaxTokens, -1), CHAIRMAN_MAX_TOKENS,
+      'chairmanMaxTokens must default to the historical CHAIRMAN_MAX_TOKENS')
+    assert.equal(readSetting(defaults.providerConcurrency, -1), PROVIDER_CONCURRENCY,
+      'providerConcurrency must default to the historical PROVIDER_CONCURRENCY')
+    assert.equal(readSetting(defaults.runBudgetMs, -1), RUN_TIMEOUT_MS,
+      'runBudgetMs must default to the historical RUN_TIMEOUT_MS')
+    /* Pinned literals, so a future "small tweak" cannot quietly lower quality. */
+    assert.equal(ANSWER_MAX_TOKENS, 16384, 'the answer budget must not be lowered silently')
+    assert.equal(REVIEW_MAX_TOKENS, 16384, 'the review budget must not be lowered silently')
+    assert.equal(CHAIRMAN_MAX_TOKENS, 16384, 'the chairman budget must not be lowered silently')
+    /* 0.2.36 raised this from 4 to 5 ON PURPOSE: a 5-seat roster on one provider
+       went from 2 waves per stage to 1. Locked as a floor, and cross-checked
+       against the README below, so it cannot silently drift back. */
+    assert.ok(PROVIDER_CONCURRENCY >= 5,
+      `the default slot count must cover a 5-seat roster in one wave, got ${PROVIDER_CONCURRENCY}`)
+    assert.equal(RUN_TIMEOUT_MS, 1800000, 'the default run budget must not be lowered silently')
+    for (const name of ['answerMaxTokens', 'reviewMaxTokens', 'chairmanMaxTokens', 'providerConcurrency', 'runBudgetMs']) {
+      assert.ok(Object.hasOwn(Config.dict, name), `Config must declare ${name}`)
+      assert.equal(Config.dict[name].meta.volatile, true,
+        `${name} must be .volatile() so a Settings write reaches the next run without a plugin restart`)
+      assert.ok(String(Config.dict[name].meta.description || '').length > 0, `${name} must carry a description`)
+      assert.throws(() => Config({ [name]: 'not-a-number' }), `${name} must reject a non-number`)
+    }
+    /* A floor on the output budget keeps "empty body / truncated answer" from being
+       a configurable outcome; the ceiling keeps a provider from being over-asked. */
+    assert.ok(OUTPUT_TOKENS_MIN >= 4096, `the output-budget floor must be sane, got ${OUTPUT_TOKENS_MIN}`)
+    assert.ok(OUTPUT_TOKENS_MIN <= ANSWER_MAX_TOKENS, 'the floor must never exclude the shipped default')
+    assert.ok(PROVIDER_CONCURRENCY_MIN >= 1 && PROVIDER_CONCURRENCY_MAX >= PROVIDER_CONCURRENCY)
+
+    /* --- provider waves ---------------------------------------------------- */
+    const bohrium = (n) => Array.from({ length: n }, () => ({ provider: 'bohrium', providerName: 'Bohrium' }))
+    const deepseek = (n) => Array.from({ length: n }, () => ({ provider: 'deepseek', providerName: 'DeepSeek' }))
+    /* The 4-slot arithmetic stays locked with an EXPLICIT slot count (the default is
+       5 now): the rule `ceil(seats/slots)` must keep holding for any slot count. */
+    const fiveOneProvider = providerWavePlan({
+      answers: bohrium(5), reviews: bohrium(5), chairman: bohrium(1),
+    }, 4)
+    assert.equal(fiveOneProvider.concurrency, 4)
+    assert.equal(fiveOneProvider.stages.answers.seats, 5)
+    assert.equal(fiveOneProvider.stages.answers.slots, 4)
+    assert.equal(fiveOneProvider.stages.answers.waves, 2,
+      'a 5-seat roster on 4 slots needs ceil(5/4)=2 waves in the answer stage')
+    assert.equal(fiveOneProvider.stages.reviews.waves, 2, 'the review stage pays the same waves')
+    assert.equal(fiveOneProvider.stages.chairman.waves, 1, 'one chairman seat is one wave')
+    assert.equal(fiveOneProvider.maxWaves, 2)
+    assert.equal(fiveOneProvider.stages.answers.byProvider[0].provider, 'bohrium')
+    assert.equal(fiveOneProvider.stages.answers.byProvider[0].seats, 5)
+    assert.equal(fiveOneProvider.advice,
+      '同 provider "bohrium" 5 席 > 槽位 4，每阶段将跑 2 波（ceil(5/4)）；掺入第二 provider 可降为一波。',
+      'the same-provider excess must produce the one visible advice line')
+    /* The 0.2.36 default: the same roster is ONE wave per stage, and the advice line
+       must disappear because there is nothing left to advise. */
+    const fiveAtDefault = providerWavePlan({
+      answers: bohrium(5), reviews: bohrium(5), chairman: bohrium(1),
+    }, PROVIDER_CONCURRENCY)
+    assert.equal(fiveAtDefault.concurrency, PROVIDER_CONCURRENCY)
+    assert.equal(fiveAtDefault.maxWaves, 1,
+      'the shipped default must put a 5-seat single-provider roster in one wave per stage')
+    assert.equal(fiveAtDefault.advice, '', 'a roster that fits the default slots needs no advice')
+    /* Six seats are still 2 waves: the default was bounded, not fitted to one roster. */
+    const sixAtDefault = providerWavePlan({
+      answers: bohrium(6), reviews: bohrium(6), chairman: bohrium(1),
+    }, PROVIDER_CONCURRENCY)
+    assert.equal(sixAtDefault.maxWaves, 2, 'a 6-seat roster still needs 2 waves at the default slots')
+    assert.ok(sixAtDefault.advice.includes('6 席 > 槽位'), 'and it must say so')
+    /* The cheapest fix the user has: slots that fit the roster. */
+    const fiveSlots = providerWavePlan({
+      answers: bohrium(5), reviews: bohrium(5), chairman: bohrium(1),
+    }, 5)
+    assert.equal(fiveSlots.maxWaves, 1, 'slots >= seats collapses every stage to one wave')
+    assert.equal(fiveSlots.advice, '', 'no excess means no advice line')
+    /* A mixed roster is one wave per stage at every slot count tested. */
+    const mixedRoster = providerWavePlan({
+      answers: [...bohrium(3), ...deepseek(2)], reviews: [...bohrium(3), ...deepseek(2)], chairman: bohrium(1),
+    }, 4)
+    assert.equal(mixedRoster.maxWaves, 1, '3+2 across two providers is one wave at 4 slots')
+    assert.equal(mixedRoster.advice, '')
+    /* Only the offending stage is named when just one stage exceeds. */
+    const answersOnly = providerWavePlan({ answers: bohrium(5), reviews: bohrium(2), chairman: bohrium(1) }, 4)
+    assert.equal(answersOnly.stages.reviews.waves, 1)
+    assert.ok(answersOnly.advice.includes('作答阶段将跑 2 波'),
+      `a single offending stage must be named, got ${JSON.stringify(answersOnly.advice)}`)
+    /* No chairman stage means no fabricated wave. */
+    const noChairman = providerWavePlan({ answers: bohrium(2), reviews: bohrium(2), chairman: [] }, 4)
+    assert.equal(noChairman.stages.chairman.seats, 0)
+    assert.equal(noChairman.stages.chairman.waves, 0)
+    assert.equal(noChairman.stages.chairman.byProvider.length, 0)
+    /* A 6-seat roster is NOT slower than a 5-seat one: both are 2 waves. */
+    assert.equal(providerWavePlan({ answers: bohrium(6), reviews: bohrium(6) }, 4).maxWaves, 2)
+    /* Garbage in must fall back to the documented default, never NaN waves. */
+    assert.equal(providerWavePlan({ answers: bohrium(5) }, Number.NaN).concurrency, PROVIDER_CONCURRENCY)
+    assert.equal(providerWavePlan({ answers: bohrium(5) }, 0).concurrency, PROVIDER_CONCURRENCY)
+    assert.equal(providerWavePlan(undefined, 4).maxWaves, 0)
+
+    /* --- stage sub-budgets ------------------------------------------------- */
+    assert.deepEqual([STAGE_BUDGET_SHARE.answers, STAGE_BUDGET_SHARE.reviews, STAGE_BUDGET_SHARE.chairman],
+      [0.45, 0.35, 0.2], 'the three stage shares are the documented 45/35/20')
+    assert.ok(STAGE_BUDGET_SHARE.answers + STAGE_BUDGET_SHARE.reviews <= 0.8,
+      'the answer and review caps must leave the chairman at least 20% by construction')
+    const plan = stageBudgetPlan(RUN_TIMEOUT_MS)
+    assert.equal(plan.totalMs, RUN_TIMEOUT_MS)
+    assert.equal(plan.stages.answers.budgetMs, 810000, 'answers get 45% of 30 min')
+    assert.equal(plan.stages.reviews.budgetMs, 630000, 'reviews get 35% of 30 min')
+    assert.equal(plan.stages.chairman.budgetMs, 360000, 'the chairman floor budget is 20% of 30 min')
+    assert.equal(plan.stages.chairman.floorMs, CHAIRMAN_FLOOR_MS, 'the chairman floor is 120 s')
+    assert.equal(plan.stages.chairman.skipped, false)
+    assert.equal(plan.stages.chairman.reason, '')
+    for (const name of ['answers', 'reviews']) {
+      assert.equal(plan.stages[name].capped, false)
+      assert.equal(plan.stages[name].cappedReason, '')
+    }
+    /* A small run budget cannot carry a floor bigger than the chairman's own share. */
+    const smallPlan = stageBudgetPlan(RUN_BUDGET_MIN_MS)
+    assert.equal(smallPlan.totalMs, RUN_BUDGET_MIN_MS)
+    assert.equal(smallPlan.stages.chairman.floorMs, Math.round(RUN_BUDGET_MIN_MS * STAGE_BUDGET_SHARE.chairman))
+    /* Out-of-range totals clamp to the ceiling: a plan can never exceed the watchdog. */
+    for (const bad of [undefined, null, 1, RUN_BUDGET_MIN_MS - 1, 10 * RUN_TIMEOUT_MS]) {
+      assert.equal(stageBudgetPlan(bad).totalMs, RUN_TIMEOUT_MS, `stageBudgetPlan(${String(bad)}) must clamp`)
+    }
+
+    /* --- run budget -------------------------------------------------------- */
+    assert.equal(runBudgetOf({}), RUN_TIMEOUT_MS, 'a run without a frozen budget falls back to the ceiling')
+    assert.equal(runBudgetOf({ budgetMs: 600000 }), 600000, 'a frozen budget is honoured')
+    assert.equal(runBudgetOf({ budgetMs: 10 * RUN_TIMEOUT_MS }), RUN_TIMEOUT_MS,
+      'a budget above the ceiling is refused: the tool timeout backstop must stay valid')
+    assert.equal(runBudgetOf({ budgetMs: 1 }), RUN_TIMEOUT_MS, 'a nonsense budget falls back to the ceiling')
+    assert.equal(runDeadlineOf({ createdAt: 5000, budgetMs: 300000 }), 305000,
+      'the deadline must be derived from the frozen budget, not the constant')
+
+    /* --- budget snapshot --------------------------------------------------- */
+    const running = stageBudgetPlan(RUN_TIMEOUT_MS)
+    running.startedAt = 1000000
+    running.stages.answers.startedAt = 1010000
+    running.stages.answers.deadlineAt = 1010000 + 810000
+    const live = budgetPlanSnapshot(running, 1070000)
+    assert.equal(live.elapsedMs, 70000, 'elapsedMs is measured from the run start')
+    assert.equal(live.remainingMs, RUN_TIMEOUT_MS - 70000)
+    assert.equal(live.stages.answers.usedMs, 60000, 'an open stage counts to now')
+    assert.equal(live.stages.answers.capped, false)
+    /* A settled run must FREEZE its stage timings instead of growing with the clock
+       every time the snapshot is re-rendered. */
+    const frozen = budgetPlanSnapshot({
+      ...running,
+      stages: {
+        ...running.stages,
+        answers: { ...running.stages.answers, endedAt: 1030000, capped: true, cappedReason: '用满了' },
+      },
+    }, 9999999)
+    assert.equal(frozen.stages.answers.usedMs, 20000, 'a closed stage freezes at endedAt')
+    assert.equal(frozen.stages.answers.capped, true)
+    assert.equal(frozen.stages.answers.cappedReason, '用满了')
+    /* The promised shape is always complete, even for a run with no plan at all. */
+    for (const view of [budgetPlanSnapshot(undefined, 0), budgetPlanSnapshot(undefined, undefined)]) {
+      assert.deepEqual(Object.keys(view.stages), ['answers', 'reviews', 'chairman'])
+      for (const name of ['answers', 'reviews', 'chairman']) {
+        for (const field of ['share', 'budgetMs', 'usedMs', 'startedAt', 'endedAt', 'deadlineAt', 'capped', 'cappedReason']) {
+          assert.ok(Object.hasOwn(view.stages[name], field), `budgetPlan.${name}.${field} must always be present`)
+        }
+      }
+      assert.equal(typeof view.stages.chairman.floorMs, 'number')
+      assert.equal(view.stages.chairman.skipped, false)
+      assert.equal(view.stages.chairman.reason, '')
+    }
+
+    /* --- what a stage cap means, and what it is NOT -------------------------- */
+    /* "The answer stage used its 45%" must never be reported as "the run ran out".
+       The three cases below are the whole distinction: inside budget → nothing,
+       stage cap bound it → named reason, RUN deadline bound it → nothing. */
+    const runDeadline = 1000000 + RUN_TIMEOUT_MS
+    const stageOf = (extra) => ({ share: 0.45, budgetMs: 810000, startedAt: 1000000 + 20000, deadlineAt: 1000000 + 20000 + 810000, ...extra })
+    assert.equal(stageCapReason('answers', stageOf({}), runDeadline, 1000000 + 20000 + 800000), '',
+      'a stage that finished inside its sub-budget must not be reported as capped')
+    assert.equal(stageCapReason('answers', stageOf({}), runDeadline, 1000000 + 20000 + 810001),
+      '作答阶段用满子预算 810s（整轮预算的 45%），阶段内未完成的席位已停止',
+      'a stage stopped by its own sub-budget must say so, in seconds and percent')
+    /* The chairman runs to the RUN deadline by design: that is not a stage cap. */
+    assert.equal(stageCapReason('chairman', {
+      share: 0.2, budgetMs: 360000, startedAt: 1000000 + 25000, deadlineAt: runDeadline,
+    }, runDeadline, runDeadline), '', 'the run deadline is not a stage cap')
+    assert.equal(stageCapReason('answers', { share: 0.45, budgetMs: 810000, startedAt: 0, deadlineAt: 0 },
+      runDeadline, runDeadline), '', 'a stage that never started cannot be capped')
+    /* A stage cap reached exactly at the boundary is still a cap (>= not >). */
+    assert.notEqual(stageCapReason('reviews', stageOf({}), runDeadline, 1000000 + 20000 + 810000), '',
+      'ending exactly at the sub-budget deadline counts as capped')
+
+    /* --- chairman floor ---------------------------------------------------- */
+    const skip = chairmanStageDecision(89000, CHAIRMAN_FLOOR_MS)
+    assert.equal(skip.action, 'skip', '89 s of remaining budget must NOT be spent on a chairman call')
+    assert.equal(skip.reason, '主席阶段预算不足（剩余 89s，下限 120s），已跳过（无主席模式）',
+      'the skip reason must state the remaining budget and the floor')
+    /* The client renders this string verbatim (no HTML, no wrapping), so it must
+       stay a single plain-text line. */
+    assert.equal(/[<>]/.test(skip.reason), false, 'the skip reason must not contain markup')
+    assert.equal(skip.reason.includes('\n'), false, 'the skip reason must be one line')
+    assert.equal(chairmanStageDecision(CHAIRMAN_FLOOR_MS, CHAIRMAN_FLOOR_MS).action, 'run',
+      'exactly the floor is still attempted')
+    assert.equal(chairmanStageDecision(CHAIRMAN_FLOOR_MS - 1, CHAIRMAN_FLOOR_MS).action, 'skip')
+    assert.equal(chairmanStageDecision(600000, CHAIRMAN_FLOOR_MS).action, 'run')
+    assert.equal(chairmanStageDecision(CHAIRMAN_FLOOR_MS, CHAIRMAN_FLOOR_MS).reason, '')
+    assert.equal(chairmanStageDecision(-5, CHAIRMAN_FLOOR_MS).reason,
+      '主席阶段预算不足（剩余 0s，下限 120s），已跳过（无主席模式）',
+      'a negative remainder must be reported as 0s, never as a negative number')
+    assert.equal(STOP_REASON_CHAIRMAN_SKIPPED, 'chairman-budget-skipped',
+      'the stopReason token is frozen: the browser maps it, so a reworded literal would be unlabelled')
+
+    /* --- the degradation is wired into execute, not just available --------- */
+    const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+    assert.ok(source.includes("finishRun(run, 'done', '', STOP_REASON_CHAIRMAN_SKIPPED)"),
+      'a chairman skipped for lack of budget must settle the run as DONE, with the reason recorded')
+    assert.equal(/finishRun\(run, 'error'[^\n]*主席阶段预算不足/.test(source), false,
+      'the chairman floor must never settle the run as an error')
+    assert.ok(source.includes('chairmanStageDecision(deadlineAt - Date.now(), chairmanTrack.floorMs)'),
+      'execute must decide the chairman stage from the budget actually left')
+    assert.ok(source.includes("endStage(run, 'answers')") && source.includes("endStage(run, 'reviews')"),
+      'both capped stages must be closed so the snapshot can report what they consumed')
+    /* Every budget-exhausted throw names the budget that ran out through `${label}`:
+       three sites in callModel (two with lastError, one with detail) and the seat
+       start guard. Counting them keeps "a stage cap must never claim the whole run
+       ran out" from being satisfied by one leftover occurrence. */
+    assert.equal((source.match(/throw new Error\(`\$\{label\}预算耗尽/g) || []).length, 4,
+      'all four budget-exhausted throws must name the stage budget, not a fixed "整轮"')
+    assert.equal(/throw new Error\(`整轮预算耗尽：/.test(source), false,
+      'no budget throw may hard-code "整轮预算耗尽"')
+    assert.ok(source.includes('timeoutMs: RUN_TIMEOUT_MS + 30000'),
+      'the tool timeout backstop must stay above the largest allowed run budget')
+  }
+
+  /* ------------------------------------------------------------------ *
+   * task-6 (pure half): the opt-member label is write-once. The measured  *
+   * hole it closes: one real runId × 8 members still passed              *
+   * `council_records.py check` with exit 0, so a single run could stand   *
+   * in for the whole 8-member matrix.                                     *
+   * ------------------------------------------------------------------ */
+  {
+    assert.deepEqual(optMemberFor('', 'rev-01'), { value: 'rev-01', conflict: '' },
+      'the first label is applied')
+    assert.deepEqual(optMemberFor('rev-01', ''), { value: 'rev-01', conflict: '' },
+      'a call without a label must not ERASE the existing one')
+    assert.deepEqual(optMemberFor('rev-01', 'rev-01'), { value: 'rev-01', conflict: '' },
+      'the same label repeated is idempotent, not a conflict (a retry is not a new member)')
+    assert.deepEqual(optMemberFor('  rev-01  ', 'rev-01'), { value: 'rev-01', conflict: '' },
+      'the label is compared trimmed')
+    const clash = optMemberFor('rev-01', 'rev-02')
+    assert.equal(clash.value, 'rev-01', 'a labelled run keeps its FIRST label')
+    assert.ok(clash.conflict.includes('不能改写'), 'the clash must be reported, never applied')
+    assert.ok(clash.conflict.includes('冒充'), 'the reason must name the integrity risk')
+    assert.equal(optMemberFor('', '').value, '', 'no label at all stays empty')
+    assert.equal(optMemberFor(undefined, undefined).value, '', 'missing input stays empty, never "undefined"')
+    assert.equal(optMemberFor(7, 'x').value, 'x', 'a non-string existing value is treated as empty')
+    assert.equal(optMemberFor('a', 7).value, 'a', 'a non-string request cannot relabel a run')
+    const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+    assert.ok(source.includes('const optLabel = optMemberFor(run.optMember, input.optMember)'),
+      'the tool must resolve the label through the write-once helper')
+    assert.ok(source.includes("if (optLabel.conflict !== '') throw new Error(optLabel.conflict)"),
+      'a conflicting label must REFUSE the run, not be applied quietly')
+  }
+
+  /* ------------------------------------------------------------------ *
+   * task-4 (pure half): the resume gate is a real rule, not a client      *
+   * convention — and it must stay INVISIBLE to panel runs.                *
+   * ------------------------------------------------------------------ */
+  {
+    const panelRun = { id: 'c1', toolRun: false, status: 'done' }
+    const toolRun = { id: 'c2', toolRun: true, status: 'done' }
+    assert.equal(resumeGuard(panelRun, false).ok, true, 'a panel run must resume without force')
+    assert.equal(resumeGuard(panelRun, true).forced, true,
+      'an explicit force on a panel run is still recorded as forced')
+    const denied = resumeGuard(toolRun, false)
+    assert.equal(denied.ok, false, 'a tool-originated run must be refused by default')
+    assert.equal(denied.status, 409, 'the refusal must be a 409, like the other run-state conflicts')
+    assert.equal(denied.code, 'tool-run', 'the refusal must carry a structured code')
+    assert.ok(denied.error.includes('工具结果'), 'the refusal must say the conclusion went back as a tool result')
+    assert.ok(denied.error.includes('force'), 'the refusal must name the escape hatch')
+    assert.equal(resumeGuard(toolRun, true).ok, true, 'the escape hatch must open for a tool run')
+    assert.equal(resumeGuard(toolRun, true).forced, true)
+    assert.equal(resumeGuard(toolRun, 'yes').ok, false, 'only a real boolean true may force a delivery')
+    assert.equal(resumeGuard(undefined, false).ok, true, 'an unknown run is not a tool run')
+    assert.equal(resumeGuard({}, false).ok, true, 'a run without the flag (a panel run) is allowed')
+    const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+    assert.ok(source.includes('const guard = resumeGuard(run, force)'),
+      'the resume route must consult the gate, not re-implement it')
+    assert.ok(source.includes('if (guard.ok !== true) {'), 'the route must honour a refused gate')
+    assert.ok(source.includes('run.resumed = forced === true ? `${mode}(forced)` : mode'),
+      'a forced delivery must be recorded distinguishably from a normal one')
+  }
 
   /* ------------------------------------------------------------------ *
    * Settings contract: the `council` entry config, the council_review    *
@@ -655,6 +1005,49 @@ try {
         `pickChairmanRoute must mirror chairmanSelection for ${JSON.stringify(spec)}`)
     }
 
+    /* task-10: ONE decision point for both entries. Explicit request > configured
+       default > first participant (with "nothing configured" NOT reported as a
+       problem). This is the rule the panel used to bypass entirely. */
+    {
+      const explicit = chairmanForRequest(settingsCatalog, selected, 'deepseek/pro', 'providerA/glm')
+      assert.equal(explicit.route.key, 'deepseek|pro', 'an explicit request beats the configured default')
+      assert.equal(explicit.problem, '', 'an honoured explicit request reports no problem')
+
+      const byDefault = chairmanForRequest(settingsCatalog, selected, '', 'providerA/glm')
+      assert.equal(byDefault.route.key, 'providerA|glm', 'with no request the configured default is used')
+      assert.equal(byDefault.problem, '', 'an honoured configured default reports no problem')
+
+      const unset = chairmanForRequest(settingsCatalog, selected, '', '')
+      assert.equal(unset.route.key, 'deepseek|pro', 'an empty setting keeps the first-participant election')
+      assert.equal(unset.problem, '', '"not configured" is not a problem to report')
+
+      const unusable = chairmanForRequest(settingsCatalog, selected, '', 'providerA/modelA')
+      assert.equal(unusable.route.key, 'deepseek|pro', 'an unusable configured default falls back')
+      assert.equal(unusable.problem, '主席 "providerA/modelA" 不在本次参与者名单里，已回退到第一个参与者',
+        'a configured-but-unusable default must be reported, never swapped in silence')
+
+      const malformed = chairmanForRequest(settingsCatalog, selected, '', 'providerA')
+      assert.equal(malformed.route.key, 'deepseek|pro', 'a malformed configured default falls back')
+      assert.ok(malformed.problem.includes('无法解析'), 'and it says the spec was unparsable')
+
+      for (const [requested, configured, expected] of [
+        [undefined, 'providerA/glm', 'providerA|glm'],
+        [null, 'providerA/glm', 'providerA|glm'],
+        ['  ', 'providerA/glm', 'providerA|glm'],
+        [undefined, undefined, 'deepseek|pro'],
+      ]) {
+        assert.equal(chairmanForRequest(settingsCatalog, selected, requested, configured).route.key, expected,
+          `non-string/blank request + ${String(configured)} must resolve to ${expected}`)
+      }
+      /* No-explicit-request must be IDENTICAL to the historical selection, for every
+         spec the old code accepted: that is what keeps empty defaults unchanged. */
+      for (const spec of ['', 'providerA/glm', 'nope/x', 'providerA/modelA', 'providerA']) {
+        assert.deepEqual(chairmanForRequest(settingsCatalog, selected, '', spec),
+          chairmanSelection(settingsCatalog, selected, spec),
+          `chairmanForRequest('', ${JSON.stringify(spec)}) must mirror chairmanSelection`)
+      }
+    }
+
     /* The three branches of chairmanSelection. The reason matters as much as the
        route: a silent swap is what hid a misconfigured chairman from its user. */
     const inside = chairmanSelection(settingsCatalog, selected, 'providerA/glm')
@@ -714,25 +1107,51 @@ try {
     const previousHome = process.env.DSH_HOME
     process.env.DSH_HOME = join(root, 'dsh-home')
     await mkdir(process.env.DSH_HOME, { recursive: true })
+    /* A run restored from the registry file has no frozen plan (it predates these
+       fields, or the Host restarted). The snapshot must still describe it, because
+       the client must never have to branch on `undefined` for an old run. */
+    await writeFile(join(process.env.DSH_HOME, 'council-runs.json'), JSON.stringify({
+      version: 1,
+      runs: [{
+        id: 'chistory1', sessionId: 's-historic', status: 'done', stage: 'done',
+        question: 'historic probe', createdAt: Date.now() - 60000, seatMode: 'llm', error: '',
+      }],
+    }), 'utf8')
     const providers = [{ id: 'deepseek', name: 'DeepSeek' }, { id: 'providerA', name: 'providerA' }]
     const models = {
       deepseek: [{ id: 'pro', name: 'DeepSeek-V4-Pro' }, { id: 'flash', name: 'DeepSeek-V4.1-Flash' }],
       providerA: [{ id: 'glm', name: 'modelB' }, { id: 'modelA', name: 'modelA' }],
     }
-    const fakeHost = (config) => {
+    /**
+     * `inbox` (optional) turns the fake `ctx.agents` into a live delivery target:
+     * `resumeRun` needs a resolvable agent, and the delivery test must see WHICH
+     * slot (`inject` = silent / `followup` = wake) was used and how many times.
+     */
+    const fakeHost = (config, streamImpl, inbox) => {
       const state = { tool: undefined, server: undefined }
       const ctx = {
         effect: (fn) => { fn(); return () => {} },
         on: () => {},
         get: () => undefined,
-        agents: { get: () => undefined, list: () => [] },
+        agents: {
+          get: (id) => (Array.isArray(inbox)
+            ? {
+              id,
+              inject: (message) => inbox.push({ via: 'inject', mode: 'silent', id, text: message.content[0].text }),
+              followup: (message) => inbox.push({ via: 'followup', mode: 'wake', id, text: message.content[0].text }),
+            }
+            : undefined),
+          list: () => [],
+        },
         subagents: {},
         tools: { register: (tool) => { state.tool = tool; return () => {} } },
         webServer: { register: (registration) => { state.server = registration; return () => {} } },
         llm: {
           listProviders: () => providers,
           listModels: async (id) => models[id] ?? [],
-          stream: () => { throw new Error('fake provider down') },
+          stream: typeof streamImpl === 'function'
+            ? streamImpl
+            : () => { throw new Error('fake provider down') },
         },
       }
       apply(ctx, config)
@@ -777,6 +1196,60 @@ try {
       const configured = fakeHost(Config({ defaultModels: ['providerA/glm', 'deepseek/flash'] }))
       assert.deepEqual(await roster(configured), ['providerA/glm', 'deepseek/flash'],
         'council_review must use defaultModels instead of the auto-pick')
+
+      /* The run restored from the registry file (see the fixture above) must be
+         described by the same fields, derived for its own roster, instead of
+         shipping `undefined` to the panel. */
+      {
+        const listed = await http(configured, 'GET', '/council/runs?sessionId=s-historic')
+        assert.equal(listed.status, 200, 'GET /council/runs must stay readable')
+        assert.equal(listed.json.runs.length, 1, 'the persisted fixture run must be restored')
+        const historic = listed.json.runs[0]
+        assert.equal(historic.id, 'chistory1')
+        assert.ok(historic.providerWaves !== null && typeof historic.providerWaves === 'object',
+          'a run with no frozen plan must still snapshot a providerWaves object')
+        assert.equal(historic.providerWaves.concurrency, PROVIDER_CONCURRENCY,
+          'a historic run is described with the default slot count')
+        assert.equal(historic.providerWaves.advice, '', 'an empty roster has no wave advice')
+        assert.ok(historic.budgetPlan !== null && typeof historic.budgetPlan === 'object',
+          'a run with no frozen plan must still snapshot a budgetPlan object')
+        assert.equal(historic.budgetPlan.totalMs, RUN_TIMEOUT_MS,
+          'a historic run is described with the default run budget')
+        assert.equal(historic.budgetPlan.stages.chairman.skipped, false)
+        assert.equal(typeof historic.budgetPlan.stages.chairman.floorMs, 'number')
+        for (const name of ['answers', 'reviews', 'chairman']) {
+          assert.equal(typeof historic.budgetPlan.stages[name].share, 'number',
+            `a historic run must still carry stages.${name}.share as a number`)
+          assert.ok(historic.budgetPlan.stages[name].share > 0 && historic.budgetPlan.stages[name].share <= 1,
+            `stages.${name}.share must stay a 0-1 fraction`)
+        }
+      }
+
+      /* A Settings write to the new knobs must reach the NEXT run without a plugin
+         restart: that is what `.volatile()` buys, and it is why the resolved values
+         are frozen per run instead of being pinned inside `apply`. */
+      {
+        const liveTune = Config({ defaultModels: ['providerA/glm', 'providerA/modelA'] })
+        const tuned = fakeHost(liveTune)
+        liveTune.providerConcurrency[write](1)
+        await roster(tuned)
+        const tunedRun = (await http(tuned, 'GET', '/council/runs?sessionId=')).json.runs[0]
+        assert.equal(tunedRun.providerWaves.concurrency, 1,
+          'a live providerConcurrency write must reach the next run without a restart')
+        assert.equal(tunedRun.providerWaves.stages.answers.waves, 2, '2 seats on a live 1-slot setting = 2 waves')
+        /* The budget must also reach the ACTUAL provider call, per stage. */
+        const seenTokens = []
+        const liveBudget = Config({ defaultModels: ['providerA/glm'] })
+        const tokenHost = fakeHost(liveBudget, async function* (request) {
+          seenTokens.push(request.maxTokens)
+          yield { type: 'text-delta', text: 'ok' }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        })
+        liveBudget.answerMaxTokens[write](8192)
+        await roster(tokenHost)
+        assert.deepEqual(seenTokens, [8192, REVIEW_MAX_TOKENS, CHAIRMAN_MAX_TOKENS],
+          'a live answerMaxTokens write must reach the answer seat only; reviews/chairman keep their budgets')
+      }
 
       /* No configured list keeps the heterogeneous auto-pick. */
       const auto = fakeHost(Config({}))
@@ -826,6 +1299,135 @@ try {
       assert.deepEqual(run.defaultModelProblems, [], 'a clean defaultModels must report no problems')
       assert.equal(run.chairmanProblem, '', 'an honoured chairman must report no problem')
 
+      /* The snapshot must EXPLAIN the latency, not only report a duration: which
+         slots this run planned with, how many waves each stage needs, and what each
+         stage was allowed / consumed. Both fields are frozen onto the run, so a
+         mid-run Settings write cannot desync the plan from the behaviour. */
+      assert.ok(Object.hasOwn(run, 'providerWaves'), 'the snapshot must carry providerWaves')
+      assert.ok(Object.hasOwn(run, 'budgetPlan'), 'the snapshot must carry budgetPlan')
+      assert.equal(run.providerWaves.concurrency, PROVIDER_CONCURRENCY,
+        'the default snapshot must report the default slot count')
+      assert.equal(typeof run.providerWaves.maxWaves, 'number')
+      assert.equal(typeof run.providerWaves.advice, 'string', 'providerWaves.advice must be a string, never null')
+      for (const name of ['answers', 'reviews', 'chairman']) {
+        const stage = run.providerWaves.stages[name]
+        assert.ok(stage !== undefined && stage !== null, `providerWaves.stages.${name} must exist`)
+        for (const field of ['seats', 'slots', 'waves']) {
+          assert.equal(typeof stage[field], 'number', `providerWaves.stages.${name}.${field} must be a number`)
+        }
+        assert.ok(Array.isArray(stage.byProvider), `providerWaves.stages.${name}.byProvider must be an array`)
+      }
+      /* One seat per provider in this roster: one wave, so no advice line. */
+      assert.equal(run.providerWaves.stages.answers.waves, 1)
+      assert.equal(run.providerWaves.advice, '')
+      assert.equal(run.budgetPlan.totalMs, RUN_TIMEOUT_MS, 'the default run budget must still be 30 minutes')
+      assert.equal(run.deadlineAt - run.createdAt, RUN_TIMEOUT_MS,
+        'the run deadline must follow the frozen budget')
+      assert.equal(run.budgetPlan.stages.answers.share, 0.45)
+      assert.equal(run.budgetPlan.stages.reviews.share, 0.35)
+      assert.equal(run.budgetPlan.stages.chairman.share, 0.2)
+      assert.equal(run.budgetPlan.stages.chairman.skipped, false, 'a run with budget left must not be marked skipped')
+      assert.equal(run.budgetPlan.stages.chairman.reason, '')
+      for (const name of ['answers', 'reviews', 'chairman']) {
+        for (const field of ['share', 'budgetMs', 'usedMs', 'startedAt', 'endedAt', 'deadlineAt', 'capped', 'cappedReason']) {
+          assert.ok(Object.hasOwn(run.budgetPlan.stages[name], field),
+            `budgetPlan.stages.${name}.${field} must be present in every snapshot`)
+        }
+        /* The client prints the split from `share` and skips the whole line when one
+           share is missing, so all three must be present 0-1 fractions. */
+        assert.ok(run.budgetPlan.stages[name].share > 0 && run.budgetPlan.stages[name].share <= 1,
+          `budgetPlan.stages.${name}.share must be a 0-1 fraction`)
+      }
+
+      /* The measured complaint ("council 不好用", no visible reason) is now answered
+         inside the tool result: two seats on ONE provider with ONE slot means two
+         waves per stage, and the conclusion says so in one line. */
+      const slowRoster = fakeHost(Config({
+        defaultModels: ['providerA/glm', 'providerA/modelA'],
+        providerConcurrency: 1,
+      }))
+      const slowResult = await slowRoster.tool.execute({ question: 'wave probe', attachFiles: false }, {})
+      const slowRun = (await http(slowRoster, 'GET', '/council/runs?sessionId=')).json.runs[0]
+      assert.equal(slowRun.providerWaves.concurrency, 1,
+        'the providerConcurrency setting must reach the frozen plan')
+      assert.equal(slowRun.providerWaves.stages.answers.waves, 2, '2 seats on 1 slot = 2 waves')
+      assert.equal(slowRun.providerWaves.maxWaves, 2)
+      assert.ok(slowResult.conclusion.includes('注意：同 provider "providerA" 2 席 > 槽位 1，每阶段将跑 2 波'),
+        `the tool conclusion must carry the one-line wave advice; got ${JSON.stringify(slowResult.conclusion)}`)
+      assert.ok(slowResult.conclusion.includes('掺入第二 provider 可降为一波'),
+        'the advice must say what to change, not only that something is slow')
+
+      /* Settings clamps: an absurd slot count must not create a wall-clock stall,
+         and a zero must not deadlock the slot gate. */
+      const clampedHigh = fakeHost(Config({ defaultModels: ['providerA/glm'], providerConcurrency: 99 }))
+      await roster(clampedHigh)
+      const clampedHighRun = (await http(clampedHigh, 'GET', '/council/runs?sessionId=')).json.runs[0]
+      assert.equal(clampedHighRun.providerWaves.concurrency, PROVIDER_CONCURRENCY_MAX,
+        'an absurd slot count must clamp to the declared ceiling')
+      const clampedZero = fakeHost(Config({ defaultModels: ['providerA/glm'], providerConcurrency: 0 }))
+      await roster(clampedZero)
+      const clampedZeroRun = (await http(clampedZero, 'GET', '/council/runs?sessionId=')).json.runs[0]
+      assert.equal(clampedZeroRun.providerWaves.concurrency, PROVIDER_CONCURRENCY,
+        'a zero slot count must fall back to the default instead of deadlocking the slot gate')
+
+      /* A lowered run budget must reach the plan AND the deadline together. */
+      const shortRun = fakeHost(Config({ defaultModels: ['providerA/glm'], runBudgetMs: 10 * 60 * 1000 }))
+      await roster(shortRun)
+      const shortRunSnap = (await http(shortRun, 'GET', '/council/runs?sessionId=')).json.runs[0]
+      assert.equal(shortRunSnap.budgetPlan.totalMs, 10 * 60 * 1000, 'runBudgetMs must reach the frozen plan')
+      assert.equal(shortRunSnap.deadlineAt - shortRunSnap.createdAt, 10 * 60 * 1000,
+        'the deadline must follow runBudgetMs, not the 30-minute constant')
+      assert.equal(shortRunSnap.budgetPlan.stages.answers.budgetMs, 270000, '45% of a 10-minute budget')
+      const tinyRun = fakeHost(Config({ defaultModels: ['providerA/glm'], runBudgetMs: 1000 }))
+      await roster(tinyRun)
+      const tinyRunSnap = (await http(tinyRun, 'GET', '/council/runs?sessionId=')).json.runs[0]
+      assert.equal(tinyRunSnap.budgetPlan.totalMs, RUN_BUDGET_MIN_MS,
+        'an unusably small run budget must clamp to the declared floor, not to zero')
+
+      /* Happy path against a scripted provider: the three stages actually complete,
+         so the budget bookkeeping is exercised on a run that FINISHES. A healthy run
+         must never be reported as capped or skipped, and its conclusion must carry
+         no degradation notice — otherwise the new fields would cry wolf every time. */
+      const healthy = fakeHost(
+        Config({ defaultModels: ['providerA/glm', 'deepseek/pro'] }),
+        async function* () {
+          yield { type: 'text-delta', text: 'ok' }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      )
+      const healthyResult = await healthy.tool.execute({ question: 'healthy probe', attachFiles: false }, {})
+      assert.equal(healthyResult.models.length, 2, 'the scripted provider keeps the whole roster')
+      const healthyRun = (await http(healthy, 'GET', '/council/runs?sessionId=')).json.runs[0]
+      assert.equal(healthyRun.status, 'done', `a scripted provider must finish all three stages; got ${JSON.stringify(healthyRun.error)}`)
+      assert.equal(healthyRun.stopReason, 'completed')
+      assert.equal(healthyRun.chairman.done, true, 'the chairman stage must have run')
+      assert.equal(healthyRun.chairman.text, 'ok')
+      assert.equal(healthyRun.budgetPlan.stages.chairman.skipped, false,
+        'a healthy run must not be marked as a skipped chairman')
+      assert.equal(healthyRun.budgetPlan.stages.chairman.reason, '')
+      for (const name of ['answers', 'reviews', 'chairman']) {
+        const stage = healthyRun.budgetPlan.stages[name]
+        assert.ok(stage.startedAt > 0, `budgetPlan.stages.${name}.startedAt must be set on a completed run`)
+        assert.ok(stage.endedAt >= stage.startedAt, `budgetPlan.stages.${name} must be closed`)
+        assert.equal(stage.capped, false, `budgetPlan.stages.${name} must not be capped on a fast run`)
+        assert.equal(stage.cappedReason, '')
+      }
+      /* The chairman's 20% is a FLOOR, not a ceiling: after a fast answer+review the
+         chairman must still be allowed the whole remaining run budget (the old
+         behaviour). Capping it at its own share would trade starvation for a new
+         timeout. */
+      assert.equal(healthyRun.budgetPlan.stages.chairman.deadlineAt, healthyRun.createdAt + RUN_TIMEOUT_MS,
+        'the chairman must be allowed the whole remaining run budget, not 20% of it')
+      assert.ok(healthyRun.budgetPlan.stages.answers.deadlineAt < healthyRun.createdAt + RUN_TIMEOUT_MS,
+        'the answer stage must still be capped at its sub-budget deadline')
+      assert.equal(healthyRun.budgetPlan.stages.answers.deadlineAt,
+        healthyRun.budgetPlan.stages.answers.startedAt + 810000,
+        'the answer sub-budget deadline is its own start plus 45% of the run budget')
+      assert.equal(healthyResult.conclusion.includes('注意：'), false,
+        `a healthy run must carry no degradation notice; got ${JSON.stringify(healthyResult.conclusion)}`)
+      assert.ok(healthyResult.conclusion.includes('（参与模型：modelB、DeepSeek-V4-Pro；runId: '),
+        `a healthy run must still end with the participant line; got ${JSON.stringify(healthyResult.conclusion)}`)
+
       /* A configured chairman that cannot be honoured is no longer silent: the
          run records the reason and the tool's own conclusion carries it. */
       const badChair = fakeHost(Config({
@@ -855,6 +1457,13 @@ try {
       assert.equal(panelRun.modelSource, '', 'an unset modelSource must snapshot as ""')
       assert.deepEqual(panelRun.defaultModelProblems, [], 'an unset defaultModelProblems must snapshot as []')
       assert.equal(panelRun.chairmanProblem, '', 'an unset chairmanProblem must snapshot as ""')
+      /* The panel path freezes the same plan, and its wave count follows the actual
+         reviewer list (which may be a subset of the answerers). */
+      assert.ok(Object.hasOwn(panelRun, 'providerWaves') && Object.hasOwn(panelRun, 'budgetPlan'),
+        'a panel-created run must carry providerWaves and budgetPlan too')
+      assert.equal(panelRun.providerWaves.stages.reviews.seats, 2,
+        'the panel wave plan must follow the reviewer list')
+      assert.equal(panelRun.budgetPlan.totalMs, RUN_TIMEOUT_MS)
 
       /* A panel-started run that picks a chairman outside its own roster must not
          swap it in silence either: the reason lands on the same `chairmanProblem`
@@ -899,6 +1508,307 @@ try {
       const panelHonouredRun = (await http(chaired, 'GET', `/council/run/${panelHonoured.json.runId}`)).json
       assert.equal(panelHonouredRun.chairman.key, 'providerA|glm', 'an honoured panel chairman must serve')
       assert.equal(panelHonouredRun.chairmanProblem, '', 'an honoured panel chairman must report no problem')
+
+      /* ------------------------------------------------------------------ *
+       * task-10: the PANEL must honour the `defaultChairman` setting too.   *
+       * Measured defect (v70, panel entry, 5 seats, no `chairman` in the    *
+       * body): chairman came back as `bohrium|hy4` while the setting said   *
+       * `bohrium/kimi-k3`, and `chairmanProblem` was '' — "no problem" for a *
+       * chairman nobody asked for. The setting worked on the tool path only. *
+       * ------------------------------------------------------------------ */
+      {
+        /* Same configuration, both entries: the panel used to ignore the setting and
+           take the first participant, so this equality is the regression lock. */
+        const bothPaths = fakeHost(Config({
+          defaultModels: ['deepseek/pro', 'providerA/glm'],
+          defaultChairman: 'providerA/glm',
+        }))
+        const panelDefault = await http(bothPaths, 'POST', '/council/run', JSON.stringify({
+          question: 'panel default chairman probe',
+          models: [{ provider: 'deepseek', model: 'pro' }, { provider: 'providerA', model: 'glm' }],
+          attachFiles: false,
+        }))
+        assert.equal(panelDefault.status, 200, `the panel run must start; body=${JSON.stringify(panelDefault.json)}`)
+        const panelDefaultRun = (await http(bothPaths, 'GET', `/council/run/${panelDefault.json.runId}`)).json
+        assert.equal(panelDefaultRun.chairman.key, 'providerA|glm',
+          'a panel run with NO chairman in the body must honour the defaultChairman SETTING')
+        assert.equal(panelDefaultRun.chairmanProblem, '',
+          'an honoured configured default must report no problem (it was honoured, not substituted)')
+        assert.notEqual(panelDefaultRun.chairman.key, panelDefaultRun.answers[0].key,
+          'the configured default must actually beat "first participant"')
+        /* The tool path, same settings: both entries must agree. */
+        const toolDefault = await bothPaths.tool.execute(
+          { question: 'tool default chairman probe', attachFiles: false },
+          { agent: { id: 'sess-both-paths' } },
+        )
+        const toolDefaultRun = (await http(bothPaths, 'GET', `/council/run/${toolDefault.runId}`)).json
+        assert.equal(toolDefaultRun.chairman.key, panelDefaultRun.chairman.key,
+          'the tool path and the panel path must elect the SAME chairman for the same settings')
+        assert.equal(toolDefaultRun.chairmanProblem, panelDefaultRun.chairmanProblem,
+          'and they must agree about whether that chairman was a fallback')
+
+        /* A configured default that is in the catalog but NOT in this roster must be
+           reported on the panel too — the panel used to have no problem field set at
+           all, so a substitution was invisible on the entry the user actually uses. */
+        const badDefault = fakeHost(Config({
+          defaultModels: ['deepseek/pro'],
+          defaultChairman: 'providerA/modelA',
+        }))
+        const badDefaultPanel = await http(badDefault, 'POST', '/council/run', JSON.stringify({
+          question: 'panel bad default chairman probe',
+          models: [{ provider: 'deepseek', model: 'pro' }, { provider: 'providerA', model: 'glm' }],
+          attachFiles: false,
+        }))
+        const badDefaultRun = (await http(badDefault, 'GET', `/council/run/${badDefaultPanel.json.runId}`)).json
+        assert.equal(badDefaultRun.chairman.key, 'deepseek|pro',
+          'an unusable configured default falls back to the first participant')
+        assert.equal(badDefaultRun.chairmanProblem,
+          '主席 "providerA/modelA" 不在本次参与者名单里，已回退到第一个参与者',
+          'a configured-but-unusable default must be REPORTED on the panel path, not swapped in silence')
+
+        /* An empty setting keeps the historical election AND reports no problem. */
+        const noDefault = fakeHost(Config({ defaultModels: ['deepseek/pro', 'providerA/glm'] }))
+        const noDefaultPanel = await http(noDefault, 'POST', '/council/run', JSON.stringify({
+          question: 'panel no default chairman probe',
+          models: [{ provider: 'deepseek', model: 'pro' }, { provider: 'providerA', model: 'glm' }],
+          attachFiles: false,
+        }))
+        const noDefaultRun = (await http(noDefault, 'GET', `/council/run/${noDefaultPanel.json.runId}`)).json
+        assert.equal(noDefaultRun.chairman.key, 'deepseek|pro',
+          'with no defaultChairman configured the first participant is still the election')
+        assert.equal(noDefaultRun.chairmanProblem, '', '"not configured" is not a problem to report')
+
+        /* An explicit pick still beats the setting: the user's choice at run time. */
+        const explicitWins = await http(bothPaths, 'POST', '/council/run', JSON.stringify({
+          question: 'panel explicit over default probe',
+          models: [{ provider: 'deepseek', model: 'pro' }, { provider: 'providerA', model: 'glm' }],
+          chairman: { provider: 'deepseek', model: 'pro' },
+          attachFiles: false,
+        }))
+        const explicitWinsRun = (await http(bothPaths, 'GET', `/council/run/${explicitWins.json.runId}`)).json
+        assert.equal(explicitWinsRun.chairman.key, 'deepseek|pro',
+          'an explicit body pick must win over the configured default')
+        assert.equal(explicitWinsRun.chairmanProblem, '', 'an honoured explicit pick reports no problem')
+
+        /* A half-empty picker (`{}` / provider only) is "no explicit request", not the
+           unparsable spec "/": it must fall through to the configured default. */
+        const emptyPick = await http(bothPaths, 'POST', '/council/run', JSON.stringify({
+          question: 'panel empty picker probe',
+          models: [{ provider: 'deepseek', model: 'pro' }, { provider: 'providerA', model: 'glm' }],
+          chairman: {},
+          attachFiles: false,
+        }))
+        const emptyPickRun = (await http(bothPaths, 'GET', `/council/run/${emptyPick.json.runId}`)).json
+        assert.equal(emptyPickRun.chairman.key, 'providerA|glm',
+          'an empty picker must fall through to the configured default')
+        assert.equal(emptyPickRun.chairmanProblem, '',
+          'an empty picker must not be reported as an unparsable chairman')
+
+        /* The panel needs to KNOW the settings to pre-fill its pickers. */
+        const echoed = await http(bothPaths, 'GET', '/council/models')
+        assert.equal(echoed.status, 200)
+        assert.deepEqual(echoed.json.defaultModels, ['deepseek/pro', 'providerA/glm'],
+          'GET /council/models must echo the configured defaultModels read-only')
+        assert.equal(echoed.json.defaultChairman, 'providerA/glm',
+          'GET /council/models must echo the configured defaultChairman read-only')
+        /* The existing fields keep their meaning. */
+        for (const field of ['providers', 'contextMaxChars', 'filesMaxChars']) {
+          assert.ok(Object.hasOwn(echoed.json, field), `GET /council/models must keep ${field}`)
+        }
+      }
+
+      /* A cancel must not rewrite an ALREADY SETTLED run: `finishRun` is documented
+         write-once, and the browser now branches on `stopReason` (including
+         `chairman-budget-skipped`), so a relabelled terminal state would be a lie
+         told by the very field this task adds. */
+      {
+        const settleHost = fakeHost(Config({ defaultModels: ['providerA/glm'] }))
+        await roster(settleHost)
+        let settled = (await http(settleHost, 'GET', '/council/runs?sessionId=')).json.runs[0]
+        for (let i = 0; i < 40 && settled.status === 'running'; i += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 10))
+          settled = (await http(settleHost, 'GET', '/council/runs?sessionId=')).json.runs[0]
+        }
+        assert.notEqual(settled.status, 'running', 'the cancellation probe run must have settled first')
+        const before = { status: settled.status, error: settled.error, stopReason: settled.stopReason }
+        assert.equal((await http(settleHost, 'POST', `/council/run/${settled.id}/cancel`, '')).status, 200,
+          'cancel must still answer 200 for a settled run')
+        const after = (await http(settleHost, 'GET', `/council/run/${settled.id}`)).json
+        assert.equal(after.status, before.status, 'a settled run must keep its terminal status')
+        assert.equal(after.error, before.error, 'a settled run must keep its terminal error')
+        assert.equal(after.stopReason, before.stopReason, 'a settled run must keep its stopReason')
+      }
+
+      /* ------------------------------------------------------------------ *
+       * task-4: the host, not the client, must refuse a resume of a         *
+       * tool-originated run. Measured by an independent verifier on the      *
+       * frozen baseline: `POST /run/<id>/resume` only looked at             *
+       * "already resumed" and never at `toolRun`, so any stale/revived tab  *
+       * could re-deliver a conclusion the tool had already returned as a    *
+       * tool/result.                                                         *
+       * ------------------------------------------------------------------ */
+      {
+        /* A tool run that actually COMPLETES (scripted provider), so the refusal
+           cannot be explained away as "the run was not finished yet". */
+        const inbox = []
+        const toolInboxHost = fakeHost(
+          Config({ defaultModels: ['providerA/glm'] }),
+          async function* () {
+            yield { type: 'text-delta', text: 'conclusion body' }
+            yield { type: 'finish', reason: { kind: 'stop' } }
+          },
+          inbox,
+        )
+        const toolRunResult = await toolInboxHost.tool.execute(
+          { question: 'resume guard probe', attachFiles: false },
+          { agent: { id: 'sess-tool-run' } },
+        )
+        assert.ok(toolRunResult.conclusion.includes('conclusion body'), 'the probe tool run must complete')
+        const toolRunSnap = (await http(toolInboxHost, 'GET', '/council/runs?sessionId=sess-tool-run')).json.runs[0]
+        assert.equal(toolRunSnap.toolRun, true, 'the probe run must be tool-originated')
+        assert.equal(toolRunSnap.status, 'done', 'the refusal must not be masked by a not-finished error')
+        assert.equal(toolRunSnap.resumed, '', 'a fresh run must not be marked resumed')
+
+        /* (1) default: refused, structured, and it says what happened. */
+        const refused = await http(toolInboxHost, 'POST',
+          `/council/run/${toolRunSnap.id}/resume`, JSON.stringify({ mode: 'wake' }))
+        assert.equal(refused.status, 409, `a tool run must refuse resume by default; body=${JSON.stringify(refused.json)}`)
+        assert.equal(refused.json.code, 'tool-run', 'the refusal must carry code=tool-run like the other run-state conflicts')
+        assert.ok(String(refused.json.error).includes('工具结果'),
+          'the refusal must explain that the conclusion already went back as a tool result')
+        assert.ok(String(refused.json.error).includes('force'),
+          'the refusal must name the escape hatch instead of leaving the caller stuck')
+        assert.equal(inbox.length, 0, 'a refused resume must deliver NOTHING')
+        assert.equal((await http(toolInboxHost, 'GET', `/council/run/${toolRunSnap.id}`)).json.resumed, '',
+          'a refused resume must not leave a resumed mark')
+
+        /* (2) explicit escape hatch: allowed, and RECORDED on the run. */
+        const forced = await http(toolInboxHost, 'POST',
+          `/council/run/${toolRunSnap.id}/resume?force=1`, JSON.stringify({ mode: 'wake' }))
+        assert.equal(forced.status, 200, `?force=1 must allow the delivery; body=${JSON.stringify(forced.json)}`)
+        assert.equal(forced.json.forced, true, 'the forced response must say it was forced')
+        assert.equal(inbox.length, 1, 'a forced resume must deliver exactly once')
+        assert.equal(inbox[0].via, 'followup', 'mode=wake must go through the wake slot')
+        assert.equal(inbox[0].id, 'sess-tool-run', 'the delivery must target the run session')
+        const forcedSnap = (await http(toolInboxHost, 'GET', `/council/run/${toolRunSnap.id}`)).json
+        assert.equal(forcedSnap.resumed, 'wake(forced)',
+          'a forced delivery must be distinguishable from a normal one in the snapshot')
+        /* The escape hatch does not unlock a second duplicate: already-resumed still wins. */
+        const second = await http(toolInboxHost, 'POST',
+          `/council/run/${toolRunSnap.id}/resume?force=1`, JSON.stringify({ mode: 'wake' }))
+        assert.equal(second.status, 409, 'even a forced resume must not deliver a third copy')
+        assert.equal(second.json.code, 'already-resumed', 'the second forced attempt keeps the already-resumed code')
+        assert.equal(inbox.length, 1, 'still exactly one delivery')
+
+        /* (3) hard regression: a PANEL run is untouched — same status, same body,
+           same mark, and it needs no `force`. */
+        const panelInbox = []
+        const panelHost = fakeHost(
+          Config({}),
+          async function* () {
+            yield { type: 'text-delta', text: 'panel conclusion' }
+            yield { type: 'finish', reason: { kind: 'stop' } }
+          },
+          panelInbox,
+        )
+        const started = await http(panelHost, 'POST', '/council/run', JSON.stringify({
+          question: 'panel resume probe',
+          models: [{ provider: 'providerA', model: 'glm' }, { provider: 'deepseek', model: 'pro' }],
+          sessionId: 'sess-panel-run',
+          attachFiles: false,
+        }))
+        assert.equal(started.status, 200, `the panel run must start; body=${JSON.stringify(started.json)}`)
+        let panelSnap = (await http(panelHost, 'GET', `/council/run/${started.json.runId}`)).json
+        for (let i = 0; i < 40 && panelSnap.status === 'running'; i += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 10))
+          panelSnap = (await http(panelHost, 'GET', `/council/run/${started.json.runId}`)).json
+        }
+        assert.equal(panelSnap.status, 'done', `the panel run must complete first; got ${JSON.stringify(panelSnap.error)}`)
+        assert.equal(panelSnap.toolRun, false, 'the panel run must not be tool-originated')
+        const panelResume = await http(panelHost, 'POST',
+          `/council/run/${started.json.runId}/resume`, JSON.stringify({ mode: 'wake' }))
+        assert.equal(panelResume.status, 200, 'a panel run must still resume exactly as before')
+        assert.deepEqual(panelResume.json, { ok: true, mode: 'wake' },
+          'the panel resume response must stay byte-for-byte the historical shape (no `forced` key)')
+        assert.equal(panelInbox.length, 1, 'the panel delivery must happen once')
+        assert.equal((await http(panelHost, 'GET', `/council/run/${started.json.runId}`)).json.resumed, 'wake',
+          'a panel delivery keeps the plain mark, never "wake(forced)"')
+        const panelAgain = await http(panelHost, 'POST',
+          `/council/run/${started.json.runId}/resume`, JSON.stringify({ mode: 'wake' }))
+        assert.equal(panelAgain.status, 409, 'a panel run still refuses a duplicate delivery')
+        assert.equal(panelAgain.json.code, 'already-resumed', 'and still with the historical code')
+      }
+
+      /* ------------------------------------------------------------------ *
+       * task-6: `optMember` must land on the run, reach the snapshot and the *
+       * conclusion's metadata line, and be un-injectable from HTTP.          *
+       * ------------------------------------------------------------------ */
+      {
+        const optHost = fakeHost(
+          Config({ defaultModels: ['providerA/glm'] }),
+          async function* () {
+            yield { type: 'text-delta', text: 'opt conclusion' }
+            yield { type: 'finish', reason: { kind: 'stop' } }
+          },
+        )
+        /* (A) the tool must DECLARE the parameter, document it, and keep it optional. */
+        const params = optHost.tool.parameters
+        assert.ok(params.properties.optMember !== undefined,
+          'council_review must declare an optMember parameter')
+        assert.equal(params.properties.optMember.type, 'string')
+        assert.ok(String(params.properties.optMember.description).includes('opt 阶段 7'),
+          'the parameter must document that it is the stage-7 member label')
+        assert.ok(String(params.properties.optMember.description).includes('留空表示非 opt 流程'),
+          'the parameter must document the empty case')
+        assert.equal(params.required.includes('optMember'), false, 'optMember must stay optional')
+
+        /* (B) a labelled run carries the label in snapshot AND conclusion. */
+        const labelled = await optHost.tool.execute(
+          { question: 'opt probe', attachFiles: false, optMember: 'rev-01' },
+          { agent: { id: 'sess-opt' } },
+        )
+        assert.ok(labelled.conclusion.includes('；optMember: rev-01）'),
+          `the label must ride in the runId metadata line; got ${JSON.stringify(labelled.conclusion.slice(-160))}`)
+        assert.equal(typeof labelled.runId, 'string')
+        /* Fetch the run the CONCLUSION names: that also proves the label and the
+           runId a downstream record would read back refer to the same run. */
+        const runIdOf = (text) => {
+          const found = /runId: ([A-Za-z0-9]+)/.exec(text)
+          return found === null ? '' : found[1]
+        }
+        assert.equal(runIdOf(labelled.conclusion), labelled.runId,
+          'the conclusion metadata line must name the run it came from')
+        const labelledSnap = (await http(optHost, 'GET', `/council/run/${labelled.runId}`)).json
+        assert.equal(labelledSnap.optMember, 'rev-01', 'the label must reach the snapshot')
+        assert.equal(labelledSnap.toolRun, true, 'the labelled run must still be a tool run')
+
+        /* (C) a run without the argument stays empty — and an empty value must not
+           fabricate an "optMember:" tag in the conclusion. */
+        const unlabelled = await optHost.tool.execute(
+          { question: 'opt probe 2', attachFiles: false },
+          { agent: { id: 'sess-opt' } },
+        )
+        assert.equal(/optMember/.test(unlabelled.conclusion), false,
+          `an unlabelled run must not carry an optMember tag; got ${JSON.stringify(unlabelled.conclusion.slice(-160))}`)
+        assert.notEqual(unlabelled.runId, labelled.runId, 'each tool call must be its own run')
+        const unlabelledSnap = (await http(optHost, 'GET', `/council/run/${unlabelled.runId}`)).json
+        assert.equal(unlabelledSnap.optMember, '', 'an unset label must snapshot as ""')
+
+        /* (D) the HTTP panel must NOT be able to inject a member label: the label is
+           trustworthy exactly because only the documented tool path can set it. */
+        const injected = await http(optHost, 'POST', '/council/run', JSON.stringify({
+          question: 'panel opt injection probe',
+          models: [{ provider: 'providerA', model: 'glm' }, { provider: 'deepseek', model: 'pro' }],
+          sessionId: 'sess-opt-panel',
+          attachFiles: false,
+          optMember: 'rev-99',
+        }))
+        assert.equal(injected.status, 200, `the panel run must start; body=${JSON.stringify(injected.json)}`)
+        const injectedSnap = (await http(optHost, 'GET', `/council/run/${injected.json.runId}`)).json
+        assert.equal(injectedSnap.optMember, '',
+          'a panel run must ignore an optMember in the body: only the tool path may label a run')
+        assert.equal(injectedSnap.toolRun, false)
+      }
 
       /* panelEnabled=false refuses every change-class route with 403 + a
          structured code, before any run lookup (the ids do not exist). */
@@ -1021,6 +1931,14 @@ try {
       assert.ok(probe.json.runningRuns >= 0, 'runningRuns must never be negative')
       assert.equal(typeof probe.json.toolEnabled, 'boolean', 'health must report the tool switch')
       assert.equal(typeof probe.json.panelEnabled, 'boolean', 'health must report the panel switch')
+      /* The live host must report the marker this source declares: that is the only
+         way the user can tell, after a reload, whether the new snapshot fields are
+         actually being served. */
+      const declaredBuild = /build: 'v(\d+)'/.exec(
+        readFileSync(new URL('../index.js', import.meta.url), 'utf8'),
+      )
+      assert.equal(probe.json.build, `v${declaredBuild[1]}`,
+        'the health probe must report the build marker the source declares')
     } finally {
       if (previousHome === undefined) delete process.env.DSH_HOME
       else process.env.DSH_HOME = previousHome
@@ -1188,5 +2106,8 @@ try {
 
   console.log('host half: OK (paths, traversal, secrets, timeout, scheduler, settings, council tool)')
 } finally {
-  await rm(root, { recursive: true, force: true })
+  /* Retries on purpose: a run's `persistRuns()` debounce (500 ms) can still fire
+     while the temp tree is being removed, which surfaced as a flaky ENOTEMPTY
+     teardown (measured while reverse-verifying this task). */
+  await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
 }

@@ -26,7 +26,12 @@ const MUST = {
   deadlineWall: 'Promise.race([execute(run, routes), deadlineWall])',
   zeroBudget: 'if (left <= 0)',
   fullClamp: 'Math.min(CALL_TIMEOUT_MS, left)',
-  runDeadlineFormula: 'return run.createdAt + RUN_TIMEOUT_MS',
+  /* 0.2.37: the deadline must honour the run's FROZEN budget (`runBudgetMs` is a
+     live setting), so the formula reads `runBudgetOf(run)` instead of the constant.
+     The behaviour it guards is unchanged — an attempt is still clamped to the
+     deadline — which is why only the literal moves, and why `verify-host` asserts
+     the actual arithmetic (`runDeadlineOf({budgetMs}) === createdAt + budget`). */
+  runDeadlineFormula: 'return run.createdAt + runBudgetOf(run)',
 }
 
 /**
@@ -117,7 +122,14 @@ const seatRegion = wholeRegion(/关键区（第 \d+–\d+ 行，完整函数体�
 const seatClampsInRegion = seatRegion === undefined ? {
   seatZeroGuard: false, seatCombined: false, seatStart: false, seatResult: false,
 } : {
-  seatZeroGuard: seatRegion.includes('整轮预算耗尽，不再启动席位'),
+  /* Same change of wording as `runDeadlineFormula`: the guard now names WHICH
+     budget ran out (`${label}` = 整轮/作答阶段/…), because a stage cap used to be
+     reported as "整轮预算耗尽" even with minutes left on the run. The guard itself
+     (refuse to start a seat with no budget) is unchanged.
+     The template literal is asserted AS A WHOLE on purpose: a substring check for
+     "预算耗尽，不再启动席位" also matches the old "整轮预算耗尽，不再启动席位" —
+     reverse-verified, that mutation stayed green, i.e. the check locked nothing. */
+  seatZeroGuard: seatRegion.includes('${label}预算耗尽，不再启动席位'),
   seatCombined: seatRegion.includes('AbortSignal.timeout(Math.min(CALL_TIMEOUT_MS, remaining()))'),
   seatStart: seatRegion.includes('Math.min(SEAT_START_TIMEOUT_MS, remaining())'),
   seatResult: seatRegion.includes('Math.min(SEAT_RESULT_TIMEOUT_MS, remaining())'),

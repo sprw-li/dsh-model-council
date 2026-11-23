@@ -141,12 +141,20 @@ council_review({
 | `panelEnabled` | **外部入口**（用户侧）：侧栏面板与 `/council` 命令，以及 `POST /council/run`、`/resume`、`/cancel`。关闭后无法发起/恢复/取消评审，**只读查询（`/council/runs`、`/council/models`、运行详情）仍然可用** |
 | `defaultModels` | 内置工具未显式传 `models` 时的默认评审模型。**选项来自 Host 的实时模型目录**（`GET /council/models`），模型下线后会标为"已保存但当前不可用"而不是静默改写 |
 | `defaultChairman` | 未显式传 chairman 时的默认主席；必须同时在参与者名单内，否则回退首位 |
+| `providerConcurrency` | **每 provider 并发槽位，默认 5**。同一 provider 的席位数 N > 槽位 M 时每阶段要跑 `ceil(N/M)` 波（三阶段串行，波数直接乘墙钟）；5 席名单在默认 5 槽下**每阶段一波**。多标签/多会话不会放大它（计数在 Host 全局）。**提高并发会提高瞬时请求数**，provider 限流时把它调回 4 |
+| `answerMaxTokens` | 作答席位输出预算，默认 16384。调低可提速，但过低的预算会让长答案被截断（有 4096 下限保护） |
+| `reviewMaxTokens` | 互评席位输出预算，默认 16384 |
+| `chairmanMaxTokens` | 主席输出预算，默认 16384 |
+| `runBudgetMs` | **整轮预算**，默认 1800000（30 分钟）；**只可下调**（下限 5 分钟），上限仍是 30 分钟。三阶段按 45% / 35% / 20% 分配子预算 |
+| `optMember` | 不在设置页：`council_review` 的**可选入参**。opt 阶段 7 逐成员评审时标记本次运行服务于哪个成员（留空 = 非 opt 流程）；写入后**不可改写**，见下文"运行记录的可核对性" |
 
 > 早先版本用单个 `enabled` 只关工具、面板照跑，字段名会让人以为整个插件停了。现在拆成两个显式开关。
 
 `defaultModels` 只要求"与模型目录同步"（解析成功、去重、≤6 条）；**不强制异构性** —— 同一 provider 的多个模型是用户的显式选择。异构性（单 provider、模型名互不相同、≤3）只在**自动挑选**分支强制。
 
-实现要点：这三个字段在 `Config` 里声明为 `.volatile()`，并由 `ctx.configForms.get('council')` 绑定。函数式插件的 `config` 默认是**激活时的快照**，只有 volatile 字段会原地更新（`cordis-plugin-loader` 的 `_commitVolatile` → `updateVolatile` 写回同一个 ref，不重启插件），所以插件侧必须用 `config.field.get()` 读。
+实现要点：这些字段在 `Config` 里声明为 `.volatile()`，并由 `ctx.configForms.get('council')` 绑定。函数式插件的 `config` 默认是**激活时的快照**，只有 volatile 字段会原地更新（`cordis-plugin-loader` 的 `_commitVolatile` → `updateVolatile` 写回同一个 ref，不重启插件），所以插件侧必须用 `config.field.get()` 读。
+
+> **Unreleased（拟 0.2.37）新增的 5 个可调项**（`answerMaxTokens` / `reviewMaxTokens` / `chairmanMaxTokens` / `providerConcurrency` / `runBudgetMs`）也是 `.volatile()`：改了**下一次 run 就生效**，不必重启插件。它们会在每次运行开始时**冻结到该 run 上**——所以一次运行的中途改设置不会让快照里的计划与真实行为不一致。**这 5 个的默认值全部等于本次变更之前的硬编码常量**，升级本身不会让任何一次作答变短或变慢。
 
 也可以直接在 profile 的插件行传 `config`（静态默认值，改普通字段会重启插件）：
 
@@ -160,6 +168,12 @@ council_review({
     defaultChairman: ''
     contextMaxChars: 6000
     filesMaxChars: 20000
+    # Unreleased（拟 0.2.37）：延迟/预算可调项（全部是 .volatile()，改了下一次 run 生效）
+    providerConcurrency: 5        # 每 provider 并发槽位；5 席名单一波。限流时调回 4
+    answerMaxTokens: 16384        # 作答席位输出预算
+    reviewMaxTokens: 16384        # 互评席位输出预算
+    chairmanMaxTokens: 16384      # 主席输出预算
+    runBudgetMs: 1800000          # 整轮预算（只可下调，下限 300000）
     # 附件许可：默认只允许会话工作区 + 调用方目录。
     attachRoots: []              # 额外允许的根目录，例如 ["D:\\dev\\Project6"]
     allowExternalPaths: false    # 逃生舱：true = 恢复"问题里任意本机路径可读"（0.2.27 前行为）
@@ -244,7 +258,7 @@ else
 ## 可靠性、安全与并发（v0.2 硬化）
 
 - **终态只写一次**：`finishRun()` 是唯一终态入口；取消/超时/正常完成竞态下，迟到的阶段结果不会覆盖「已取消/已超时」；watchdog 与 cancel 都会 dispose 活跃席位。
-- **并发上收到 Host**：每 provider 全局 4 并发槽（多聊天/多标签页不会放大）；429/5xx/超时/ECONN 等瞬态失败退避重试（最多 3 次）；`max-tokens` 无正文自动翻倍重试。
+- **并发上收到 Host**：每 provider 全局 5 并发槽（多聊天/多标签页不会放大）；429/5xx/超时/ECONN 等瞬态失败退避重试（最多 3 次）；`max-tokens` 无正文自动翻倍重试。
 - **降级熔断 3**：每个 run 最多降级 3 席（超时/失败 → 纯模型）——刻意低于 `MAX_MODELS = 6`，因为连续多席失败通常意味着 provider 故障而非单席偶发，继续降级只会放大负载；触发熔断时整轮报错并注明原因。`seat.fallback/fallbackFrom` 与 `run.fallbacks/fallbackLimit` 可在快照里审计。
 - **单会话单 run**：同一 `sessionId` 已有运行中的评审时，`POST /council/run` 返回 409 + 现有 runId，前端改为接回而不是再开一份。
 - **运行注册表持久化**：写入 `${DSH_HOME:-~/.dsh}/council-runs.json`（最多 20 条，500ms 防抖）；Host 重启后仍能查到历史运行，重启前仍在跑的被标注为「Host 重启，运行中断」。
@@ -270,6 +284,34 @@ else
   - **仍缺**：多卷/网络驱动器上的 reparse point 行为未测（junction 不能跨卷，理论影响面有限）。
 - **自动化回归**：`npm run verify` 现在同时跑 host 与 client harness（路径修复/穿越拒绝/密钥跳过/超时语义/并发窗口）。
 
+## 延迟、预算与降级（Unreleased，拟 0.2.37）
+
+实测背景：本机 8 次 5 席调用耗时 **11m45s–27m46s**，其中一次在**主席阶段**硬失败
+（`整轮预算耗尽：调用超时（89s 内未完成）`）。三个成因与对策：
+
+| 成因 | 本次变更（Unreleased，拟 0.2.37）的做法 |
+|---|---|
+| 每席 16384 tokens × 5 席 × 3 阶段 | 改成设置（`answerMaxTokens` / `reviewMaxTokens` / `chairmanMaxTokens`），**默认值不变**——想快就自己调低，升级不会偷偷缩短答案 |
+| `providerConcurrency = 4` → 5 席同 provider = 每阶段 `ceil(5/4)=2` 波、三阶段≈5 波 | 默认提到 **5**：5 席名单每阶段**一波**（≈3 波，实测等效 −40% 墙钟），**不改变单次调用质量**；6 席仍 2 波。提高并发会提高瞬时请求数，遇限流调回 4 |
+| 主席是最后一阶段，只吃 30 分钟预算的**剩余量** | 三阶段子预算 **45% / 35% / 20%**：作答、互评被硬封顶，主席由构造保证 ≥20%；仍不足 120s 时**优雅跳过**而不是硬失败 |
+
+- **子预算与波次是可见的**：快照新增两个字段（名字冻结）——
+  - `providerWaves`：`{concurrency, maxWaves, advice, stages:{answers|reviews|chairman:{seats, slots, waves, byProvider:[{provider, providerName, seats, slots, waves}]}}}`，即"这轮每个阶段要跑几波"，以及一行可执行的 `advice`（同 provider 超额时给出"掺入第二 provider 可降为一波"）；
+  - `budgetPlan`：`{startedAt, totalMs, elapsedMs, remainingMs, stages:{answers|reviews|chairman:{share, budgetMs, usedMs, startedAt, endedAt, deadlineAt, capped, cappedReason}}}`，主席另带 `floorMs/skipped/reason`。
+  两者**永远存在**（从磁盘恢复的历史 run 会按其名单与默认预算现场算一份）；阶段关闭后 `usedMs` 冻结，不随快照刷新增长。
+- **降级一律显式**：主席被跳过时 `stopReason = "chairman-budget-skipped"`、`status` 仍是 `done`、`error` 为空，`budgetPlan.stages.chairman.reason` 写明"剩余 Ns、下限 Ms"，整轮按**无主席模式**产出结论；阶段用满子预算时该阶段 `capped=true` + `cappedReason`。这些以及同 provider 波次建议都会以 `注意：…` 一行写进 `council_review` 的**工具结论文本**，调用方与用户都看得见。
+- **阶段预算耗尽不再冒充整轮**：以前任何预算耗尽都写"整轮预算耗尽"，即使整轮还剩几分钟；现在按阶段分别写"作答阶段/互评阶段/主席阶段预算耗尽"。
+- **想更快 / 想更稳**：更快 → 调低三个 token 预算（单次输出短），或把名单拆到两个 provider（每阶段都是一波）；更稳 → `runBudgetMs` 下调（例如 20 分钟，早失败早返回），或 `providerConcurrency` 调回 4（限流时）。
+
+## 运行记录的可核对性（Unreleased，拟 0.2.37）
+
+- **工具发起的 run 不会被重复回投**：`POST /council/run/<id>/resume` 对 `toolRun === true` 的 run **默认拒绝**（409 + `code: "tool-run"`，说明"结论已作为工具结果交回调用方"）。重复投递不能只靠客户端自觉——任何过期标签页/复活页面都拿不到第二份。
+  - 显式逃生门：`?force=1`（或 body `force: true`）放行，并把 run 记为 `resumed: "wake(forced)"`（而不是普通的 `wake`），所以"强行重复投递"**可审计**而不是静默。逃生门只解除 tool-run 这一条，同一次投递的第二次仍 409 `already-resumed`。
+  - 面板 run（`toolRun !== true`）行为与响应体**逐字不变**。
+- **`optMember` 成员标签（write-once）**：`council_review` 新增可选入参 `optMember`，用途是 opt 阶段 7 逐成员评审时标注"本次运行服务于哪个成员"（留空 = 非 opt 流程）。它落到 run 上并进入快照 `optMember`，也会出现在工具结论的元信息行：`（参与模型：…；runId: cxxx；optMember: rev-01）`。
+  - **一旦写入不可改写**：无标签的调用不会清空已有标签，同值重复是幂等，**不同值直接报错**（`该运行已标注为 opt 成员 "X"，不能改写为 "Y"`）。这样一个 `runId` 只能对应一个成员——下游记录里"同一 runId × 8 个成员"不再可能，而"8 条记录来自 8 次独立运行"才有机械依据。
+  - **面板无法注入**：`POST /council/run` body 里的 `optMember` 会被忽略（面板 run 的快照恒为 `''`），因为标签可信的前提是只有文档化的工具路径能写它。
+
 ## 已知限制
 
 - `ctx.agents.get(sessionId).session.snapshotEvents()` 是 DSH 内部接口，已用 try/catch 降级为“只发问题”，UI 会标注「上下文读取失败」；升级 DSH 后请重新验证。
@@ -282,7 +324,7 @@ else
 - **subagent 席位只在作答阶段**：互评与主席走快速纯模型通道，避免 6 席 × 多阶段各开一整轮子代理导致假死；单席有启动 60s / 执行 240s 上限（`SEAT_START_TIMEOUT_MS` / `SEAT_RESULT_TIMEOUT_MS`，与本节一致），超时或失败自动降级纯模型（卡片标「完成（降级）」），整轮另有 30 分钟 watchdog。卡片在运行中显示「启动中/运行中 Ns」。
 - **subagent 模式下路径附件默认关闭**：委员自己用只读工具读工作区，避免重复注入 20k 字；如需同时注入，走 API 显式传 `attachFiles: true`。
 - **subagent 席位较慢**：每席是一轮完整子代理（带工具），比纯模型调用慢数倍；子会话会出现在子代理侧栏。`council-readonly` preset 依赖 DSH 的 `dsh-persona`/`dsh-tool-fs`/`dsh-tool-fs-search`/`dsh-skill-filesystem`/`dsh-tool-skill` 模块名，升级 DSH 后若改名会注册失败并自动退回纯模型模式（UI 会提示）。
-- **输出预算**：作答/互评/主席各 16384 tokens、单次调用超时 300s；推理模型若把预算烧光且无正文，会自动用 32768 重试一次。仍有极小概率失败，属模型侧限制。
+- **输出预算**：作答/互评/主席各 16384 tokens（可用 `answerMaxTokens` / `reviewMaxTokens` / `chairmanMaxTokens` 调低提速）、单次调用超时 600s（`CALL_TIMEOUT_MS`，且始终被整轮预算钳制）；推理模型若把预算烧光且无正文，会自动用 32768 重试一次。仍有极小概率失败，属模型侧限制。
 - 未做跨 profile / 卸载依赖 / 旧 DSH 版本的真实多环境验证。
 
 ## 安装

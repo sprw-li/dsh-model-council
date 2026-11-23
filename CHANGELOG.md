@@ -1,3 +1,86 @@
+# Unreleased（下一版，拟 0.2.37）
+
+> **为什么不是 `# 0.2.36`**：`package.json` 的 `version` 仍是 `0.2.36`，而 tag `v0.2.36` 已经指向
+> 重写历史后的旧提交 —— 把新变更挂在 0.2.36 名下会造成"同一个版本号对应两种内容"，比文档漂移更糟。
+> 本节描述的变更**尚未发版**；发版时四处（README / `package.json` / tag / Release 资产）同步升到
+> 0.2.37，并由 `dev/check-release.mjs` 的 6 条判据守住。
+
+起因：用户一句"**council 不好用**"。实测 8 次 5 席调用耗时 **11m45s–27m46s**，其中一次**倒在主席阶段**
+（`整轮预算耗尽：调用超时（89s 内未完成）`）。这一版全部围绕"**慢**"和"**降级不可见**"两个问题。
+
+## 1. 默认并发 4 → 5：5 席名单每阶段一波（本版唯一直接降低默认墙钟的改动）
+
+成因：一个阶段里**每个 provider** 最多 `providerConcurrency` 路并发，所以一阶段需要 `ceil(席位数/槽位)` **波**，
+而作答/互评/主席三阶段是**串行**的。用户的 5 席名单全在 `bohrium` 上，4 槽 → 每阶段 2 波 ≈ 全程 5 波。
+
+把默认槽位提到 **5**：5 席名单每阶段 **1 波** ≈ 全程 3 波（实测等效 **−40% 墙钟**），而**单次调用质量一点没变**
+——一波就是同一批模型调用，只是同时放行而不是分两批。6 席仍是 2 波：这个默认值是"覆盖常见 5 席名单"，
+不是"照着某一份名单调参"。
+
+> **风险声明**：提高并发上限会提高 provider 的**瞬时请求数**。若出现 429/限流/超时（退避重试吸收不了的那种），
+> 请把 `providerConcurrency` 调回 4 —— 它是活设置，**下一次 run 就生效**，不必重启插件。
+> 计数仍在 Host 全局，多标签页/多会话不会把它放大。
+
+## 2. 延迟与预算变成可调设置（默认值全部**不变**）
+
+`answerMaxTokens` / `reviewMaxTokens` / `chairmanMaxTokens`（默认各 16384）、`providerConcurrency`（默认 5）、
+`runBudgetMs`（默认 1800000，只可下调，下限 300000）。全部 `.volatile()`：设置页改完**下一次 run 生效**，
+不必重启插件；每次运行开始时**冻结到该 run 上**，所以中途改设置不会让快照里的计划与真实行为不一致。
+
+**升级不改变任何既有行为**：这 5 个默认值等于 0.2.36 之前的硬编码常量。想更快就自己调低 token 预算，
+想更稳就调低整轮预算或把并发调回 4。
+
+## 3. 主席阶段保底：子预算 + 优雅降级（不再硬失败）
+
+三阶段子预算 **作答 45% / 互评 35% / 主席 20%**：前两段被硬封顶，主席由构造保证 ≥20% 的整轮预算；
+主席**不设上限**（快阶段跑完后它仍可用剩余全部预算——20% 是地板，不是天花板，否则等于把"被饿死"换成"被催死"）。
+
+若主席开始前剩余预算仍不足 `floorMs`（默认 120s，且不大于主席自身份额），**优雅跳过**而不是拿 89s 去撞超时：
+`stopReason = "chairman-budget-skipped"`、`status` 仍是 `done`、`error` 为空、`budgetPlan.stages.chairman.reason`
+写明"剩余 Ns / 下限 Ms"，整轮按**无主席模式**产出结论（答案 + 匿名互评照常给出）。
+
+## 4. "慢"和"降级"变成看得见的数据
+
+- 快照新增（字段名冻结）`providerWaves`（`concurrency` / `maxWaves` / `advice` / 每阶段 `seats,slots,waves,byProvider`）
+  与 `budgetPlan`（`totalMs` / `elapsedMs` / `remainingMs` / 每阶段 `share,budgetMs,usedMs,startedAt,endedAt,deadlineAt,capped,cappedReason`，主席另有 `floorMs,skipped,reason`）。
+  两者**永远存在**：从磁盘恢复的历史 run 会按其名单与默认预算现场算一份。阶段关闭后 `usedMs` 冻结。
+- 同 provider 席位数 > 槽位时，`council_review` 的**工具结论文本**里会多一行：
+  `注意：同 provider "bohrium" 5 席 > 槽位 4，每阶段将跑 2 波（ceil(5/4)）；掺入第二 provider 可降为一波。`
+  阶段被预算封顶、主席被跳过也同样以 `注意：…` 一行写进结论——**降级绝不静默**。
+- 预算耗尽的措辞不再冒充整轮：以前任何地方都用"整轮预算耗尽"，即使整轮还剩几分钟；现在按
+  "作答阶段/互评阶段/主席阶段预算耗尽" 分开写。
+
+## 5. 重复回投改为 **Host 侧强制**（不再只靠客户端自觉）
+
+`POST /council/run/<id>/resume` 对 `toolRun === true` 的 run **默认拒绝**：`409` + `code: "tool-run"`，
+说明"该结论已作为工具结果交回调用方"。之前只拦"同一 run 已回投过"，于是任何过期/复活的标签页都能给一条
+工具已经交付过的 run 再投一份结论。显式逃生门 `?force=1`（或 body `force: true`）放行，并把 run 记为
+`resumed: "wake(forced)"` —— 强行重复投递**可审计**，不是静默。面板 run 的行为与响应体**逐字不变**。
+
+## 6. `optMember`：一次运行不能被冒充成 8 个成员（完整性）
+
+`council_review` 新增可选入参 `optMember`（opt 阶段 7 逐成员评审时标注本次运行服务于哪个成员，留空 = 非 opt 流程）。
+落到 run 并进入快照 `optMember`，也进工具结论的元信息行：`（参与模型：…；runId: cxxx；optMember: rev-01）`。
+
+**write-once**：无标签调用不清空已有标签，同值重复幂等，**不同值直接报错**。
+实测的完整性漏洞：一个真 runId × 8 个成员标签生成的记录仍能让 `council_records.py check` 拿到 exit 0 PASS，
+即**一次运行可以冒充整个 8 成员矩阵**；插件侧把它做成 `runId ↔ member` 一对一且不可改写之后，
+下游才有机械依据判断"8 条记录来自 8 次独立运行"。面板 `POST /council/run` 无法注入该标签。
+
+## 7. 修既有文档漂移
+
+README 一直写"单次调用超时 **300s**"，而 `CALL_TIMEOUT_MS` 实际是 **600000 = 10 分钟**（0.2.35 之前就漂了）。
+改成事实值，并**加断言把 README 与常量绑在一起**（`verify-host.mjs` 解析 README 印的数字与 `CALL_TIMEOUT_MS` 比较），
+防止下一次再漂。同一处还断言：5 个新设置项与 `providerWaves/budgetPlan/optMember/chairman-budget-skipped`
+必须在 README 里被写到——没写下来的设置项/快照字段，和没写下来的常量一样是缺陷。
+
+## 验收
+
+- `node --check index.js` → 0；`node dev/verify-host.mjs` 连续 **6** 次 exit 0（含 **47** 项反向验证：每个新判定改坏一次必红，还原后 `index.js`/`README.md` 双基线 SHA256 一致）；`node dev/check-release.mjs` 6/6；**`npm run verify` 全链（client + host + runtime + sampler）exit 0**。
+- 并发默认值改回 4 → README 一致性断言立刻变红（反向验证的真实用例 M42）。同理 `CALL_TIMEOUT_MS` 改回 300000 或 README 写回 300s，**两个方向都会红**（M43/M46）。
+- `dev/tune-sampler.mjs` 的两处字面量锚随本次变更更新（`runDeadlineOf` 改为按冻结预算算、席位守卫措辞阶段化），并且**补了反向验证**：把公式改回常量、或把守卫措辞改回"整轮预算耗尽"，sampler 立即 MISS 变红。
+- **一条留给下一个改文档的人的教训**：初版用 `readme.includes('providerWaves')` 锁"README 必须提到该字段"，反向验证把 README 里的 `providerWaves` 改名成 `providerWavesUndocumented` 时**依然绿**——子串匹配把"改名"也当成"写了"。改成完整标识符匹配（`(?<![A-Za-z0-9_])名字(?![A-Za-z0-9_])`）后才红。**用 `includes` 锁文档，等于没锁。**
+
 # 0.2.35
 
 起因：用户要"**展开实时可见思考**"。实现过程中连带挖出**三个**真问题，其中一个说明**旧的验收门禁一直在骗自己**。
