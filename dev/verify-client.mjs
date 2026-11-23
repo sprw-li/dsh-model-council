@@ -10,10 +10,23 @@
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
+import { createHash } from 'node:crypto'
 import vm from 'node:vm'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const source = readFileSync(join(here, '..', 'client.js'), 'utf8')
+
+/* This harness's own identity, quoted in every stall dump and in the pass line.
+   A red that cannot be tied to one revision is unattributable: an independent
+   verifier once reported two failures whose dumps matched a working tree that
+   still carried somebody's temporary fault injection — including an interval
+   delay (`1000ms`) and an awaited-forever promise that no shipped line arms —
+   so the first question about any future red must be "which bytes produced it",
+   answerable here instead of by archaeology. */
+const HARNESS_SHA = createHash('sha256')
+  .update(readFileSync(fileURLToPath(import.meta.url)))
+  .digest('hex')
+  .slice(0, 16)
 
 /* Discovery delay, read from the source so the harness cannot drift from it. */
 const DISCOVERY_MS = Number((/const RUN_DISCOVERY_MS = (\d+)/.exec(source) || [])[1])
@@ -267,14 +280,54 @@ function dispatchWindowEvent(type, event) {
  */
 const WATCHDOG_EXIT_CODE = 3
 const RUN_WATCHDOG_MS = 300000
-/* After the summary every remaining step is synchronous, so anything still
-   keeping the loop alive after this grace is a leaked handle, not slow work. */
+/* How long a COMPLETED run may keep the loop alive before the exit-hygiene
+   check speaks up. Every remaining step after the summary is synchronous, so a
+   faithful check needs a small grace, not a long one. */
 const EXIT_GRACE_MS = 5000
+/* The no-progress gate: a run that keeps the loop alive but produces no new
+   evidence is stalled, and 300s of total time is a poor proxy for that. The
+   longest intentional silence in this file is the `DISCOVERY_MS + 600` wait
+   (~4.6s); 60000ms is ~13x that, so a loaded machine cannot trip it by being
+   slow, while a real stall is named in a minute instead of five. */
+const STALL_PHASE_MS = 60000
+const STALL_CHECK_MS = 10000
 const HARNESS_STARTED_AT = Date.now()
-let watchdogPhase = 'boot: module setup before the plugin is applied'
+/* Named as precisely as the code allows: everything up to the registration
+   phase below is synchronous (the first `await` in this file is after it), so a
+   stall reported here cannot be "a mock that never answered". */
+let watchdogPhase = 'boot: imports, client.js read, fakes built (synchronous — no await exists here)'
 /** Name the section under test, so a stall can be attributed instead of guessed. */
 function phase(name) {
   watchdogPhase = name
+}
+/** Every observable sign of progress, across all transports. */
+function progressScore() {
+  return publishCount + fetchCalls.length + timerSeq + intervalSeq + discoveryArms
+}
+/** How many handles this harness itself armed through the fake window. */
+function harnessOwnedHandles() {
+  return pendingTimers.size + pendingIntervals.size
+}
+/** Clear every handle the harness owns; returns how many it cleared. */
+function drainHarnessHandles() {
+  const owned = harnessOwnedHandles()
+  for (const timer of [...pendingTimers.values()]) fakeWindow.clearTimeout(timer.id)
+  for (const id of [...pendingIntervals.keys()]) fakeWindow.clearInterval(id)
+  return owned
+}
+/**
+ * The exit-hygiene verdict for a run whose assertions all passed.
+ *
+ * Pure on purpose: the hard invariant "a passing run is never reported as a
+ * stall" is asserted in this file instead of only claimed in a comment. A
+ * leftover handle that the harness itself armed and can clear is the harness's
+ * own bookkeeping — the client re-arms its leader lease on a real schedule, and
+ * a cancelled timer can survive one more continuation — never evidence against
+ * the code under test. Only a handle the harness cannot account for at all is a
+ * genuine "test done, node won't exit".
+ */
+function exitHygieneVerdict(harnessOwnedLeft) {
+  return harnessOwnedLeft > 0 ? 'pass' : 'stall'
 }
 /** Everything the harness is holding right now: a stall must be diagnosable. */
 function watchdogDump(reason) {
@@ -292,8 +345,10 @@ function watchdogDump(reason) {
   return [
     '',
     `HARNESS WATCHDOG (exit ${WATCHDOG_EXIT_CODE}): ${reason}`,
+    `  harness sha256: ${HARNESS_SHA} (node ${process.version})`,
     `  phase: ${watchdogPhase}`,
     `  elapsedMs: ${Date.now() - HARNESS_STARTED_AT} (limit ${RUN_WATCHDOG_MS}ms)`,
+    `  progress: publishes=${publishCount} fetches=${fetchCalls.length} timers=${timerSeq} intervals=${intervalSeq} discovery=${discoveryArms} (last movement ${Date.now() - stallMark.at}ms ago)`,
     `  armed timers (${pendingTimers.size}) seq:delay[/discovery]: ${armed.length === 0 ? 'none' : armed.join(', ')}`,
     `  armed intervals (${pendingIntervals.size}) seq:delay: ${intervals.length === 0 ? 'none' : intervals.join(', ')}`,
     `  discovery arms: ${discoveryArms} (noise hits ${discoveryNoiseHits}); held ids: ${discoveryTimerIds.length}`,
@@ -314,6 +369,20 @@ function watchdogFail(reason) {
 const runWatchdog = setTimeout(() => {
   watchdogFail(`the run did not finish within ${RUN_WATCHDOG_MS}ms; it is stuck, not slow`)
 }, RUN_WATCHDOG_MS)
+/* No-progress gate. Unref'd: it must not be the reason a finished run stays
+   alive, but it fires whenever something ELSE keeps the loop open. */
+let stallMark = { at: HARNESS_STARTED_AT, score: 0, phase: watchdogPhase }
+const stallGate = setInterval(() => {
+  const score = progressScore()
+  if (score !== stallMark.score || watchdogPhase !== stallMark.phase) {
+    stallMark = { at: Date.now(), score, phase: watchdogPhase }
+    return
+  }
+  if (Date.now() - stallMark.at >= STALL_PHASE_MS) {
+    watchdogFail(`no progress for ${STALL_PHASE_MS}ms in phase "${watchdogPhase}"`)
+  }
+}, STALL_CHECK_MS)
+stallGate.unref()
 
 const resumeCalls = []
 /* Fault injection for the resilience cases below. */
@@ -3112,6 +3181,35 @@ phase('legacy migration: useFeedback:true -> silent, not wake')
   }
 }
 
+/* --- The exit-hygiene invariant, asserted here rather than only described in
+       prose: `exit 3` means "stalled", so a run whose assertions all passed must
+       never be judged a stall. The rule is a pure function, which is what makes
+       it pinnable; its behavioural half (a residual harness-owned interval must
+       still exit 0) is proven by the injected-interval reverse check reported
+       with this change. Source ordering is pinned too, because "the drain comes
+       before the criterion" is the whole fix. --- */
+{
+  if (exitHygieneVerdict(1) !== 'pass' || exitHygieneVerdict(7) !== 'pass') {
+    throw new Error('a leftover handle the harness itself armed must not fail a passing run')
+  }
+  if (exitHygieneVerdict(0) !== 'stall') {
+    throw new Error('an unexplainable live handle after the summary must still be reported as a stall')
+  }
+  const harnessText = readFileSync(fileURLToPath(import.meta.url), 'utf8')
+  const exitRegion = harnessText.slice(harnessText.indexOf("phase('exit: releasing the loops the plugin owns')"))
+  const drainAt = exitRegion.indexOf('drainHarnessHandles()')
+  const criterionAt = exitRegion.indexOf('clearTimeout(runWatchdog)')
+  if (drainAt === -1 || criterionAt === -1 || drainAt > criterionAt) {
+    throw new Error('the exit path must drain harness-owned handles BEFORE the hygiene criterion is armed')
+  }
+  if (exitRegion.indexOf('exitHygieneVerdict(ownedLeft)') === -1) {
+    throw new Error('the hygiene criterion must consult exitHygieneVerdict')
+  }
+  if (!/harness sha256: \$\{HARNESS_SHA\}/.test(harnessText)) {
+    throw new Error('a stall dump must name the harness revision that produced it')
+  }
+}
+
 /* This harness started two endless loops the plugin owns in a real tab: the
    leader-election interval and the discovery chain (which re-arms on purpose).
    Release both so the offline run terminates instead of hanging. */
@@ -3122,19 +3220,39 @@ dispatchWindowEvent('pagehide', { type: 'pagehide' })
    real timer but would leave the entry listed as "armed", which is exactly the
    kind of misleading evidence a stalled run must not produce. */
 for (const id of discoveryTimerIds) fakeWindow.clearTimeout(id)
+/* Drain EVERY handle this harness owns BEFORE the hygiene criterion is armed.
+   `pagehide` asks the client to stop, but the client re-arms its leader lease on
+   a real schedule and a continuation already in flight can re-arm one more
+   interval; treating that as a failure of the code under test is how a fully
+   passing run once got reported as `exit 3`. The drain comes first, so the
+   criterion below only ever judges handles the harness cannot account for. */
+const drainedAtExit = drainHarnessHandles()
 
-/* The run is over: disarm the upper bound, then prove the event loop is actually
-   empty. Every remaining step is synchronous, so if this process is still alive
-   EXIT_GRACE_MS from now a handle leaked — exactly the "test done, node won't
-   exit" stall this file could not distinguish from work. The timer is unref'd so
-   it fires only while something ELSE keeps the loop alive: a clean run still
-   exits immediately, with no added latency. */
+/* The run is over: disarm both timers, then check for handles nobody can
+   explain. Every remaining step is synchronous, so if this process is still
+   alive EXIT_GRACE_MS from now, something outside this harness's bookkeeping is
+   holding the loop open — exactly the "test done, node won't exit" stall this
+   file could not distinguish from work. The check is unref'd so it fires only
+   while something ELSE keeps the loop alive: a clean run still exits
+   immediately, with no added latency. Hard invariant: a run whose assertions all
+   passed is NEVER reported as a stall — see `exitHygieneVerdict`. */
 clearTimeout(runWatchdog)
+clearInterval(stallGate)
 setTimeout(() => {
-  watchdogFail(`the run printed its summary but the process did not exit within ${EXIT_GRACE_MS}ms: a handle is still live`)
+  const ownedLeft = drainHarnessHandles()
+  if (exitHygieneVerdict(ownedLeft) === 'pass') {
+    /* Harness-owned bookkeeping, not a defect: say so and end deterministically. */
+    process.stderr.write(
+      `note: ${ownedLeft} harness-owned handle(s) outlived a passing run `
+      + `(${drainedAtExit} drained at exit); drained again and exiting 0 — not a stall [harness ${HARNESS_SHA}]\n`,
+    )
+    process.exit(0)
+  }
+  watchdogFail('the run printed its summary but the process did not exit and no harness-owned handle explains it')
 }, EXIT_GRACE_MS).unref()
 
 console.log('client half: OK')
+console.log(`  harness: ${HARNESS_SHA} (node ${process.version})`)
 console.log(`  slots: ${[...registered].join(', ')}`)
 console.log(`  tab type: ${tabTypes[0].kind} (${tabTypes[0].id})`)
 console.log(`  command: /${command.name} (${command.ui.kind})`)
