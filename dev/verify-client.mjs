@@ -53,6 +53,10 @@ if (!Number.isSafeInteger(STREAM_REBUILD_BASE_MS) || STREAM_REBUILD_BASE_MS <= 0
    sleeping STREAM_STALL_MS/… for real. */
 let timerSeq = 0
 const pendingTimers = new Map()
+/* The other handle kind the client owns (leader-election lease). Tracked for the
+   watchdog dump only; see `setInterval` in `fakeWindow`. */
+const pendingIntervals = new Map()
+let intervalSeq = 0
 /* Case-timer lookups where the discovery chain's re-arm happened to be armed
    last. Non-zero is expected in a long run; it is only evidence, and it is the
    exact condition that used to fire the wrong callback. */
@@ -238,6 +242,78 @@ function dispatchWindowEvent(type, event) {
   if (set === undefined) return
   for (const listener of [...set]) listener(event)
 }
+
+/* ---- Global watchdog: one upper bound for the WHOLE run ---------------- *
+ * Why this exists: this harness had no upper bound of its own. Every wait in it
+ * is a fixed sleep (bounded), but nothing bounded the PROCESS. A never-settling
+ * `await`, or a handle the run forgot to release (the client owns a
+ * leader-election interval and an endless discovery chain), left node alive
+ * indefinitely, so a broken run burned ~70 minutes instead of failing. This file
+ * is part of `npm run verify`, the repo's only full-chain acceptance run, and an
+ * acceptance criterion nobody can afford to wait for is not a criterion.
+ *
+ * Bound derivation (measured, not guessed). Immediately before this change, on
+ * this machine (2026-11-24), five consecutive `node dev/verify-client.mjs` runs
+ * took min 58.22s / median 58.34s / max 58.38s (spread 0.3%). Nearly all of that
+ * is fixed wall-clock `setTimeout` sleeps, so it barely scales with CPU speed.
+ * The limit is ~5x the observed max, rounded up to a round five minutes
+ * (300000ms = 5.14x max): generous for a cold or loaded machine, yet ~14x sooner
+ * than the stall it replaces. Re-measure before changing this number.
+ *
+ * Armed REFERENCED (not `unref`) on purpose: a hang must end in a dump, and an
+ * unref'd timer lets node exit silently when the loop runs dry. The success path
+ * clears it, so a passing run is not slowed down. Exit codes stay distinct:
+ * 0 = pass, 1 = assertion failure (unchanged), 3 = watchdog (this file only).
+ */
+const WATCHDOG_EXIT_CODE = 3
+const RUN_WATCHDOG_MS = 300000
+/* After the summary every remaining step is synchronous, so anything still
+   keeping the loop alive after this grace is a leaked handle, not slow work. */
+const EXIT_GRACE_MS = 5000
+const HARNESS_STARTED_AT = Date.now()
+let watchdogPhase = 'boot: module setup before the plugin is applied'
+/** Name the section under test, so a stall can be attributed instead of guessed. */
+function phase(name) {
+  watchdogPhase = name
+}
+/** Everything the harness is holding right now: a stall must be diagnosable. */
+function watchdogDump(reason) {
+  const armed = [...pendingTimers.values()]
+    .sort((left, right) => left.seq - right.seq)
+    .map((timer) => `${timer.seq}:${timer.ms}ms${timer.discovery === true ? '/discovery' : ''}`)
+  const intervals = [...pendingIntervals.values()]
+    .sort((left, right) => left.seq - right.seq)
+    .map((entry) => `${entry.seq}:${entry.ms}ms`)
+  const publishes = storePublishLog.slice(-12).map((entry) => `${entry.seq}:${entry.detail}`).join(' | ')
+  const state = lastStoreState !== null && typeof lastStoreState === 'object' ? lastStoreState : {}
+  const liveRun = state.run !== null && state.run !== undefined && typeof state.run === 'object'
+    ? `${state.run.id}/${state.run.status}/${state.run.stage}`
+    : 'none'
+  return [
+    '',
+    `HARNESS WATCHDOG (exit ${WATCHDOG_EXIT_CODE}): ${reason}`,
+    `  phase: ${watchdogPhase}`,
+    `  elapsedMs: ${Date.now() - HARNESS_STARTED_AT} (limit ${RUN_WATCHDOG_MS}ms)`,
+    `  armed timers (${pendingTimers.size}) seq:delay[/discovery]: ${armed.length === 0 ? 'none' : armed.join(', ')}`,
+    `  armed intervals (${pendingIntervals.size}) seq:delay: ${intervals.length === 0 ? 'none' : intervals.join(', ')}`,
+    `  discovery arms: ${discoveryArms} (noise hits ${discoveryNoiseHits}); held ids: ${discoveryTimerIds.length}`,
+    `  publishes: ${publishCount}; last 12: ${publishes === '' ? 'none' : publishes}`,
+    `  store: running=${String(state.running)} runId=${JSON.stringify(state.runId)} run=${liveRun} note=${JSON.stringify(state.feedbackNote)} error=${JSON.stringify(state.error)}`,
+    `  fetch calls seen: ${fetchCalls.length}`,
+    '',
+  ].join('\n')
+}
+/** Bounded failure: flush the dump, then exit — never hang waiting on the flush. */
+function watchdogFail(reason) {
+  const hardExit = setTimeout(() => process.exit(WATCHDOG_EXIT_CODE), 1000)
+  process.stderr.write(watchdogDump(reason) + '\n', () => {
+    clearTimeout(hardExit)
+    process.exit(WATCHDOG_EXIT_CODE)
+  })
+}
+const runWatchdog = setTimeout(() => {
+  watchdogFail(`the run did not finish within ${RUN_WATCHDOG_MS}ms; it is stuck, not slow`)
+}, RUN_WATCHDOG_MS)
 
 const resumeCalls = []
 /* Fault injection for the resilience cases below. */
@@ -531,8 +607,20 @@ const fakeWindow = {
     clearTimeout(id)
   },
   /* The leader election needs both; the discovery case below drives it. */
-  setInterval,
-  clearInterval,
+  /* Intervals are tracked too: the client's leader-election lease is one, it is
+     the handle `pagehide` has to stop, and a leaked interval is the classic
+     "worker finished, node never exits" cause. Without this the watchdog dump
+     would say "armed timers: none" while an interval held the loop open. */
+  setInterval: (fn, ms, ...rest) => {
+    intervalSeq += 1
+    const id = setInterval(fn, ms, ...rest)
+    pendingIntervals.set(id, { seq: intervalSeq, ms })
+    return id
+  },
+  clearInterval: (id) => {
+    pendingIntervals.delete(id)
+    clearInterval(id)
+  },
   addEventListener: addWindowListener,
   removeEventListener: removeWindowListener,
   navigator: { clipboard: { writeText: async () => {} } },
@@ -717,6 +805,7 @@ const ctx = {
   },
 }
 
+phase('registration: apply the plugin and check slot/tab/command registration')
 plugin.apply(ctx)
 
 const registered = new Set(registrations.map((entry) => entry.key))
@@ -859,6 +948,7 @@ const inputActions = {
   submit: () => {},
 }
 
+phase('composer bridge + slash command entry (draft must not auto-start)')
 renderAndFlush(React.createElement(bridge, { t, sessionId: 'session-test', useInput: (selector) => selector({ draft: '/' }), inputActions }))
 
 if (typeof command.icon !== 'function') throw new Error('command has no slash-menu icon')
@@ -879,6 +969,7 @@ if (fetchCalls.some((call) => call.url === '/council/run' && call.method === 'PO
   throw new Error('entering from the slash menu must not auto-start the review')
 }
 
+phase('panel body: render text, then run once and check the post-back')
 const tabHtml = render(tabBody === undefined ? null : React.createElement(tabBody, { t }))
 for (const expected of ['多模型理事会', '开始评审', '主席模型', '接当前对话上下文', '自动附带问题里的本地路径', 'subagent 只读席位', '会话工作区：demo', '静默放进上下文', '直接唤醒主聊天', '不做（只留在右侧栏）']) {
   if (!tabHtml.includes(expected)) throw new Error(`tab body missing "${expected}": ${tabHtml.slice(0, 400)}`)
@@ -904,6 +995,7 @@ if (!filesHtml.includes('席位：1 个只读 subagent + 1 个快速')) throw ne
 if (!filesHtml.includes('已附带源码 4 个文件')) throw new Error('source-pack note is missing after the run')
 if (!filesHtml.includes('首字 0.9s')) throw new Error('per-seat TTFT metric is missing after the run')
 
+phase('overlay: floating run card (body portal)')
 /* ---- Floating run status: conversation.input.overlay ---- */
 const overlayReg = registrations.find((entry) => entry.key === 'conversation.input.overlay')
 if (overlayReg === undefined) throw new Error('council did not register the floating run-status overlay')
@@ -941,6 +1033,7 @@ if (resumeCalls.length !== resumeBeforeOverlay) {
 if (fetchCalls.filter((call) => /\/cancel$/.test(call.url)).length !== cancelBeforeOverlay) {
   throw new Error('rendering the overlay must not cancel the run')
 }
+phase('tool card: toolview for preparing/start/result')
 /* ---- Conversation card: `tool.call.toolview`, keyed by the wire name ---- */
 const toolviewRegs = registrations.filter((entry) => entry.options !== undefined && entry.options.name === 'tool.call.toolview')
 if (toolviewRegs.length !== 1) {
@@ -1050,6 +1143,7 @@ for (const expected of ['评审失败', 'CouncilRunError', 'COUNCIL_FAILED']) {
   }
 }
 
+phase('discovery: the chain re-arms, only the leader sends')
 /* ---- Discovery: the timer always re-arms, but only a leader sends ---- *
  * The old `isPollLeader() !== true` source-text assertion demanded the early
  * return that IS the dead end (a tab that was not leader at mount never armed
@@ -1110,6 +1204,7 @@ for (const expected of ['评审失败', 'CouncilRunError', 'COUNCIL_FAILED']) {
   await new Promise((resolve) => setTimeout(resolve, 3200))
 }
 
+phase('live progress: the card reads the shared store')
 /* ---- Live progress: read from the shared store, never from the tool props ---- */
 {
   /* feedbackMode off so the synthetic run cannot be delivered. */
@@ -1145,6 +1240,7 @@ for (const expected of ['评审失败', 'CouncilRunError', 'COUNCIL_FAILED']) {
   wakeRadio.props.onChange()
 }
 
+phase('live reasoning: an expanded seat streams thinking + answer')
 /* ---- Live reasoning: an expanded seat streams its thinking and answer ---- *
  * "我需要展开实时可见思考": a status dot is not enough. Both the conversation
  * card and the floating card must expand one seat and show the Host's reasoning
@@ -1368,6 +1464,7 @@ for (const expected of ['评审失败', 'CouncilRunError', 'COUNCIL_FAILED']) {
   wakeRadio.props.onChange()
 }
 
+phase('settings page over the Host configuration form')
 /* ---- Settings page: settings.section over the Host configuration form ---- */
 const sectionReg = registrations.find((entry) => entry.key === 'settings.section')
 if (sectionReg === undefined) throw new Error('council did not register a settings section')
@@ -1442,6 +1539,7 @@ if (checkedStates[0] !== false || checkedStates[1] !== true) {
 configForm.value.toolEnabled = true
 configForm.value.panelEnabled = true
 
+phase('selection entry: context menu + quick-quote bridge event')
 /* Selection context menu: right-click a passage offers the council review item. */
 if (typeof command.icon !== 'function') throw new Error('command has no slash-menu icon')
 if (interactionDefs.length !== 1) throw new Error(`expected one text interaction, got ${interactionDefs.length}`)
@@ -1548,6 +1646,7 @@ if (silentResume === undefined || silentResume.mode !== 'silent') {
 const silentHtml = render(React.createElement(tabBody, { t }))
 if (!silentHtml.includes('已静默放进上下文')) throw new Error('silent delivery note is missing')
 
+phase('resilience: 409 already-resumed vs other 409, poll blip')
 /* --- Resilience: a 409 with code=already-resumed means delivered, not failure --- */
 {
   const before = resumeCalls.length
@@ -1592,6 +1691,7 @@ if (!silentHtml.includes('已静默放进上下文')) throw new Error('silent de
   }
 }
 
+phase('regression pins: source order of the delivery token / leader gate')
 /* --- Regression: the delivery token must not be claimed before the POST.
        A follower used to write feedbackRunId, so when it took over the leader
        role the guard above short-circuited and nobody delivered. --- */
@@ -1689,6 +1789,7 @@ if (!silentHtml.includes('已静默放进上下文')) throw new Error('silent de
   }
 }
 
+phase('outbound manifest: preview + explicit confirmation gate')
 /* ---- Outbound manifest: POST /council/preview + explicit confirmation gate ---- */
 function setQuestion(value) {
   const tree = build(tabBody({ t }))
@@ -1728,6 +1829,7 @@ function checkboxByLabel(text) {
   return findNode(label.children, (node) => node.type === 'input')
 }
 
+phase('SSE liveness: heartbeat, stall watchdog, follower recovery')
 /* ---- SSE liveness: host heartbeat + a follower that must never go dark ---- *
  * Host protocol: `event: beat` / `data: {"seq":N}` every ~3s while the stream
  * lives. The client treats it as liveness only. When a stream stalls or
@@ -2039,6 +2141,7 @@ function checkboxByLabel(text) {
   silentRadio.props.onChange()
 }
 
+phase('manifest cases: preview fail-closed + confirmation staleness')
 /* 1. "预览附件" posts /council/preview and renders the manifest in full. */
 {
   setQuestion('外发清单测试问题')
@@ -2232,6 +2335,7 @@ function checkboxByLabel(text) {
   restore.props.onChange()
 }
 
+phase('delivery decisions: tool-run must not post back, panel must')
 /* ---- Tool-originated runs are not posted back; /council runs still are ---- *
  * The `council_review` tool hands the conclusion to its caller as the
  * `tool/result`, so a panel poll/stream that also posted it spliced a second,
@@ -2530,6 +2634,7 @@ function checkboxByLabel(text) {
   console.log(`  delivery decisions: ${deliveryDecisions.join(' | ')}`)
 }
 
+phase('plan copy / graceful degradation / the stale-card probe')
 /* ---- Plan copy, graceful degradation, and the reported stale card ----- *
  * Three field complaints, one block:
  *
@@ -2866,6 +2971,7 @@ for (const cleanup of cleanups.reverse()) {
   }
 }
 
+phase('legacy migration: useFeedback:true -> silent, not wake')
 /* ---- Legacy migration: `useFeedback:true` must mean 'silent', not 'wake' ---- *
  * The old boolean used to become 'wake', which queues a follow-up turn on the
  * main agent — so a user who never opened the panel kept getting a new chat
@@ -3009,8 +3115,24 @@ for (const cleanup of cleanups.reverse()) {
 /* This harness started two endless loops the plugin owns in a real tab: the
    leader-election interval and the discovery chain (which re-arms on purpose).
    Release both so the offline run terminates instead of hanging. */
+phase('exit: releasing the loops the plugin owns')
 dispatchWindowEvent('pagehide', { type: 'pagehide' })
-for (const id of discoveryTimerIds) clearTimeout(id)
+/* Cleared through the fake window (not the global `clearTimeout`) so the
+   registry the watchdog dump reads stays truthful: the global one cancels the
+   real timer but would leave the entry listed as "armed", which is exactly the
+   kind of misleading evidence a stalled run must not produce. */
+for (const id of discoveryTimerIds) fakeWindow.clearTimeout(id)
+
+/* The run is over: disarm the upper bound, then prove the event loop is actually
+   empty. Every remaining step is synchronous, so if this process is still alive
+   EXIT_GRACE_MS from now a handle leaked — exactly the "test done, node won't
+   exit" stall this file could not distinguish from work. The timer is unref'd so
+   it fires only while something ELSE keeps the loop alive: a clean run still
+   exits immediately, with no added latency. */
+clearTimeout(runWatchdog)
+setTimeout(() => {
+  watchdogFail(`the run printed its summary but the process did not exit within ${EXIT_GRACE_MS}ms: a handle is still live`)
+}, EXIT_GRACE_MS).unref()
 
 console.log('client half: OK')
 console.log(`  slots: ${[...registered].join(', ')}`)
