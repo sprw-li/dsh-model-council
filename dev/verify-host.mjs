@@ -1643,7 +1643,11 @@ try {
             'a plain GET must not see a model added after it was cached')
 
           const refreshed = await http(liveHost, 'GET', '/council/models?refresh=1')
-          assert.notEqual(refreshed.json.catalogAt, firstAt, '?refresh=1 must re-enumerate the catalog')
+          /* The proof is CONTENT, not a timestamp: `catalogAt` is a millisecond
+             clock, so two enumerations can share one and a notEqual assertion
+             would flake (it did). Seeing the newly added model is the behaviour
+             under test; the timestamp only has to move forward or stay put. */
+          assert.ok(refreshed.json.catalogAt >= firstAt, 'catalogAt must not go backwards')
           assert.equal(refreshed.json.providers.some((p) => p.models.some((m) => m.id === 'pro9')), true,
             '?refresh=1 must see the newly added model')
           for (const field of ['providers', 'contextMaxChars', 'filesMaxChars', 'defaultModels',

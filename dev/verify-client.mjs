@@ -1656,6 +1656,18 @@ configForm.value.defaultModels = []
   if (panelReload === undefined) {
     throw new Error('the sidebar panel must offer a "reload models" control')
   }
+  /* Measured feedback: the control was invisible as a control because it sat
+     inside a label and inherited text styling ("不明显"). It must carry its own
+     framed class on BOTH surfaces, or it silently degrades into a line of text. */
+  for (const [label, node] of [['settings', settingsReload], ['panel', panelReload]]) {
+    const className = node.props !== undefined && node.props !== null ? node.props.className : undefined
+    if (typeof className !== 'string' || !className.split(/\s+/).includes('dsc-reload')) {
+      throw new Error(`the ${label} reload control must be framed (class dsc-reload), got ${JSON.stringify(className)}`)
+    }
+  }
+  if (!/\.dsc-reload\{[^}]*border:1px solid/.test(readFileSync(join(here, '..', 'client.js'), 'utf8'))) {
+    throw new Error('the .dsc-reload style must draw a border, or the control is not visibly a button')
+  }
   const requestsBefore = modelsRequests.length
   settingsReload.props.onClick()
   await new Promise((resolve) => setTimeout(resolve, 80))

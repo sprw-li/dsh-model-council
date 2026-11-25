@@ -446,6 +446,14 @@ const RUN_DISCOVERY_MS = 4000
 .dsc-panel-body{display:flex;flex-direction:column;gap:12px;padding:14px 16px 18px;overflow:auto}
 .dsc-field{display:flex;flex-direction:column;gap:6px}
 .dsc-field-label{font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary)}
+/* A reload control lives INSIDE a label / field label, whose text styles would
+   otherwise make a bare button read as a line of text ("not obvious" — measured
+   feedback). Give it a real frame: border, tinted fill, its own type scale, and
+   explicit hover/disabled states, so it is recognisably a control. */
+.dsc-reload{display:inline-flex;align-items:center;gap:4px;margin-left:8px;height:22px;padding:0 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:11px;font-weight:500;line-height:1;cursor:pointer;vertical-align:middle}
+.dsc-reload:hover:not(:disabled){border-color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-interactive-bg-hover)}
+.dsc-reload:disabled{opacity:.55;cursor:default}
+.dsc-reload-glyph{font-size:12px;line-height:1}
 .dsc-textarea{box-sizing:border-box;width:100%;min-height:82px;resize:vertical;padding:8px 10px;border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;line-height:1.55;outline:none}
 .dsc-textarea:focus{border-color:var(--dsw-alias-brand-primary)}
 .dsc-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
@@ -2464,10 +2472,13 @@ const RUN_DISCOVERY_MS = 4000
           t('settings.models'),
           h('button', {
             type: 'button',
-            className: 'dsc-secondary',
+            className: 'dsc-reload',
+            title: t('panel.loadModels'),
             disabled: state.loading === true,
             onClick: () => { void loadModels(true) },
-          }, state.loading === true ? t('bar.loading') : t('panel.loadModels')),
+          },
+            h('span', { className: 'dsc-reload-glyph', 'aria-hidden': true }, '⟳'),
+            state.loading === true ? t('bar.loading') : t('panel.loadModels')),
         ),
         h('div', { className: 'dsc-settings-hint' }, t('settings.modelsHint')),
         state.loading === true && state.catalog.length === 0
@@ -2955,10 +2966,13 @@ const RUN_DISCOVERY_MS = 4000
                 t('panel.models', { count: state.selected.length }),
                 h('button', {
                   type: 'button',
-                  className: 'dsc-secondary',
+                  className: 'dsc-reload',
+                  title: t('panel.loadModels'),
                   disabled: state.loading === true,
                   onClick: () => { void loadModels(true) },
-                }, state.loading === true ? t('bar.loading') : t('panel.loadModels')),
+                },
+                  h('span', { className: 'dsc-reload-glyph', 'aria-hidden': true }, '⟳'),
+                  state.loading === true ? t('bar.loading') : t('panel.loadModels')),
               ),
               state.loading
                 ? h('span', { className: 'dsc-hint' }, t('bar.loading'))
