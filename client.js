@@ -146,6 +146,7 @@ window.__ModuleLoader__.load({
       'settings.saved': '已保存',
       'settings.saveFailed': '保存未生效（可能被更新的一版覆盖）',
       'settings.unavailable': '已保存但当前不可用的模型：{list}',
+      'settings.defaultProblems': '配置的默认模型在当前目录中找不到：{list}',
       'settings.noForm': '当前客户端没有提供设置表单接口（configForms），无法在这里修改配置。',
       'stage.reviews': '交叉互评',
       'stage.chairman': '主席汇总',
@@ -326,6 +327,7 @@ window.__ModuleLoader__.load({
       'settings.saved': 'Saved',
       'settings.saveFailed': 'Save did not land (a newer revision may have superseded it)',
       'settings.unavailable': 'Saved but currently unavailable: {list}',
+      'settings.defaultProblems': 'Configured default models missing from the live catalog: {list}',
       'settings.noForm': 'This client does not expose the configuration form API (configForms), so the settings cannot be edited here.',
       'stage.reviews': 'Peer review',
       'stage.chairman': 'Synthesis',
@@ -584,6 +586,9 @@ const RUN_DISCOVERY_MS = 4000
         workspace: null,
         loading: false,
         loadError: '',
+        /* Host-reported reasons a configured default model could not be resolved
+           against the live catalog. Empty on an older Host that omits the field. */
+        defaultModelProblems: [],
         question: '',
         runId: '',
         run: null,
@@ -732,11 +737,18 @@ const RUN_DISCOVERY_MS = 4000
 
     let loadPromise = null
 
-    /** Load the configured provider/model catalog once, retryable. */
-    function loadModels() {
+    /**
+     * Load the configured provider/model catalog once, retryable.
+     *
+     * `force` asks the Host to re-enumerate its live catalog instead of serving
+     * its 60s cache. The list IS live data (the same registry the composer's own
+     * picker enumerates), so a model added or retired after mount was otherwise
+     * invisible here and there was no way to ask. Ordinary calls keep the cache.
+     */
+    function loadModels(force) {
       if (loadPromise !== null) return loadPromise
       store.publish({ loading: true, loadError: '' })
-      loadPromise = fetchJson('/council/models')
+      loadPromise = fetchJson(force === true ? '/council/models?refresh=1' : '/council/models')
         .then((data) => {
           const rows = []
           const providers = Array.isArray(data.providers) ? data.providers : []
@@ -763,8 +775,26 @@ const RUN_DISCOVERY_MS = 4000
             && Number.isSafeInteger(data.filesMaxChars) && data.filesMaxChars > 0
             ? data.filesMaxChars
             : 20000
-          store.publish({ catalog: rows, contextMaxChars, filesMaxChars, loading: false, loadError: '' })
+          /* A configured default model the Host can no longer resolve is
+             reported, not swallowed: an operator who retired a model must see
+             WHICH entry died instead of wondering why the roster got shorter.
+             An older Host does not send the field, so nothing renders. */
+          const problems = Array.isArray(data.defaultModelProblems)
+            ? data.defaultModelProblems.filter((item) => typeof item === 'string' && item !== '')
+            : []
+          store.publish({
+            catalog: rows,
+            contextMaxChars,
+            filesMaxChars,
+            defaultModelProblems: problems,
+            loading: false,
+            loadError: '',
+          })
           pruneSelection(rows)
+          /* The sidebar can be opened without the slash command, so an empty
+             persisted selection must still be seeded here — otherwise the panel
+             shows "0 selected" until the user picks by hand. */
+          ensureSelection()
         })
         .catch((error) => {
           store.publish({ loading: false, loadError: String(error && error.message ? error.message : error) })
@@ -791,13 +821,56 @@ const RUN_DISCOVERY_MS = 4000
       persist()
     }
 
-    /** Pick a starter panel when the user has not chosen models yet. */
+    /**
+     * Pick a starter roster when the user has not chosen models yet.
+     *
+     * The configured `defaultModels` wins: those are the seats the user actually
+     * picked in Settings, and the old `catalog.slice(0, 3)` ignored them — it
+     * landed on the two DeepSeek providers (a duplicate model NAME) plus whatever
+     * Bohrium listed first. With no configured list, mirror the Host's own
+     * auto-pick: one model per provider, distinct model names, at most three —
+     * never a positional slice. A persisted choice of >=2 is never overwritten.
+     */
     function ensureSelection() {
       if (store.state.selected.length >= 2) return
       const rows = store.state.catalog
       if (rows.length < 2) return
-      const keys = rows.slice(0, 3).map((row) => row.key)
-      store.publish({ selected: keys, chairmanKey: keys[0] })
+      const known = new Set(rows.map((row) => row.key))
+      const configured = acceptedDefaultModels()
+        .map((spec) => parseRouteKey(spec))
+        .filter((parsed) => parsed !== null)
+        .map((parsed) => `${parsed.provider}|${parsed.model}`)
+        .filter((key) => known.has(key))
+      if (configured.length >= 2) {
+        const keys = configured.slice(0, MAX_MODELS)
+        /* Prefer the configured chairman when it is one of these seats; a
+           chairman outside the roster cannot serve, so fall back to the first
+           seat exactly as the Host does. */
+        const chairmanSpec = acceptedSettings().defaultChairman
+        const chairmanParsed = typeof chairmanSpec === 'string' ? parseRouteKey(chairmanSpec) : null
+        const preferred = chairmanParsed === null
+          ? ''
+          : `${chairmanParsed.provider}|${chairmanParsed.model}`
+        store.publish({
+          selected: keys,
+          chairmanKey: keys.indexOf(preferred) === -1 ? keys[0] : preferred,
+        })
+        persist()
+        return
+      }
+      const picked = []
+      const names = new Set()
+      const usedProviders = new Set()
+      for (const row of rows) {
+        if (picked.length >= 3) break
+        if (usedProviders.has(row.provider)) continue
+        if (names.has(row.name)) continue
+        names.add(row.name)
+        usedProviders.add(row.provider)
+        picked.push(row.key)
+      }
+      if (picked.length < 2) return
+      store.publish({ selected: picked, chairmanKey: picked[0] })
       persist()
     }
 
@@ -2280,6 +2353,7 @@ const RUN_DISCOVERY_MS = 4000
         catalog: snapshot.catalog,
         loading: snapshot.loading,
         loadError: snapshot.loadError,
+        defaultModelProblems: snapshot.defaultModelProblems,
       }))
       /* Seeded from the accepted Host value during render, not from an effect:
          the draft must already equal what the Host holds on the first paint,
@@ -2386,12 +2460,25 @@ const RUN_DISCOVERY_MS = 4000
         ),
         h('div', { className: 'dsc-settings-hint' }, t('settings.panelEnabledHint')),
 
-        h('div', { className: 'dsc-settings-label' }, t('settings.models')),
+        h('div', { className: 'dsc-settings-label' },
+          t('settings.models'),
+          h('button', {
+            type: 'button',
+            className: 'dsc-secondary',
+            disabled: state.loading === true,
+            onClick: () => { void loadModels(true) },
+          }, state.loading === true ? t('bar.loading') : t('panel.loadModels')),
+        ),
         h('div', { className: 'dsc-settings-hint' }, t('settings.modelsHint')),
         state.loading === true && state.catalog.length === 0
           ? h('div', { className: 'dsc-settings-hint' }, t('bar.loading'))
           : null,
         state.loadError !== '' ? h('div', { className: 'dsc-warn' }, state.loadError) : null,
+        state.defaultModelProblems.length > 0
+          ? h('div', { className: 'dsc-warn' }, t('settings.defaultProblems', {
+              list: state.defaultModelProblems.join('；'),
+            }))
+          : null,
         groups.length === 0 && state.loading !== true
           ? h('div', { className: 'dsc-settings-hint' }, t('bar.empty'))
           : null,
@@ -2864,12 +2951,25 @@ const RUN_DISCOVERY_MS = 4000
               h('div', { className: 'dsc-hint' }, t('panel.feedbackHint')),
             ),
             h('div', { className: 'dsc-field' },
-              h('span', { className: 'dsc-field-label' }, t('panel.models', { count: state.selected.length })),
+              h('span', { className: 'dsc-field-label' },
+                t('panel.models', { count: state.selected.length }),
+                h('button', {
+                  type: 'button',
+                  className: 'dsc-secondary',
+                  disabled: state.loading === true,
+                  onClick: () => { void loadModels(true) },
+                }, state.loading === true ? t('bar.loading') : t('panel.loadModels')),
+              ),
               state.loading
                 ? h('span', { className: 'dsc-hint' }, t('bar.loading'))
                 : state.loadError !== ''
                   ? h('div', { className: 'dsc-error-box' }, state.loadError)
                   : h(ModelOptions, { catalog: state.catalog, selected: state.selected }),
+              state.defaultModelProblems.length > 0
+                ? h('div', { className: 'dsc-warn' }, t('settings.defaultProblems', {
+                    list: state.defaultModelProblems.join('；'),
+                  }))
+                : null,
             ),
             state.useChairman
               ? h('div', { className: 'dsc-field' },

@@ -2297,8 +2297,18 @@ export function apply(ctx, config) {
     }
   }, 'council: read-only preset')
 
-  /** Enumerate every configured provider and its text models. */
-  async function catalog() {    if (catalogCache.value !== undefined && Date.now() - catalogCache.at < MODEL_CACHE_MS) return catalogCache.value
+  /**
+   * Enumerate every configured provider and its text models.
+   *
+   * `force` bypasses MODEL_CACHE_MS. The catalog is live data (ctx.llm — the same
+   * registry the composer's own model picker enumerates), but a 60s cache with no
+   * invalidation left the panel showing a stale list and offered no way to refresh
+   * after a model was added or retired. The tool path and the ordinary panel load
+   * keep the cache; only an explicit refresh opts out.
+   */
+  async function catalog(force) {
+    const fresh = force === true
+    if (!fresh && catalogCache.value !== undefined && Date.now() - catalogCache.at < MODEL_CACHE_MS) return catalogCache.value
     let providers = []
     try {
       providers = ctx.llm.listProviders()
@@ -3482,23 +3492,39 @@ export function apply(ctx, config) {
         }
 
         if (req.method === 'GET' && path === '/models') {
-          const cat = await catalog()
+          /* `?refresh=1` (or `=true`) re-enumerates the live catalog instead of
+             serving the 60s cache. Without it, a model added or retired after the
+             panel mounted stayed invisible until the TTL expired, and the panel
+             had no way to ask. The response keeps every existing field, so an old
+             client is unaffected. */
+          const refreshParam = url.searchParams.get('refresh')
+          const cat = await catalog(refreshParam === '1' || refreshParam === 'true')
           /* `defaultModels` / `defaultChairman` are a READ-ONLY echo of the settings,
              added so the panel can pre-fill its pickers instead of guessing. Before
              this, the panel had no way to know that a default chairman was
              configured — which is how a configured chairman kept being replaced by
              the first participant without anything on screen saying so. The existing
-             fields keep their meaning; these two are additive. */
+             fields keep their meaning; these are additive. */
           const modelsSetting = readSetting(liveConfig.defaultModels, [])
           const chairmanSetting = readSetting(liveConfig.defaultChairman, '')
+          const defaultSpecs = Array.isArray(modelsSetting)
+            ? modelsSetting.filter((spec) => typeof spec === 'string' && spec !== '')
+            : []
+          /* A pinned model that no longer exists used to be dropped silently: the
+             roster just came back shorter and nothing said which entry died. Report
+             it so the panel can name the dead entry instead of guessing, and say
+             whether ANY pinned model is still usable. */
+          const configured = resolveConfiguredRoutes(cat, defaultSpecs)
           sendJson(res, 200, {
             providers: cat.providers,
             contextMaxChars,
             filesMaxChars,
-            defaultModels: Array.isArray(modelsSetting)
-              ? modelsSetting.filter((spec) => typeof spec === 'string' && spec !== '')
-              : [],
+            defaultModels: defaultSpecs,
             defaultChairman: typeof chairmanSetting === 'string' ? chairmanSetting : '',
+            catalogAt: catalogCache.at,
+            catalogAgeMs: Math.max(0, Date.now() - catalogCache.at),
+            defaultModelProblems: configured.problems,
+            defaultModelsUsable: defaultSpecs.length === 0 || configured.routes.length > 0,
           })
           return
         }
@@ -3526,7 +3552,7 @@ export function apply(ctx, config) {
           } catch {
             /* diagnostics must never throw */
           }
-          sendJson(res, 200, { build: 'v71', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
+          sendJson(res, 200, { build: 'v72', runs: runsOut.slice(-10), agents: agentsOut.slice(-30) })
           return
         }
         if (req.method === 'GET' && path === '/workspace') {
@@ -3541,7 +3567,7 @@ export function apply(ctx, config) {
           for (const run of runs.values()) if (run.status === 'running') runningCount += 1
           sendJson(res, 200, {
             ok: true,
-            build: 'v71',
+            build: 'v72',
             toolEnabled: toolEnabled(liveConfig),
             panelEnabled: panelEnabled(liveConfig),
             /*

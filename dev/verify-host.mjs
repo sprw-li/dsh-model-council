@@ -1615,6 +1615,66 @@ try {
         for (const field of ['providers', 'contextMaxChars', 'filesMaxChars']) {
           assert.ok(Object.hasOwn(echoed.json, field), `GET /council/models must keep ${field}`)
         }
+
+        /* The catalog is live data a user watches: a model added after the panel
+           mounted must be reachable without waiting out MODEL_CACHE_MS, and a
+           pinned model that disappeared must be named instead of silently
+           shortening the roster. Both are measured against a MUTATED fake
+           catalog, so a "refresh" that returns the cache cannot pass. */
+        const originalDeepseek = models.deepseek
+        try {
+          const liveHost = fakeHost(Config({ defaultModels: ['deepseek/pro'] }))
+          const first = await http(liveHost, 'GET', '/council/models')
+          assert.equal(first.status, 200)
+          assert.ok(first.json.providers.some((p) => p.id === 'deepseek' && p.models.some((m) => m.id === 'pro')),
+            'the live catalog must list the provider models')
+          assert.deepEqual(first.json.defaultModelProblems, [],
+            'a defaultModels entry that resolves must report no problem')
+          assert.equal(first.json.defaultModelsUsable, true, 'a usable defaultModels list reports usable')
+          const firstAt = first.json.catalogAt
+          assert.equal(typeof firstAt, 'number', 'catalogAt must be a timestamp')
+          assert.equal(typeof first.json.catalogAgeMs, 'number', 'catalogAgeMs must be a number')
+
+          /* A model appears after the panel mounted. */
+          models.deepseek = originalDeepseek.concat([{ id: 'pro9', name: 'DeepSeek-V4.9-Pro' }])
+          const cached = await http(liveHost, 'GET', '/council/models')
+          assert.equal(cached.json.catalogAt, firstAt, 'a plain GET must serve the cache')
+          assert.equal(cached.json.providers.some((p) => p.models.some((m) => m.id === 'pro9')), false,
+            'a plain GET must not see a model added after it was cached')
+
+          const refreshed = await http(liveHost, 'GET', '/council/models?refresh=1')
+          assert.notEqual(refreshed.json.catalogAt, firstAt, '?refresh=1 must re-enumerate the catalog')
+          assert.equal(refreshed.json.providers.some((p) => p.models.some((m) => m.id === 'pro9')), true,
+            '?refresh=1 must see the newly added model')
+          for (const field of ['providers', 'contextMaxChars', 'filesMaxChars', 'defaultModels',
+            'defaultChairman', 'catalogAt', 'catalogAgeMs', 'defaultModelProblems', 'defaultModelsUsable']) {
+            assert.ok(Object.hasOwn(refreshed.json, field), `a refresh must keep ${field}`)
+          }
+          assert.deepEqual(refreshed.json.defaultModels, ['deepseek/pro'],
+            'a refresh must not change the echoed setting')
+
+          /* A pinned model that no longer exists is reported, not dropped silently. */
+          const staleHost = fakeHost(Config({ defaultModels: ['deepseek/pro', 'deepseek/gone'] }))
+          const staleJson = (await http(staleHost, 'GET', '/council/models')).json
+          assert.equal(staleJson.defaultModelProblems.length, 1,
+            'a defaultModels entry missing from the catalog must be reported')
+          assert.ok(staleJson.defaultModelProblems[0].includes('deepseek/gone'),
+            `the problem must name the dead entry: ${JSON.stringify(staleJson.defaultModelProblems)}`)
+          assert.equal(staleJson.defaultModelsUsable, true, 'one usable entry keeps the list usable')
+
+          const goneHost = fakeHost(Config({ defaultModels: ['deepseek/gone'] }))
+          const goneJson = (await http(goneHost, 'GET', '/council/models')).json
+          assert.equal(goneJson.defaultModelsUsable, false,
+            'a fully unusable defaultModels list must be reported as unusable')
+
+          /* An unset defaultModels is not a problem: auto-pick is the documented path. */
+          const unsetHost = fakeHost(Config({}))
+          const unsetJson = (await http(unsetHost, 'GET', '/council/models')).json
+          assert.deepEqual(unsetJson.defaultModelProblems, [], 'an unset defaultModels reports no problem')
+          assert.equal(unsetJson.defaultModelsUsable, true, 'an unset defaultModels is usable (auto-pick)')
+        } finally {
+          models.deepseek = originalDeepseek
+        }
       }
 
       /* A cancel must not rewrite an ALREADY SETTLED run: `finishRun` is documented

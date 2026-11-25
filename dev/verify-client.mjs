@@ -237,6 +237,17 @@ let loadArgument
 const styleTags = []
 const storage = new Map()
 const fetchCalls = []
+/* Catalog the fake Host serves, and the retired-default reports it sends.
+   Mutable so a test can prove that a refresh re-enumerates instead of serving
+   the client's cache, and that a retired pinned model is surfaced. */
+let fakeCatalogProviders = [
+  { id: 'p1', name: 'Provider One', models: [{ id: 'm1', name: 'Model One' }, { id: 'm2', name: 'Model Two' }] },
+  { id: 'p2', name: 'Provider Two', models: [{ id: 'm3', name: 'Model Three' }] },
+]
+let fakeModelProblems = []
+/* Every `/council/models` request, verbatim: the refresh control must be
+   distinguishable from an ordinary load, and only the URL proves it. */
+const modelsRequests = []
 const windowListeners = new Map()
 
 function addWindowListener(type, listener) {
@@ -581,16 +592,15 @@ const fakeWindow = {
       method: options === undefined || options === null || options.method === undefined ? 'GET' : options.method,
       body: options !== undefined && options !== null && options.body !== undefined ? String(options.body) : '',
     })
-    if (url === '/council/models') {
+    if (url === '/council/models' || url === '/council/models?refresh=1') {
+      modelsRequests.push(String(url))
       return {
         ok: true,
         json: async () => ({
           contextMaxChars: 6000,
           filesMaxChars: 20000,
-          providers: [
-            { id: 'p1', name: 'Provider One', models: [{ id: 'm1', name: 'Model One' }, { id: 'm2', name: 'Model Two' }] },
-            { id: 'p2', name: 'Provider Two', models: [{ id: 'm3', name: 'Model Three' }] },
-          ],
+          providers: fakeCatalogProviders,
+          defaultModelProblems: fakeModelProblems,
         }),
       }
     }
@@ -1579,6 +1589,135 @@ if (!missingHtml.includes('retired/gone-model')) {
   throw new Error(`a saved but unavailable model must be reported: ${missingHtml.slice(0, 400)}`)
 }
 configForm.value.defaultModels = []
+
+/* ---- The participant roster must come from live data, not a position ----
+   Measured defect this locks down: the panel seeded itself with
+   `catalog.slice(0, 3)`, which ignored the `defaultModels` the user had just
+   picked in Settings (it landed on the two same-named DeepSeek providers), and
+   the Host's catalog cache had no way to be refreshed, so a model added or
+   retired after mount stayed invisible. All three behaviours are asserted here
+   against a fake Host whose catalog and retired-entry reports can be changed
+   between calls. */
+{
+  const settingsSection = registrations.find((entry) => entry.key === 'settings.section').component
+
+  /** Names of the participant checkboxes currently rendered as ON. */
+  function selectedNames(node, out = []) {
+    if (node === null || node === undefined) return out
+    if (Array.isArray(node)) {
+      for (const item of node) selectedNames(item, out)
+      return out
+    }
+    if (typeof node !== 'object') return out
+    const className = node.props !== undefined && node.props !== null ? node.props.className : undefined
+    if (node.type === 'label' && typeof className === 'string' && className.includes('dsc-opt-on')) {
+      out.push(textOf(node.children))
+    }
+    if (node.children !== undefined) selectedNames(node.children, out)
+    return out
+  }
+
+  /**
+   * Uncheck the MODEL options only, so the seeding path runs from scratch.
+   * Scoped to `label.dsc-opt` on purpose: the panel also carries the
+   * attach-files and context checkboxes, and clearing those would silently
+   * disable the surfaces later cases depend on.
+   */
+  function clearSelection(node) {
+    if (node === null || node === undefined) return
+    if (Array.isArray(node)) {
+      for (const item of node) clearSelection(item)
+      return
+    }
+    if (typeof node !== 'object') return
+    const className = node.props !== undefined && node.props !== null ? node.props.className : undefined
+    if (node.type === 'label' && typeof className === 'string' && className.includes('dsc-opt')) {
+      const input = findNode(node.children, (child) => child.type === 'input')
+      if (input !== undefined && input.props !== undefined && input.props !== null
+        && input.props.checked === true && typeof input.props.onChange === 'function') {
+        input.props.onChange({ target: { checked: false } })
+      }
+      return
+    }
+    if (node.children !== undefined) clearSelection(node.children)
+  }
+
+  const panelTree = () => build(React.createElement(tabBody, { t }))
+
+  /* 1. The reload control must ask the Host to re-enumerate. Ordinary loads must
+        keep the cache, or every panel mount would cost a full provider walk. */
+  configForm.value.defaultModels = []
+  const settingsTree = build(React.createElement(settingsSection, { t }))
+  const settingsReload = findButtonByText(settingsTree, '重新读取模型')
+  if (settingsReload === undefined) {
+    throw new Error('the settings page must offer a "reload models" control')
+  }
+  const panelReload = findButtonByText(panelTree(), '重新读取模型')
+  if (panelReload === undefined) {
+    throw new Error('the sidebar panel must offer a "reload models" control')
+  }
+  const requestsBefore = modelsRequests.length
+  settingsReload.props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  const refreshRequests = modelsRequests.slice(requestsBefore)
+  if (!refreshRequests.includes('/council/models?refresh=1')) {
+    throw new Error(`the reload control must bypass the Host catalog cache, got ${JSON.stringify(refreshRequests)}`)
+  }
+
+  /* 2. A configured defaultModels list wins over any positional pick — it must
+        produce the user's CHOSEN SET, which differs from what the auto-pick
+        would choose (auto-pick takes p1|m1 + p2|m3; this asks for p1|m2 +
+        p2|m3, so the two branches are distinguishable by set, not by render
+        order — the option list always renders in catalog order). */
+  configForm.value.defaultModels = ['p2/m3', 'p1/m2']
+  configForm.value.defaultChairman = 'p1/m2'
+  clearSelection(panelTree())
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  findButtonByText(panelTree(), '重新读取模型').props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  const configuredNames = selectedNames(panelTree())
+  if (JSON.stringify(configuredNames) !== JSON.stringify(['Model Two', 'Model Three'])) {
+    throw new Error(`the panel must seed from the configured defaultModels, got ${JSON.stringify(configuredNames)}`)
+  }
+
+  /* 3. With no configured list the fallback mirrors the Host: one model per
+        provider, distinct model NAMES, at most three — never a positional slice
+        (which would have taken Model One + Model Two from the same provider). */
+  configForm.value.defaultModels = []
+  configForm.value.defaultChairman = ''
+  clearSelection(panelTree())
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  findButtonByText(panelTree(), '重新读取模型').props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  const autoNames = selectedNames(panelTree())
+  if (JSON.stringify(autoNames) !== JSON.stringify(['Model One', 'Model Three'])) {
+    throw new Error(`the auto-pick must be heterogeneous (one model per provider, distinct names), got ${JSON.stringify(autoNames)}`)
+  }
+
+  /* 4. A pinned model the Host can no longer resolve must be NAMED on both
+        surfaces, not silently dropped from the roster. The store only learns it
+        from a load, so one has to run after the Host changes its answer. */
+  fakeModelProblems = ['默认模型不在当前模型目录中：p2/gone']
+  try {
+    findButtonByText(panelTree(), '重新读取模型').props.onClick()
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    const settingsProblems = render(React.createElement(settingsSection, { t }))
+    if (!settingsProblems.includes('p2/gone')) {
+      throw new Error(`the settings page must name a retired default model: ${settingsProblems.slice(0, 400)}`)
+    }
+    const panelProblems = render(React.createElement(tabBody, { t }))
+    if (!panelProblems.includes('p2/gone')) {
+      throw new Error(`the panel must name a retired default model: ${panelProblems.slice(0, 400)}`)
+    }
+  } finally {
+    fakeModelProblems = []
+    findButtonByText(panelTree(), '重新读取模型').props.onClick()
+    await new Promise((resolve) => setTimeout(resolve, 80))
+  }
+
+  configForm.value.defaultChairman = ''
+  configForm.value.defaultModels = []
+}
 
 /* The two switches must be independent: the panel entry is not the tool entry,
    so one being off must not flip the other. */
